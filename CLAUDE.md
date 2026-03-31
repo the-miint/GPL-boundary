@@ -30,13 +30,13 @@ This is the most important part of the architecture to understand.
 1. **miint** creates input shm, writes Arrow IPC data
 2. **miint** spawns `gpl-boundary`, writes JSON request to stdin (includes
    `shm_input` name)
-3. **gpl-boundary** reads input from shm, runs tool, creates output shm with
-   PID-based name (`/gpl-boundary-{pid}-out`), writes Arrow IPC results
-4. **gpl-boundary** responds via stdout with `shm_output` name and
-   `shm_output_size`
-5. **miint** reads response, opens output shm, reads `shm_output_size` bytes
-   of Arrow IPC
-6. **miint** unlinks both input and output shm (it owns cleanup of both)
+3. **gpl-boundary** reads input from shm, runs tool, creates output shm(s) with
+   PID-based names (`/gpl-boundary-{pid}-{label}`), writes Arrow IPC results
+4. **gpl-boundary** responds via stdout with `shm_outputs` array (name, label,
+   size for each output)
+5. **miint** reads response, opens each output shm, reads `size` bytes of
+   Arrow IPC
+6. **miint** unlinks both input and all output shm (it owns cleanup of all)
 
 ### Signal handling
 
@@ -44,15 +44,19 @@ gpl-boundary installs signal handlers for SIGINT and SIGTERM that unlink any
 output shm it has created. This prevents leaks on graceful termination.
 
 **SIGKILL cannot be trapped.** The PID-based naming convention
-(`/gpl-boundary-{pid}-out`) lets miint detect and clean up stale segments by
-checking if the PID is still alive.
+(`/gpl-boundary-{pid}-{label}`) lets miint detect and clean up stale segments
+by checking if the PID is still alive.
 
 ### Cleanup registry
 
 - `shm::register_for_cleanup(name)` -- called when output shm is created
-- `shm::deregister_cleanup(name)` -- called after successful response (caller
-  now owns it)
+  (inside `arrow_ipc::write_batch_to_output_shm`)
+- `shm::deregister_cleanup(name)` -- called in `main.rs` **after** the JSON
+  response has been written to stdout (not inside `execute()`)
 - Signal handler and `cleanup_all()` iterate the registry and unlink everything
+
+**Important**: deregister must happen after stdout write, not before. If a
+signal arrives between deregister and stdout write, the shm leaks.
 
 ### SharedMemory::detach()
 
@@ -74,12 +78,20 @@ documentation for the separate submodule development teams.
 
 Each tool gets:
 1. A git submodule under `ext/<toolname>`
-2. Build integration in `build.rs`
+2. A `build_<toolname>()` function in `build.rs` (separate `cc::Build` per tool
+   to prevent symbol collisions)
 3. An adapter in `src/tools/<toolname>.rs` implementing `GplTool`
-4. Registration in `src/tools/mod.rs` dispatch
-5. Tool-specific API documentation (input/output schemas, config params) via
+4. Auto-registration via `inventory::submit!` in the tool module (no manual
+   dispatch code needed)
+5. `pub mod <toolname>;` in `src/tools/mod.rs`
+6. Tool-specific API documentation (input/output schemas, config params) via
    the `describe()` method on `GplTool`
-6. Smoke tests using real shared memory
+7. An ABI size-check test for each `#[repr(C)]` config struct
+8. Smoke tests using real shared memory (use `test_util` helpers)
+
+Use `arrow_ipc::write_batch_to_output_shm()` and
+`arrow_ipc::read_batches_from_shm()` for Arrow IPC marshaling -- do not
+duplicate this logic in tool modules.
 
 We do not exhaustively test submodules; that is their own CI's job.
 
@@ -98,15 +110,19 @@ system-level install of submodule libraries is needed.
 
 ```
 src/
-  main.rs            # Entry point: CLI flags or stdin JSON dispatch
-  protocol.rs        # Request/Response JSON types (serde)
+  main.rs            # Entry point: CLI flags, stdin JSON dispatch, shm deregister
+  arrow_ipc.rs       # Shared Arrow IPC helpers (write_batch_to_output_shm, read_batches_from_shm)
+  protocol.rs        # Request/Response/ShmOutput JSON types (serde)
   shm.rs             # POSIX shared memory, cleanup registry, signal handlers
+  test_util.rs       # Shared test helpers (cfg(test) only)
   tools/
-    mod.rs           # GplTool trait, dispatch, introspection (describe/version)
-    fasttree.rs      # FastTree FFI bindings + Arrow IPC marshaling + tests
+    mod.rs           # GplTool trait, ToolRegistration, inventory-based dispatch
+    fasttree.rs      # FastTree FFI bindings + GplTool impl + tests
 ext/
   fasttree/          # git submodule (GPL, C99)
-build.rs             # Compiles C submodule sources via cc crate
+tests/
+  build_sanity.rs    # Integration tests: binary links and runs correctly
+build.rs             # Per-tool C compilation functions via cc crate
 ```
 
 ## CLI introspection
@@ -125,10 +141,14 @@ These let miint programmatically discover capabilities without hardcoding.
 - **Rust edition 2021**, standard cargo project
 - **Tests use real shared memory**: smoke tests create POSIX shm segments,
   write Arrow IPC, run tools, read Arrow IPC output. No mocking.
-- **FFI**: raw bindings in each tool module. `#[repr(C)]` structs must match
-  C headers exactly.
+- **FFI**: manual `#[repr(C)]` bindings in each tool module (not bindgen).
+  Structs must match C headers exactly. Each config struct must have an ABI
+  size-check test. Size checks catch added/removed fields but not reordering;
+  manual review against the C header is still required when fields change.
 - **Error handling**: tools return `Response::error(msg)`. Never panic across
   FFI.
+- **Tool registration**: tools self-register via `inventory::submit!`. No
+  manual dispatch match arms. Duplicate names are caught at startup.
 - **CI**: GitHub Actions on Linux + macOS. Runs `cargo test`, `cargo clippy`,
   `cargo fmt --check`.
 - **No Newick output**: fasttree returns SOA tree structure as Arrow columnar
@@ -153,11 +173,16 @@ Response (stdout JSON):
 ```json
 {
   "success": true,
-  "shm_output": "/gpl-boundary-1234-out",
-  "shm_output_size": 8192,
+  "shm_outputs": [
+    { "name": "/gpl-boundary-1234-tree", "label": "tree", "size": 8192 }
+  ],
   "result": { "n_nodes": 7, "n_leaves": 4, "root": 6, "stats": { ... } }
 }
 ```
+
+Tools may produce multiple outputs (each a separate shm segment with a
+distinct label). `shm_outputs` is omitted from JSON when empty (error
+responses, metadata-only tools). Labels must be `[a-z0-9-]+`.
 
 ## Arrow schemas
 
@@ -165,7 +190,7 @@ Response (stdout JSON):
 - `name: Utf8` -- sequence identifier
 - `sequence: Utf8` -- aligned sequence (all must be equal length)
 
-**FastTree output** (written by gpl-boundary to shm_output):
+**FastTree output** (written by gpl-boundary to shm_outputs, label "tree"):
 - `id: Int32` -- node index [0, n_nodes)
 - `parent: Int32` -- parent node index (-1 for root)
 - `branch_length: Float64`
@@ -173,6 +198,36 @@ Response (stdout JSON):
 - `n_children: Int32` -- 0 for leaves
 - `is_leaf: Boolean`
 - `name: Utf8` (nullable) -- leaf name, null for internal nodes
+
+## Arrow IPC write strategy
+
+`write_batch_to_output_shm` serializes to `Vec<u8>` then copies into shm.
+Alternatives were investigated and rejected:
+- **Over-allocate + ftruncate**: unsafe with existing mmap (SIGBUS risk if
+  accessing pages beyond truncated size)
+- **Two-pass counting writer**: viable but marginal benefit, adds complexity
+- **Temporary file**: strictly worse than Vec approach
+
+Revisit if profiling shows this is a bottleneck for large outputs.
+
+## C API contract for submodules
+
+C libraries integrated as submodules must expose:
+
+```c
+void tool_config_init(tool_config_t *config);    // struct_size as first field
+tool_ctx_t *tool_create(const tool_config_t *config);
+void tool_destroy(tool_ctx_t *ctx);
+int tool_run(tool_ctx_t *ctx, ...);              // returns error code
+void tool_output_free(tool_output_t *output);
+const char *tool_strerror(int code);
+const char *tool_last_error(tool_ctx_t *ctx);
+```
+
+Requirements: no global state, no `main()` (use `TOOL_NO_MAIN` define guard),
+no stdout/stderr (use log callback), no `exit()`/`abort()`, deterministic with
+seed, SOA outputs preferred (maps cleanly to Arrow columns), ABI versioning
+via `struct_size` as first field in config.
 
 ## Related projects
 

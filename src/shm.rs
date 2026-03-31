@@ -57,10 +57,11 @@ pub fn install_signal_handlers() {
 }
 
 extern "C" fn signal_handler(sig: libc::c_int) {
-    // shm_unlink and _exit are async-signal-safe per POSIX.
-    // We avoid the Mutex here and directly iterate /dev/shm if needed,
-    // but for simplicity we attempt the lock with the understanding that
-    // if it's poisoned we just exit without cleanup.
+    // FIXME: Mutex::lock() is not async-signal-safe. If SIGTERM arrives while
+    // the main thread holds the lock (e.g., inside register_for_cleanup), this
+    // deadlocks. The PID-based naming convention lets miint detect and clean up
+    // stale segments, so this is a fallback, not a guarantee. A proper fix would
+    // use a lock-free structure (atomic array or just compute the name from PID).
     if let Ok(registry) = CLEANUP_REGISTRY.lock() {
         for name in registry.iter() {
             if let Ok(c_name) = CString::new(name.as_str()) {
@@ -77,10 +78,18 @@ extern "C" fn signal_handler(sig: libc::c_int) {
     }
 }
 
-/// Generate a unique output shm name using the process PID.
-pub fn output_shm_name() -> String {
+/// Generate a unique output shm name using the process PID and a label.
+/// Labels must be short ASCII identifiers (lowercase alphanumeric + hyphen).
+pub fn output_shm_name(label: &str) -> String {
+    assert!(
+        !label.is_empty()
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+        "shm label must be non-empty and contain only [a-z0-9-], got: {label:?}"
+    );
     let pid = std::process::id();
-    format!("/gpl-boundary-{pid}-out")
+    format!("/gpl-boundary-{pid}-{label}")
 }
 
 // --- SharedMemory type ---
@@ -294,6 +303,22 @@ mod tests {
 
         // Should fail to open since it was unlinked
         assert!(SharedMemory::open_readonly(name).is_err());
+    }
+
+    #[test]
+    fn test_output_shm_name_with_label() {
+        let name = output_shm_name("tree");
+        let pid = std::process::id();
+        assert_eq!(name, format!("/gpl-boundary-{pid}-tree"));
+    }
+
+    #[test]
+    fn test_output_shm_name_different_labels() {
+        let name_a = output_shm_name("tree");
+        let name_b = output_shm_name("dist");
+        assert_ne!(name_a, name_b);
+        assert!(name_a.ends_with("-tree"));
+        assert!(name_b.ends_with("-dist"));
     }
 
     #[test]

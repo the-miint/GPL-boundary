@@ -1,13 +1,10 @@
 //! FastTree adapter: reads Arrow IPC from shared memory, runs fasttree,
 //! writes SOA tree as Arrow IPC back to shared memory.
 
-use crate::protocol::Response;
-use crate::shm::SharedMemory;
+use crate::protocol::{Response, ShmOutput};
 use crate::tools::{ConfigParam, FieldDescription, GplTool, ToolDescription};
 use arrow::array::{BooleanArray, Float64Array, Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
@@ -130,22 +127,21 @@ fn output_schema() -> Schema {
 
 pub struct FastTreeTool;
 
+inventory::submit! {
+    crate::tools::ToolRegistration {
+        create: || Box::new(FastTreeTool),
+    }
+}
+
 impl FastTreeTool {
     /// Read Arrow IPC stream from shared memory, extract name and sequence columns.
     fn read_input(shm_input: &str) -> Result<(Vec<String>, Vec<String>), String> {
-        let shm = SharedMemory::open_readonly(shm_input)
-            .map_err(|e| format!("Failed to open input shm '{shm_input}': {e}"))?;
-
-        let cursor = std::io::Cursor::new(shm.as_slice());
-        let reader = StreamReader::try_new(cursor, None)
-            .map_err(|e| format!("Failed to read Arrow IPC from input shm: {e}"))?;
+        let batches = crate::arrow_ipc::read_batches_from_shm(shm_input)?;
 
         let mut all_names = Vec::new();
         let mut all_seqs = Vec::new();
 
-        for batch_result in reader {
-            let batch = batch_result.map_err(|e| format!("Failed to read Arrow batch: {e}"))?;
-
+        for batch in &batches {
             let name_col = batch
                 .column_by_name("name")
                 .ok_or("Input missing 'name' column")?
@@ -170,39 +166,10 @@ impl FastTreeTool {
     }
 
     /// Convert SOA tree to Arrow RecordBatch and write as IPC to a new shared
-    /// memory region. Returns (shm_name, ipc_byte_count).
-    fn write_output(tree: &FastTreeSoa) -> Result<(String, usize), String> {
+    /// memory region. Returns ShmOutput with name, label, and byte count.
+    fn write_output(tree: &FastTreeSoa) -> Result<ShmOutput, String> {
         let batch = unsafe { soa_to_record_batch(tree)? };
-
-        // Serialize to IPC in memory first to know the size
-        let mut ipc_buf = Vec::new();
-        {
-            let schema = Arc::new(output_schema());
-            let mut writer = StreamWriter::try_new(&mut ipc_buf, &schema)
-                .map_err(|e| format!("Failed to create Arrow IPC writer: {e}"))?;
-            writer
-                .write(&batch)
-                .map_err(|e| format!("Failed to write Arrow batch: {e}"))?;
-            writer
-                .finish()
-                .map_err(|e| format!("Failed to finish Arrow IPC stream: {e}"))?;
-        }
-
-        let shm_name = crate::shm::output_shm_name();
-
-        // Create output shm and register for cleanup (signal safety)
-        crate::shm::register_for_cleanup(&shm_name);
-
-        let mut shm = SharedMemory::create(&shm_name, ipc_buf.len())
-            .map_err(|e| format!("Failed to create output shm '{shm_name}': {e}"))?;
-
-        shm.as_mut_slice()[..ipc_buf.len()].copy_from_slice(&ipc_buf);
-        let size = ipc_buf.len();
-
-        // Detach: munmap without unlinking. miint will read and unlink.
-        shm.detach();
-
-        Ok((shm_name, size))
+        crate::arrow_ipc::write_batch_to_output_shm(&batch, "tree")
     }
 }
 
@@ -451,7 +418,7 @@ impl GplTool for FastTreeTool {
             }
 
             // Write tree as Arrow IPC to a new output shared memory region
-            let (shm_name, shm_size) = match Self::write_output(&*tree) {
+            let shm_out = match Self::write_output(&*tree) {
                 Ok(v) => v,
                 Err(e) => {
                     fasttree_tree_soa_free(tree);
@@ -478,10 +445,7 @@ impl GplTool for FastTreeTool {
             fasttree_tree_soa_free(tree);
             fasttree_destroy(ctx);
 
-            // Deregister from cleanup — caller (miint) now owns the output shm
-            crate::shm::deregister_cleanup(&shm_name);
-
-            Response::ok(result, shm_name, shm_size)
+            Response::ok(result, vec![shm_out])
         }
     }
 }
@@ -533,35 +497,11 @@ unsafe fn soa_to_record_batch(tree: &FastTreeSoa) -> Result<RecordBatch, String>
     .map_err(|e| format!("Failed to create Arrow RecordBatch: {e}"))
 }
 
-/// Helper: write an Arrow RecordBatch as IPC stream into a new shared memory region.
-/// Used by tests to set up input data.
-#[cfg(test)]
-pub fn write_arrow_to_shm(name: &str, batch: &RecordBatch) -> SharedMemory {
-    let mut ipc_buf = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut ipc_buf, &batch.schema()).unwrap();
-        writer.write(batch).unwrap();
-        writer.finish().unwrap();
-    }
-
-    let mut shm = SharedMemory::create(name, ipc_buf.len()).unwrap();
-    shm.as_mut_slice()[..ipc_buf.len()].copy_from_slice(&ipc_buf);
-    shm
-}
-
-/// Helper: read an Arrow RecordBatch from IPC stream in shared memory.
-/// Used by tests to verify output data.
-#[cfg(test)]
-pub fn read_arrow_from_shm(name: &str) -> Vec<RecordBatch> {
-    let shm = SharedMemory::open_readonly(name).unwrap();
-    let cursor = std::io::Cursor::new(shm.as_slice());
-    let reader = StreamReader::try_new(cursor, None).unwrap();
-    reader.into_iter().map(|b| b.unwrap()).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shm::SharedMemory;
+    use crate::test_util::{read_arrow_from_shm, unique_shm_name, write_arrow_to_shm};
 
     fn make_input_batch(names: &[&str], sequences: &[&str]) -> RecordBatch {
         let schema = Arc::new(input_schema());
@@ -573,15 +513,6 @@ mod tests {
             ],
         )
         .unwrap()
-    }
-
-    fn unique_shm_name(prefix: &str) -> String {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        format!("/{prefix}-{ts}")
     }
 
     #[test]
@@ -611,10 +542,12 @@ mod tests {
         assert!(response.success, "FastTree failed: {:?}", response.error);
 
         // Response should contain output shm info
-        let output_name = response.shm_output.as_ref().unwrap();
-        let output_size = response.shm_output_size.unwrap();
+        assert_eq!(response.shm_outputs.len(), 1);
+        let output_name = &response.shm_outputs[0].name;
+        let output_size = response.shm_outputs[0].size;
         assert!(output_size > 0);
         assert!(output_name.starts_with("/gpl-boundary-"));
+        assert_eq!(response.shm_outputs[0].label, "tree");
 
         // Verify JSON metadata
         let result = response.result.unwrap();
@@ -676,7 +609,8 @@ mod tests {
             response.error
         );
 
-        let output_name = response.shm_output.as_ref().unwrap();
+        assert_eq!(response.shm_outputs.len(), 1);
+        let output_name = &response.shm_outputs[0].name;
         let result = response.result.unwrap();
         assert_eq!(result["n_leaves"], 4);
 
@@ -697,6 +631,29 @@ mod tests {
 
         let response = tool.execute(&config, "/nonexistent-shm-name");
         assert!(!response.success);
-        assert!(response.error.unwrap().contains("Failed to open input shm"));
+        assert!(response.error.unwrap().contains("Failed to open shm"));
+    }
+
+    /// Verify that the Rust #[repr(C)] FastTreeConfig has the same size as the
+    /// C fasttree_config_t. The C side sets struct_size in config_init(), so a
+    /// mismatch here means the Rust struct definition has drifted from the C header.
+    ///
+    /// Limitation: this catches added/removed fields but NOT field reordering or
+    /// type changes that preserve size (e.g., swapping two c_int fields). Manual
+    /// review against the C header is still required when fields change.
+    ///
+    /// Every new tool should add an equivalent test for its config struct.
+    #[test]
+    fn test_config_struct_abi_size() {
+        let mut config: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut config) };
+        assert_eq!(
+            config.struct_size,
+            std::mem::size_of::<FastTreeConfig>(),
+            "ABI mismatch: Rust FastTreeConfig ({} bytes) vs C fasttree_config_t ({} bytes). \
+             Check field types and padding against ext/fasttree/fasttree.h.",
+            std::mem::size_of::<FastTreeConfig>(),
+            config.struct_size,
+        );
     }
 }

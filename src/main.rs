@@ -1,5 +1,8 @@
+mod arrow_ipc;
 mod protocol;
 mod shm;
+#[cfg(test)]
+mod test_util;
 mod tools;
 
 use std::io::{self, Read};
@@ -8,6 +11,18 @@ use std::process;
 fn main() {
     // Install signal handlers for shm cleanup before any shm is created
     shm::install_signal_handlers();
+
+    // Fail fast if two modules registered the same tool name
+    {
+        let mut names = tools::list_tools();
+        let total = names.len();
+        names.sort();
+        names.dedup();
+        if names.len() != total {
+            eprintln!("fatal: duplicate tool names in registry");
+            process::exit(1);
+        }
+    }
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -75,6 +90,13 @@ fn main() {
             eprintln!("Failed to serialize response: {e}");
             process::exit(1);
         }
+    }
+
+    // Deregister output shm from cleanup AFTER the response is written to stdout.
+    // The caller (miint) now owns the output segments. If we deregistered before
+    // writing and a signal arrived during the write, the shm would leak.
+    for shm_out in &response.shm_outputs {
+        shm::deregister_cleanup(&shm_out.name);
     }
 
     if !response.success {

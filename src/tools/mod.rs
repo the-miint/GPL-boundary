@@ -45,19 +45,28 @@ pub trait GplTool {
     fn execute(&self, config: &serde_json::Value, shm_input: &str) -> Response;
 }
 
+/// Registration entry for the tool registry. Each tool module calls
+/// `inventory::submit!` with one of these to register itself.
+pub struct ToolRegistration {
+    pub(crate) create: fn() -> Box<dyn GplTool>,
+}
+
+inventory::collect!(ToolRegistration);
+
 /// Return all registered tools.
 fn all_tools() -> Vec<Box<dyn GplTool>> {
-    vec![Box::new(fasttree::FastTreeTool)]
+    inventory::iter::<ToolRegistration>
+        .into_iter()
+        .map(|reg| (reg.create)())
+        .collect()
 }
 
 /// Dispatch a request to the appropriate tool.
 pub fn dispatch(request: &Request) -> Response {
-    match request.tool.as_str() {
-        "fasttree" => {
-            let tool = fasttree::FastTreeTool;
-            tool.execute(&request.config, &request.shm_input)
-        }
-        other => Response::error(format!("Unknown tool: {other}")),
+    let tool = all_tools().into_iter().find(|t| t.name() == request.tool);
+    match tool {
+        Some(t) => t.execute(&request.config, &request.shm_input),
+        None => Response::error(format!("Unknown tool: {}", request.tool)),
     }
 }
 
@@ -90,4 +99,59 @@ pub fn version_info() -> serde_json::Value {
         "gpl_boundary": env!("CARGO_PKG_VERSION"),
         "tools": tools,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fasttree_in_registry() {
+        let names = list_tools();
+        assert!(
+            names.contains(&"fasttree".to_string()),
+            "fasttree not found in registry: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_unknown_tool() {
+        let request = Request {
+            tool: "nonexistent".to_string(),
+            config: serde_json::json!({}),
+            shm_input: "/dummy".to_string(),
+        };
+        let response = dispatch(&request);
+        assert!(!response.success);
+        assert!(response
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("Unknown tool: nonexistent"));
+    }
+
+    #[test]
+    fn test_describe_from_registry() {
+        let desc = describe_tool("fasttree");
+        assert!(desc.is_some());
+        let desc = desc.unwrap();
+        assert_eq!(desc.name, "fasttree");
+        assert!(!desc.config_params.is_empty());
+        assert!(!desc.input_schema.is_empty());
+        assert!(!desc.output_schema.is_empty());
+    }
+
+    #[test]
+    fn test_all_registered_tools_have_unique_names() {
+        let tools = all_tools();
+        let mut names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
+        let original_len = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            original_len,
+            "Duplicate tool names in registry"
+        );
+    }
 }
