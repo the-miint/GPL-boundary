@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Pre-commit hook for GPL-boundary.
+# Install: make install-hooks (or copy to .git/hooks/pre-commit)
+#
+# Runs fmt check and clippy on staged changes. Tests are intentionally
+# excluded -- they require POSIX shared memory and can be slow. Run
+# `make check` or `cargo test` before pushing.
+
+set -euo pipefail
+
+echo "pre-commit: checking formatting..."
+cargo fmt -- --check 2>&1 || {
+    echo ""
+    echo "Formatting check failed. Run 'cargo fmt' and re-stage."
+    exit 1
+}
+
+echo "pre-commit: running clippy..."
+cargo clippy -- -D warnings 2>&1 || {
+    echo ""
+    echo "Clippy found warnings. Fix them and re-stage."
+    exit 1
+}

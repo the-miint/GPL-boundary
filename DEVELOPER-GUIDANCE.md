@@ -472,6 +472,164 @@ If your tool needs non-string input (numeric arrays, matrices), discuss the
 input Arrow schema with the GPL-boundary maintainers. The Rust adapter can
 extract any Arrow column type.
 
+## Smoke tests
+
+Once the Rust adapter compiles and registers with `inventory::submit!`, you
+need smoke tests that exercise the full roundtrip: Arrow IPC input in shared
+memory → tool execution → Arrow IPC output in shared memory. These tests use
+real POSIX shared memory, not mocks.
+
+### Test infrastructure
+
+The `test_util` module (compiled only under `cfg(test)`) provides three
+helpers:
+
+- `unique_shm_name(prefix)` -- generates a unique shm name using PID + atomic
+  counter, safe for parallel test execution and within the macOS 31-character
+  shm name limit
+- `write_arrow_to_shm(name, batch)` -- writes a `RecordBatch` as Arrow IPC
+  stream into a new shared memory region; returns a `SharedMemory` handle that
+  keeps the segment alive (unlinks on drop)
+- `read_arrow_from_shm(name)` -- reads all `RecordBatch`es from Arrow IPC
+  stream in shared memory
+
+Import them in your test module:
+
+```rust
+use crate::shm::SharedMemory;
+use crate::test_util::{read_arrow_from_shm, unique_shm_name, write_arrow_to_shm};
+```
+
+### Writing a smoke test
+
+A smoke test has four phases: build input, run the tool, verify the JSON
+response, and verify the Arrow output. Here is the pattern, using FastTree as
+the reference:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shm::SharedMemory;
+    use crate::test_util::{read_arrow_from_shm, unique_shm_name, write_arrow_to_shm};
+    use arrow::array::StringArray;
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    /// Helper: build an Arrow RecordBatch matching your tool's input schema.
+    fn make_input_batch(names: &[&str], sequences: &[&str]) -> RecordBatch {
+        let schema = Arc::new(input_schema());
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(names.to_vec())),
+                Arc::new(StringArray::from(sequences.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_tool_roundtrip() {
+        // 1. Build input and write to shared memory
+        let input_name = unique_shm_name("tool-in");
+        let batch = make_input_batch(/* your test data */);
+        let _input_shm = write_arrow_to_shm(&input_name, &batch);
+
+        // 2. Run the tool via GplTool::execute()
+        let tool = YourTool;
+        let config = serde_json::json!({ /* tool-specific config */ });
+        let response = tool.execute(&config, &input_name);
+
+        // 3. Verify JSON response
+        assert!(response.success, "Tool failed: {:?}", response.error);
+        assert_eq!(response.shm_outputs.len(), 1);
+
+        let output = &response.shm_outputs[0];
+        assert!(output.name.starts_with("/gpl-boundary-"));
+        assert_eq!(output.label, "your-label");
+        assert!(output.size > 0);
+
+        let result = response.result.unwrap();
+        // ... assert expected metadata fields ...
+
+        // 4. Verify Arrow IPC output in shared memory
+        let out_batches = read_arrow_from_shm(&output.name);
+        assert_eq!(out_batches.len(), 1);
+        let out = &out_batches[0];
+        // ... assert schema, row count, column values ...
+
+        // 5. Clean up output shm (simulating what miint does)
+        let _ = SharedMemory::unlink(&output.name);
+    }
+}
+```
+
+Key points:
+
+- **Keep `_input_shm` alive** until after `execute()` returns. If you drop
+  it, the input segment is unlinked before the tool reads it.
+- **Clean up output shm** at the end of each test with `SharedMemory::unlink`.
+  The tool creates output shm but does not unlink it (that is the caller's
+  job).
+- **Use `unique_shm_name`** for input names. Output names are generated
+  internally by `write_batch_to_output_shm` using the PID, so they are
+  already unique.
+
+### Required test cases
+
+Each tool must have at minimum:
+
+1. **Happy-path roundtrip** -- valid input → success response → correct Arrow
+   output. If your tool accepts meaningfully different input types (e.g.,
+   nucleotide vs. protein), test each.
+2. **Bad shm name** -- pass a nonexistent shm name and assert the response
+   is `success: false` with a useful error message:
+   ```rust
+   #[test]
+   fn test_bad_input_shm() {
+       let tool = YourTool;
+       let config = serde_json::json!({});
+       let response = tool.execute(&config, "/nonexistent-shm-name");
+       assert!(!response.success);
+       assert!(response.error.unwrap().contains("Failed to open shm"));
+   }
+   ```
+3. **ABI size check** -- verify the Rust `#[repr(C)]` config struct matches
+   the C struct. Every tool with FFI config must have this:
+   ```rust
+   #[test]
+   fn test_config_struct_abi_size() {
+       let mut config: YourConfig = unsafe { std::mem::zeroed() };
+       unsafe { your_config_init(&mut config) };
+       assert_eq!(
+           config.struct_size,
+           std::mem::size_of::<YourConfig>(),
+           "ABI mismatch: Rust YourConfig ({} bytes) vs C ({} bytes)",
+           std::mem::size_of::<YourConfig>(),
+           config.struct_size,
+       );
+   }
+   ```
+
+### What not to test
+
+We do not exhaustively test submodule correctness (that is the submodule's
+own CI). Smoke tests verify the integration boundary: that data flows
+correctly through Arrow IPC → FFI → Arrow IPC, that the tool runs without
+crashing, and that the output schema and metadata match expectations.
+
+### Running tests
+
+```bash
+cargo test                    # all tests (uses real POSIX shared memory)
+cargo test --lib tools::      # just tool module tests
+make check                    # fmt + clippy + test
+```
+
+Tests require POSIX shared memory support (`/dev/shm` on Linux, `shm_open`
+on macOS). CI runs on both platforms.
+
 ## Checklist
 
 Before starting integration, verify your C API against this list:
@@ -497,3 +655,6 @@ Before starting integration, verify your C API against this list:
 - [ ] Context reusable after error
 - [ ] Separate API and core source files
 - [ ] Public header with `extern "C"` guards for C++ compatibility
+- [ ] ABI size-check test for config struct
+- [ ] Happy-path smoke test (Arrow IPC roundtrip through shared memory)
+- [ ] Bad-shm-name error test
