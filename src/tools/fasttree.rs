@@ -1,0 +1,702 @@
+//! FastTree adapter: reads Arrow IPC from shared memory, runs fasttree,
+//! writes SOA tree as Arrow IPC back to shared memory.
+
+use crate::protocol::Response;
+use crate::shm::SharedMemory;
+use crate::tools::{ConfigParam, FieldDescription, GplTool, ToolDescription};
+use arrow::array::{BooleanArray, Float64Array, Int32Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::ipc::reader::StreamReader;
+use arrow::ipc::writer::StreamWriter;
+use arrow::record_batch::RecordBatch;
+use std::ffi::{CStr, CString};
+use std::os::raw::{c_char, c_int, c_void};
+use std::ptr;
+use std::sync::Arc;
+
+// --- FFI bindings to libfasttree ---
+
+#[repr(C)]
+pub struct FastTreeConfig {
+    pub struct_size: usize,
+    pub seq_type: c_int,
+    pub model: c_int,
+    pub gtr_rates: [f64; 6],
+    pub gtr_freq: [f64; 4],
+    pub gtr_from_alignment: c_int,
+    pub nni_rounds: c_int,
+    pub spr_rounds: c_int,
+    pub ml_nni_rounds: c_int,
+    pub n_rate_cats: c_int,
+    pub slow: c_int,
+    pub fastest: c_int,
+    pub n_bootstrap: c_int,
+    pub gamma_log_lk: c_int,
+    pub seed: i64,
+    pub use_top_hits: c_int,
+    pub top_hits_mult: f64,
+    pub use_bionj: c_int,
+    pub pseudo_weight: f64,
+    pub constraint_weight: f64,
+    pub ml_accuracy: c_int,
+    pub start_newick: *const c_char,
+    pub quote_names: c_int,
+    pub n_threads: c_int,
+    pub progress_callback: Option<unsafe extern "C" fn(*const c_char, f64, *mut c_void) -> c_int>,
+    pub progress_user_data: *mut c_void,
+    pub log_callback: Option<unsafe extern "C" fn(*const c_char, *mut c_void)>,
+    pub log_user_data: *mut c_void,
+    pub alloc_fn: Option<unsafe extern "C" fn(usize, *mut c_void) -> *mut c_void>,
+    pub free_fn: Option<unsafe extern "C" fn(*mut c_void, *mut c_void)>,
+    pub alloc_user_data: *mut c_void,
+}
+
+#[repr(C)]
+pub struct FastTreeStats {
+    pub n_unique_seqs: c_int,
+    pub log_likelihood: f64,
+    pub gamma_log_lk: f64,
+    pub n_nni: c_int,
+    pub n_spr: c_int,
+    pub n_ml_nni: c_int,
+}
+
+#[repr(C)]
+pub struct FastTreeSoa {
+    pub n_nodes: c_int,
+    pub n_leaves: c_int,
+    pub root: c_int,
+    pub parent: *const c_int,
+    pub branch_length: *const f64,
+    pub support: *const f64,
+    pub n_children: *const c_int,
+    pub is_leaf: *const c_int,
+    pub children_offset: *const c_int,
+    pub name: *const *const c_char,
+    pub _children_buf: *const c_int,
+    pub _name_buf: *const c_char,
+    pub _base: *mut c_void,
+}
+
+#[allow(non_camel_case_types)]
+type fasttree_ctx_t = c_void;
+
+extern "C" {
+    fn fasttree_config_init(config: *mut FastTreeConfig);
+    fn fasttree_create(config: *const FastTreeConfig) -> *mut fasttree_ctx_t;
+    fn fasttree_destroy(ctx: *mut fasttree_ctx_t);
+    fn fasttree_build_soa(
+        ctx: *mut fasttree_ctx_t,
+        names: *const *const c_char,
+        seqs: *const *const c_char,
+        n_seq: c_int,
+        n_pos: c_int,
+        tree_out: *mut *mut FastTreeSoa,
+        stats_out: *mut FastTreeStats,
+    ) -> c_int;
+    fn fasttree_tree_soa_free(tree: *mut FastTreeSoa);
+    fn fasttree_strerror(code: c_int) -> *const c_char;
+    fn fasttree_last_error(ctx: *mut fasttree_ctx_t) -> *const c_char;
+}
+
+const FASTTREE_OK: c_int = 0;
+const FASTTREE_VERSION: &str = "2.3.0";
+
+// --- Arrow schema definitions ---
+
+/// Input schema: columnar alignment data from miint.
+#[allow(dead_code)]
+pub fn input_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("name", DataType::Utf8, false),
+        Field::new("sequence", DataType::Utf8, false),
+    ])
+}
+
+/// Output schema: SOA tree columnar data for miint.
+fn output_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("parent", DataType::Int32, false),
+        Field::new("branch_length", DataType::Float64, false),
+        Field::new("support", DataType::Float64, false),
+        Field::new("n_children", DataType::Int32, false),
+        Field::new("is_leaf", DataType::Boolean, false),
+        Field::new("name", DataType::Utf8, true),
+    ])
+}
+
+// --- Tool implementation ---
+
+pub struct FastTreeTool;
+
+impl FastTreeTool {
+    /// Read Arrow IPC stream from shared memory, extract name and sequence columns.
+    fn read_input(shm_input: &str) -> Result<(Vec<String>, Vec<String>), String> {
+        let shm = SharedMemory::open_readonly(shm_input)
+            .map_err(|e| format!("Failed to open input shm '{shm_input}': {e}"))?;
+
+        let cursor = std::io::Cursor::new(shm.as_slice());
+        let reader = StreamReader::try_new(cursor, None)
+            .map_err(|e| format!("Failed to read Arrow IPC from input shm: {e}"))?;
+
+        let mut all_names = Vec::new();
+        let mut all_seqs = Vec::new();
+
+        for batch_result in reader {
+            let batch = batch_result.map_err(|e| format!("Failed to read Arrow batch: {e}"))?;
+
+            let name_col = batch
+                .column_by_name("name")
+                .ok_or("Input missing 'name' column")?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or("'name' column is not Utf8")?;
+
+            let seq_col = batch
+                .column_by_name("sequence")
+                .ok_or("Input missing 'sequence' column")?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or("'sequence' column is not Utf8")?;
+
+            for i in 0..batch.num_rows() {
+                all_names.push(name_col.value(i).to_string());
+                all_seqs.push(seq_col.value(i).to_string());
+            }
+        }
+
+        Ok((all_names, all_seqs))
+    }
+
+    /// Convert SOA tree to Arrow RecordBatch and write as IPC to a new shared
+    /// memory region. Returns (shm_name, ipc_byte_count).
+    fn write_output(tree: &FastTreeSoa) -> Result<(String, usize), String> {
+        let batch = unsafe { soa_to_record_batch(tree)? };
+
+        // Serialize to IPC in memory first to know the size
+        let mut ipc_buf = Vec::new();
+        {
+            let schema = Arc::new(output_schema());
+            let mut writer = StreamWriter::try_new(&mut ipc_buf, &schema)
+                .map_err(|e| format!("Failed to create Arrow IPC writer: {e}"))?;
+            writer
+                .write(&batch)
+                .map_err(|e| format!("Failed to write Arrow batch: {e}"))?;
+            writer
+                .finish()
+                .map_err(|e| format!("Failed to finish Arrow IPC stream: {e}"))?;
+        }
+
+        let shm_name = crate::shm::output_shm_name();
+
+        // Create output shm and register for cleanup (signal safety)
+        crate::shm::register_for_cleanup(&shm_name);
+
+        let mut shm = SharedMemory::create(&shm_name, ipc_buf.len())
+            .map_err(|e| format!("Failed to create output shm '{shm_name}': {e}"))?;
+
+        shm.as_mut_slice()[..ipc_buf.len()].copy_from_slice(&ipc_buf);
+        let size = ipc_buf.len();
+
+        // Detach: munmap without unlinking. miint will read and unlink.
+        shm.detach();
+
+        Ok((shm_name, size))
+    }
+}
+
+impl GplTool for FastTreeTool {
+    fn name(&self) -> &str {
+        "fasttree"
+    }
+
+    fn version(&self) -> String {
+        FASTTREE_VERSION.to_string()
+    }
+
+    fn describe(&self) -> ToolDescription {
+        ToolDescription {
+            name: "fasttree",
+            version: self.version(),
+            description:
+                "Approximately-maximum-likelihood phylogenetic trees from sequence alignments",
+            config_params: vec![
+                ConfigParam {
+                    name: "seq_type",
+                    param_type: "string",
+                    default: serde_json::json!("auto"),
+                    description: "Sequence type: auto-detect, nucleotide, or protein",
+                    allowed_values: vec!["auto", "nucleotide", "protein"],
+                },
+                ConfigParam {
+                    name: "seed",
+                    param_type: "integer",
+                    default: serde_json::json!(314159),
+                    description: "Random seed for reproducibility",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "model",
+                    param_type: "string",
+                    default: serde_json::json!("auto"),
+                    description: "Substitution model (auto=JTT for protein, JC for nucleotide)",
+                    allowed_values: vec!["auto", "jtt", "lg", "wag", "jc", "gtr"],
+                },
+                ConfigParam {
+                    name: "fastest",
+                    param_type: "boolean",
+                    default: serde_json::json!(false),
+                    description: "Use fastest heuristics (less accurate)",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "gamma",
+                    param_type: "boolean",
+                    default: serde_json::json!(false),
+                    description: "Compute gamma log-likelihood",
+                    allowed_values: vec![],
+                },
+            ],
+            input_schema: vec![
+                FieldDescription {
+                    name: "name",
+                    arrow_type: "Utf8",
+                    nullable: false,
+                    description: "Sequence identifier",
+                },
+                FieldDescription {
+                    name: "sequence",
+                    arrow_type: "Utf8",
+                    nullable: false,
+                    description: "Aligned sequence (all must be equal length)",
+                },
+            ],
+            output_schema: vec![
+                FieldDescription {
+                    name: "id",
+                    arrow_type: "Int32",
+                    nullable: false,
+                    description: "Node index [0, n_nodes)",
+                },
+                FieldDescription {
+                    name: "parent",
+                    arrow_type: "Int32",
+                    nullable: false,
+                    description: "Parent node index (-1 for root)",
+                },
+                FieldDescription {
+                    name: "branch_length",
+                    arrow_type: "Float64",
+                    nullable: false,
+                    description: "Branch length to parent",
+                },
+                FieldDescription {
+                    name: "support",
+                    arrow_type: "Float64",
+                    nullable: false,
+                    description: "SH-like local support value (-1 if not computed)",
+                },
+                FieldDescription {
+                    name: "n_children",
+                    arrow_type: "Int32",
+                    nullable: false,
+                    description: "Number of children (0 for leaves)",
+                },
+                FieldDescription {
+                    name: "is_leaf",
+                    arrow_type: "Boolean",
+                    nullable: false,
+                    description: "Whether node is a leaf",
+                },
+                FieldDescription {
+                    name: "name",
+                    arrow_type: "Utf8",
+                    nullable: true,
+                    description: "Leaf name (null for internal nodes)",
+                },
+            ],
+            response_metadata: vec![
+                FieldDescription {
+                    name: "n_nodes",
+                    arrow_type: "integer",
+                    nullable: false,
+                    description: "Total node count in tree",
+                },
+                FieldDescription {
+                    name: "n_leaves",
+                    arrow_type: "integer",
+                    nullable: false,
+                    description: "Leaf count in tree",
+                },
+                FieldDescription {
+                    name: "root",
+                    arrow_type: "integer",
+                    nullable: false,
+                    description: "Index of root node",
+                },
+                FieldDescription {
+                    name: "stats.n_unique_seqs",
+                    arrow_type: "integer",
+                    nullable: false,
+                    description: "Number of unique sequences after deduplication",
+                },
+                FieldDescription {
+                    name: "stats.log_likelihood",
+                    arrow_type: "float64",
+                    nullable: false,
+                    description: "Final tree log-likelihood (-1 if ML disabled)",
+                },
+                FieldDescription {
+                    name: "stats.gamma_log_lk",
+                    arrow_type: "float64",
+                    nullable: false,
+                    description: "Gamma log-likelihood (-1 if not computed)",
+                },
+                FieldDescription {
+                    name: "stats.n_nni",
+                    arrow_type: "integer",
+                    nullable: false,
+                    description: "Total ME-NNI topology changes",
+                },
+                FieldDescription {
+                    name: "stats.n_spr",
+                    arrow_type: "integer",
+                    nullable: false,
+                    description: "Total SPR topology changes",
+                },
+                FieldDescription {
+                    name: "stats.n_ml_nni",
+                    arrow_type: "integer",
+                    nullable: false,
+                    description: "Total ML-NNI topology changes",
+                },
+            ],
+        }
+    }
+
+    fn execute(&self, config: &serde_json::Value, shm_input: &str) -> Response {
+        // Read input alignment from Arrow IPC in shared memory
+        let (names, sequences) = match Self::read_input(shm_input) {
+            Ok(data) => data,
+            Err(e) => return Response::error(e),
+        };
+
+        if names.len() < 3 {
+            return Response::error("At least 3 sequences required");
+        }
+
+        let n_seq = names.len() as c_int;
+        let n_pos = sequences[0].len() as c_int;
+
+        if sequences.iter().any(|s| s.len() as c_int != n_pos) {
+            return Response::error("All sequences must have the same length (aligned)");
+        }
+
+        // Convert to C strings for fasttree
+        let c_names: Vec<CString> = names
+            .iter()
+            .map(|n| CString::new(n.as_str()).unwrap())
+            .collect();
+        let c_seqs: Vec<CString> = sequences
+            .iter()
+            .map(|s| CString::new(s.as_str()).unwrap())
+            .collect();
+        let c_name_ptrs: Vec<*const c_char> = c_names.iter().map(|n| n.as_ptr()).collect();
+        let c_seq_ptrs: Vec<*const c_char> = c_seqs.iter().map(|s| s.as_ptr()).collect();
+
+        let seq_type = match config.get("seq_type").and_then(|v| v.as_str()) {
+            Some("nucleotide") => 2,
+            Some("protein") => 1,
+            _ => 0,
+        };
+        let seed = config
+            .get("seed")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(314159);
+
+        unsafe {
+            let mut ft_config: FastTreeConfig = std::mem::zeroed();
+            fasttree_config_init(&mut ft_config);
+            ft_config.seq_type = seq_type;
+            ft_config.seed = seed;
+
+            let ctx = fasttree_create(&ft_config);
+            if ctx.is_null() {
+                return Response::error("Failed to create fasttree context (out of memory)");
+            }
+
+            let mut tree: *mut FastTreeSoa = ptr::null_mut();
+            let mut stats: FastTreeStats = std::mem::zeroed();
+
+            let rc = fasttree_build_soa(
+                ctx,
+                c_name_ptrs.as_ptr(),
+                c_seq_ptrs.as_ptr(),
+                n_seq,
+                n_pos,
+                &mut tree,
+                &mut stats,
+            );
+
+            if rc != FASTTREE_OK {
+                let err_msg = CStr::from_ptr(fasttree_last_error(ctx))
+                    .to_string_lossy()
+                    .into_owned();
+                let code_msg = CStr::from_ptr(fasttree_strerror(rc))
+                    .to_string_lossy()
+                    .into_owned();
+                fasttree_destroy(ctx);
+                return Response::error(format!("{code_msg}: {err_msg}"));
+            }
+
+            // Write tree as Arrow IPC to a new output shared memory region
+            let (shm_name, shm_size) = match Self::write_output(&*tree) {
+                Ok(v) => v,
+                Err(e) => {
+                    fasttree_tree_soa_free(tree);
+                    fasttree_destroy(ctx);
+                    return Response::error(e);
+                }
+            };
+
+            // Build lightweight stats for JSON response
+            let result = serde_json::json!({
+                "n_nodes": (*tree).n_nodes,
+                "n_leaves": (*tree).n_leaves,
+                "root": (*tree).root,
+                "stats": {
+                    "n_unique_seqs": stats.n_unique_seqs,
+                    "log_likelihood": stats.log_likelihood,
+                    "gamma_log_lk": stats.gamma_log_lk,
+                    "n_nni": stats.n_nni,
+                    "n_spr": stats.n_spr,
+                    "n_ml_nni": stats.n_ml_nni,
+                }
+            });
+
+            fasttree_tree_soa_free(tree);
+            fasttree_destroy(ctx);
+
+            // Deregister from cleanup — caller (miint) now owns the output shm
+            crate::shm::deregister_cleanup(&shm_name);
+
+            Response::ok(result, shm_name, shm_size)
+        }
+    }
+}
+
+/// Convert fasttree SOA tree to an Arrow RecordBatch.
+unsafe fn soa_to_record_batch(tree: &FastTreeSoa) -> Result<RecordBatch, String> {
+    let n = tree.n_nodes as usize;
+
+    let ids: Vec<i32> = (0..n as i32).collect();
+    let parent = std::slice::from_raw_parts(tree.parent, n);
+    let branch_length = std::slice::from_raw_parts(tree.branch_length, n);
+    let support = std::slice::from_raw_parts(tree.support, n);
+    let n_children = std::slice::from_raw_parts(tree.n_children, n);
+    let is_leaf_raw = std::slice::from_raw_parts(tree.is_leaf, n);
+    let name_ptrs = std::slice::from_raw_parts(tree.name, n);
+
+    let names: Vec<Option<String>> = name_ptrs
+        .iter()
+        .map(|&p| {
+            if p.is_null() {
+                None
+            } else {
+                Some(CStr::from_ptr(p).to_string_lossy().into_owned())
+            }
+        })
+        .collect();
+
+    let schema = Arc::new(output_schema());
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(Int32Array::from(parent.to_vec())),
+            Arc::new(Float64Array::from(branch_length.to_vec())),
+            Arc::new(Float64Array::from(support.to_vec())),
+            Arc::new(Int32Array::from(n_children.to_vec())),
+            Arc::new(BooleanArray::from(
+                is_leaf_raw.iter().map(|&v| v != 0).collect::<Vec<bool>>(),
+            )),
+            Arc::new(StringArray::from(
+                names
+                    .iter()
+                    .map(|n| n.as_deref())
+                    .collect::<Vec<Option<&str>>>(),
+            )),
+        ],
+    )
+    .map_err(|e| format!("Failed to create Arrow RecordBatch: {e}"))
+}
+
+/// Helper: write an Arrow RecordBatch as IPC stream into a new shared memory region.
+/// Used by tests to set up input data.
+#[cfg(test)]
+pub fn write_arrow_to_shm(name: &str, batch: &RecordBatch) -> SharedMemory {
+    let mut ipc_buf = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut ipc_buf, &batch.schema()).unwrap();
+        writer.write(batch).unwrap();
+        writer.finish().unwrap();
+    }
+
+    let mut shm = SharedMemory::create(name, ipc_buf.len()).unwrap();
+    shm.as_mut_slice()[..ipc_buf.len()].copy_from_slice(&ipc_buf);
+    shm
+}
+
+/// Helper: read an Arrow RecordBatch from IPC stream in shared memory.
+/// Used by tests to verify output data.
+#[cfg(test)]
+pub fn read_arrow_from_shm(name: &str) -> Vec<RecordBatch> {
+    let shm = SharedMemory::open_readonly(name).unwrap();
+    let cursor = std::io::Cursor::new(shm.as_slice());
+    let reader = StreamReader::try_new(cursor, None).unwrap();
+    reader.into_iter().map(|b| b.unwrap()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_input_batch(names: &[&str], sequences: &[&str]) -> RecordBatch {
+        let schema = Arc::new(input_schema());
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(names.to_vec())),
+                Arc::new(StringArray::from(sequences.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn unique_shm_name(prefix: &str) -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("/{prefix}-{ts}")
+    }
+
+    #[test]
+    fn test_fasttree_nucleotide_roundtrip() {
+        let input_name = unique_shm_name("ft-nt-in");
+
+        let batch = make_input_batch(
+            &["SeqA", "SeqB", "SeqC", "SeqD"],
+            &[
+                "ACGTACGTACGTACGTACGT",
+                "ACGTACGTACGTACGTACGA",
+                "TGCATGCATGCATGCATGCA",
+                "TGCATGCATGCATGCATGCG",
+            ],
+        );
+
+        // Write input to shm (simulating what miint does)
+        let _input_shm = write_arrow_to_shm(&input_name, &batch);
+
+        let tool = FastTreeTool;
+        let config = serde_json::json!({
+            "seq_type": "nucleotide",
+            "seed": 12345
+        });
+
+        let response = tool.execute(&config, &input_name);
+        assert!(response.success, "FastTree failed: {:?}", response.error);
+
+        // Response should contain output shm info
+        let output_name = response.shm_output.as_ref().unwrap();
+        let output_size = response.shm_output_size.unwrap();
+        assert!(output_size > 0);
+        assert!(output_name.starts_with("/gpl-boundary-"));
+
+        // Verify JSON metadata
+        let result = response.result.unwrap();
+        assert_eq!(result["n_leaves"], 4);
+        assert!(result["n_nodes"].as_i64().unwrap() >= 4);
+        assert!(result["stats"]["log_likelihood"].as_f64().unwrap() < 0.0);
+
+        // Verify Arrow IPC output in shared memory
+        let out_batches = read_arrow_from_shm(output_name);
+        assert_eq!(out_batches.len(), 1);
+        let out = &out_batches[0];
+
+        let n_nodes = result["n_nodes"].as_i64().unwrap() as usize;
+        assert_eq!(out.num_rows(), n_nodes);
+        assert_eq!(out.num_columns(), 7);
+
+        // Check column names
+        assert_eq!(out.schema().field(0).name(), "id");
+        assert_eq!(out.schema().field(1).name(), "parent");
+        assert_eq!(out.schema().field(2).name(), "branch_length");
+        assert_eq!(out.schema().field(5).name(), "is_leaf");
+        assert_eq!(out.schema().field(6).name(), "name");
+
+        // Count leaves in output
+        let is_leaf = out
+            .column_by_name("is_leaf")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let leaf_count = (0..is_leaf.len()).filter(|&i| is_leaf.value(i)).count();
+        assert_eq!(leaf_count, 4);
+
+        // Caller cleans up output shm (simulating what miint does)
+        let _ = SharedMemory::unlink(output_name);
+    }
+
+    #[test]
+    fn test_fasttree_protein_roundtrip() {
+        let input_name = unique_shm_name("ft-aa-in");
+
+        let batch = make_input_batch(
+            &["ProtA", "ProtB", "ProtC", "ProtD"],
+            &["ARNDCQEGHI", "ARNDCQEGHL", "LKMFPSTWYV", "LKMFPSTWYA"],
+        );
+
+        let _input_shm = write_arrow_to_shm(&input_name, &batch);
+
+        let tool = FastTreeTool;
+        let config = serde_json::json!({
+            "seq_type": "protein",
+            "seed": 12345
+        });
+
+        let response = tool.execute(&config, &input_name);
+        assert!(
+            response.success,
+            "FastTree protein failed: {:?}",
+            response.error
+        );
+
+        let output_name = response.shm_output.as_ref().unwrap();
+        let result = response.result.unwrap();
+        assert_eq!(result["n_leaves"], 4);
+
+        let out_batches = read_arrow_from_shm(output_name);
+        assert_eq!(out_batches.len(), 1);
+        assert_eq!(
+            out_batches[0].num_rows(),
+            result["n_nodes"].as_i64().unwrap() as usize
+        );
+
+        let _ = SharedMemory::unlink(output_name);
+    }
+
+    #[test]
+    fn test_fasttree_bad_input_shm() {
+        let tool = FastTreeTool;
+        let config = serde_json::json!({"seq_type": "nucleotide"});
+
+        let response = tool.execute(&config, "/nonexistent-shm-name");
+        assert!(!response.success);
+        assert!(response.error.unwrap().contains("Failed to open input shm"));
+    }
+}

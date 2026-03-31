@@ -1,0 +1,4 @@
+[submodule "ext/fasttree"]
+	path = ext/fasttree
+	url = https://github.com/the-miint/fasttree.git
+	branch = v2.3.0-miint
