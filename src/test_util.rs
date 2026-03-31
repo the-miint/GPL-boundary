@@ -8,16 +8,16 @@ use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
-/// Generate a unique shm name using prefix, PID, and nanosecond timestamp.
-/// Includes PID to prevent collisions across concurrent test processes.
+/// Generate a unique shm name using prefix, PID, and an atomic counter.
+/// Uses a counter instead of a timestamp to keep names under the macOS
+/// POSIX shm 31-character limit. PID prevents collisions across concurrent
+/// test processes; the counter prevents collisions within a process.
 pub fn unique_shm_name(prefix: &str) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    format!("/{prefix}-{pid}-{ts}")
+    format!("/{prefix}-{pid}-{n}")
 }
 
 /// Write an Arrow RecordBatch as IPC stream into a new shared memory region.
