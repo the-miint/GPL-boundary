@@ -173,12 +173,18 @@ Response (stdout JSON):
 ```json
 {
   "success": true,
+  "schema_version": 1,
   "shm_outputs": [
     { "name": "/gpl-boundary-1234-tree", "label": "tree", "size": 8192 }
   ],
   "result": { "n_nodes": 7, "n_leaves": 4, "root": 6, "stats": { ... } }
 }
 ```
+
+`schema_version` is an integer that is bumped on any breaking output schema
+change (new/removed/renamed columns, type changes). It lets consumers fail
+fast when boundary and extension versions drift. It is set by `dispatch()`
+from the tool's `schema_version()` method and is only present on success.
 
 Tools may produce multiple outputs (each a separate shm segment with a
 distinct label). `shm_outputs` is omitted from JSON when empty (error

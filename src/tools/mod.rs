@@ -28,6 +28,7 @@ pub struct ConfigParam {
 pub struct ToolDescription {
     pub name: &'static str,
     pub version: String,
+    pub schema_version: u32,
     pub description: &'static str,
     pub config_params: Vec<ConfigParam>,
     pub input_schema: Vec<FieldDescription>,
@@ -39,6 +40,9 @@ pub struct ToolDescription {
 pub trait GplTool {
     fn name(&self) -> &str;
     fn version(&self) -> String;
+    /// Output Arrow schema version. Bump on any breaking schema change
+    /// (new/removed/renamed columns, type changes) so consumers can fail fast.
+    fn schema_version(&self) -> u32;
     fn describe(&self) -> ToolDescription;
     /// Execute the tool. The tool reads input from shm_input, creates its own
     /// output shm, and returns a Response containing the output shm name and size.
@@ -65,7 +69,13 @@ fn all_tools() -> Vec<Box<dyn GplTool>> {
 pub fn dispatch(request: &Request) -> Response {
     let tool = all_tools().into_iter().find(|t| t.name() == request.tool);
     match tool {
-        Some(t) => t.execute(&request.config, &request.shm_input),
+        Some(t) => {
+            let mut response = t.execute(&request.config, &request.shm_input);
+            if response.success {
+                response.schema_version = Some(t.schema_version());
+            }
+            response
+        }
         None => Response::error(format!("Unknown tool: {}", request.tool)),
     }
 }

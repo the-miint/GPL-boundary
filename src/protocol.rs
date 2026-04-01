@@ -46,6 +46,12 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 
+    /// Schema version for the tool's output Arrow schema. Bumped on any
+    /// breaking change (new/removed/renamed columns, type changes). Lets the
+    /// caller fail fast when boundary and extension versions drift.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
+
     /// Output shared memory segments, each containing Arrow IPC data.
     /// Created by gpl-boundary. Caller is responsible for reading and unlinking.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -62,6 +68,7 @@ impl Response {
         Self {
             success: true,
             error: None,
+            schema_version: None,
             shm_outputs,
             result: Some(result),
         }
@@ -71,6 +78,7 @@ impl Response {
         Self {
             success: false,
             error: Some(msg.into()),
+            schema_version: None,
             shm_outputs: vec![],
             result: None,
         }
@@ -89,6 +97,8 @@ mod tests {
         );
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
         assert!(json["success"].as_bool().unwrap());
+        // schema_version is set by dispatch, not Response::ok
+        assert!(json.get("schema_version").is_none());
         let outputs = json["shm_outputs"].as_array().unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0]["name"], "/out1");
@@ -114,6 +124,7 @@ mod tests {
         assert!(!json["success"].as_bool().unwrap());
         assert_eq!(json["error"], "something broke");
         assert!(json.get("shm_outputs").is_none());
+        assert!(json.get("schema_version").is_none());
         assert!(json.get("result").is_none());
     }
 

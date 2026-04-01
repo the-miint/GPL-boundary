@@ -99,6 +99,15 @@ extern "C" {
 const FASTTREE_OK: c_int = 0;
 const FASTTREE_VERSION: &str = "2.3.0";
 
+/// C-callable log callback that writes messages to stderr.
+/// Passed as `log_callback` to fasttree when verbose mode is enabled.
+unsafe extern "C" fn stderr_log_callback(msg: *const c_char, _user_data: *mut c_void) {
+    if !msg.is_null() {
+        let s = CStr::from_ptr(msg).to_string_lossy();
+        eprint!("{s}");
+    }
+}
+
 // --- Arrow schema definitions ---
 
 /// Input schema: columnar alignment data from miint.
@@ -182,10 +191,15 @@ impl GplTool for FastTreeTool {
         FASTTREE_VERSION.to_string()
     }
 
+    fn schema_version(&self) -> u32 {
+        1
+    }
+
     fn describe(&self) -> ToolDescription {
         ToolDescription {
             name: "fasttree",
             version: self.version(),
+            schema_version: self.schema_version(),
             description:
                 "Approximately-maximum-likelihood phylogenetic trees from sequence alignments",
             config_params: vec![
@@ -222,6 +236,13 @@ impl GplTool for FastTreeTool {
                     param_type: "boolean",
                     default: serde_json::json!(false),
                     description: "Compute gamma log-likelihood",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "verbose",
+                    param_type: "boolean",
+                    default: serde_json::json!(false),
+                    description: "Write tool log output to stderr for diagnostics",
                     allowed_values: vec![],
                 },
             ],
@@ -381,12 +402,20 @@ impl GplTool for FastTreeTool {
             .get("seed")
             .and_then(|v| v.as_i64())
             .unwrap_or(314159);
+        let verbose = config
+            .get("verbose")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         unsafe {
             let mut ft_config: FastTreeConfig = std::mem::zeroed();
             fasttree_config_init(&mut ft_config);
             ft_config.seq_type = seq_type;
             ft_config.seed = seed;
+
+            if verbose {
+                ft_config.log_callback = Some(stderr_log_callback);
+            }
 
             let ctx = fasttree_create(&ft_config);
             if ctx.is_null() {
