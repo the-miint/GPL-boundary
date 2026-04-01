@@ -322,8 +322,8 @@ if (config->log_callback) {
 }
 ```
 
-The Rust adapter currently discards log output. Future versions may route it
-to stderr.
+The Rust adapter routes log callback output to stderr when the caller enables
+`verbose` mode in the tool config. Keep messages informative but not excessive.
 
 ## Build integration
 
