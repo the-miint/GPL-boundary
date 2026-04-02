@@ -21,6 +21,10 @@ fn test_version_output() {
         "Version output missing fasttree: {stdout}"
     );
     assert!(
+        stdout.contains("prodigal"),
+        "Version output missing prodigal: {stdout}"
+    );
+    assert!(
         stdout.contains("gpl_boundary"),
         "Version output missing gpl_boundary: {stdout}"
     );
@@ -38,5 +42,9 @@ fn test_list_tools_output() {
     assert!(
         stdout.contains("fasttree"),
         "list-tools missing fasttree: {stdout}"
+    );
+    assert!(
+        stdout.contains("prodigal"),
+        "list-tools missing prodigal: {stdout}"
     );
 }

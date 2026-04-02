@@ -1,4 +1,5 @@
 pub mod fasttree;
+pub mod prodigal;
 
 use crate::protocol::{Request, Response};
 
@@ -121,6 +122,15 @@ mod tests {
         assert!(
             names.contains(&"fasttree".to_string()),
             "fasttree not found in registry: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_prodigal_in_registry() {
+        let names = list_tools();
+        assert!(
+            names.contains(&"prodigal".to_string()),
+            "prodigal not found in registry: {names:?}"
         );
     }
 
