@@ -1,4 +1,4 @@
-# Developer Guidance: Adding a Program to GPL-boundary
+# C/C++ Library API Guidance for GPL-boundary Integration
 
 This document is for developers of C/C++ bioinformatics tools who want to
 integrate their program with GPL-boundary. It covers C API design decisions
