@@ -69,6 +69,8 @@ GPL-licensed tools live as git submodules under `ext/`. Currently:
 
 - `ext/fasttree` -- FastTree phylogenetic tree inference (GPL-2.0+, C99,
   branch `v2.3.0-miint`)
+- `ext/prodigal` -- Prodigal prokaryotic gene prediction (GPL-3.0, C99,
+  branch `v2.6.4-miint`)
 
 **We control the submodule APIs** (the-miint org maintains forks). If an API
 does not fit our needs, we can modify it. However, changes require
@@ -118,8 +120,10 @@ src/
   tools/
     mod.rs           # GplTool trait, ToolRegistration, inventory-based dispatch
     fasttree.rs      # FastTree FFI bindings + GplTool impl + tests
+    prodigal.rs      # Prodigal FFI bindings + GplTool impl + tests
 ext/
-  fasttree/          # git submodule (GPL, C99)
+  fasttree/          # git submodule (GPL-2.0+, C99)
+  prodigal/          # git submodule (GPL-3.0, C99)
 tests/
   build_sanity.rs    # Integration tests: binary links and runs correctly
 build.rs             # Per-tool C compilation functions via cc crate
@@ -205,6 +209,28 @@ responses, metadata-only tools). Labels must be `[a-z0-9-]+`.
 - `is_leaf: Boolean`
 - `name: Utf8` (nullable) -- leaf name, null for internal nodes
 
+**Prodigal input** (written by miint to shm_input):
+- `name: Utf8` -- contig identifier
+- `sequence: Utf8` -- nucleotide sequence (different lengths allowed)
+
+**Prodigal output** (written by gpl-boundary to shm_outputs, label "genes"):
+- `seq_name: Utf8` -- source contig identifier
+- `begin: Int32` -- gene start position (1-based)
+- `end: Int32` -- gene end position (1-based)
+- `strand: Int32` -- +1 forward, -1 reverse
+- `partial_left: Boolean` -- gene is partial at left edge
+- `partial_right: Boolean` -- gene is partial at right edge
+- `start_type: Int32` -- 0=ATG, 1=GTG, 2=TTG, 3=Edge
+- `cscore: Float64` -- coding score
+- `sscore: Float64` -- start score
+- `rscore: Float64` -- RBS score
+- `uscore: Float64` -- upstream score
+- `tscore: Float64` -- type score
+- `confidence: Float64` -- gene confidence [50, 100]
+- `gc_cont: Float64` -- per-gene GC content
+- `rbs_motif: Utf8` -- ribosome binding site motif
+- `rbs_spacer: Utf8` -- RBS spacer region
+
 ## Arrow IPC write strategy
 
 `write_batch_to_output_shm` serializes to `Vec<u8>` then copies into shm.
@@ -239,3 +265,4 @@ via `struct_size` as first field in config.
 
 - **miint**: `../duckdb-miint` -- C++ DuckDB extension that spawns this binary
 - **fasttree**: `ext/fasttree` -- GPL phylogenetic tree library
+- **prodigal**: `ext/prodigal` -- GPL prokaryotic gene prediction library

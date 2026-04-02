@@ -2,3 +2,7 @@
 	path = ext/fasttree
 	url = https://github.com/the-miint/fasttree.git
 	branch = v2.3.0-miint
+[submodule "ext/prodigal"]
+	path = ext/prodigal
+	url = https://github.com/the-miint/prodigal.git
+	branch = v2.6.4-miint
