@@ -96,7 +96,7 @@ extern "C" {
 }
 
 const PRODIGAL_OK: c_int = 0;
-const PRODIGAL_VERSION: &str = "2.6.3";
+const PRODIGAL_VERSION: &str = "2.6.4";
 
 /// C-callable log callback that writes messages to stderr.
 unsafe extern "C" fn stderr_log_callback(msg: *const c_char, _user_data: *mut c_void) {
