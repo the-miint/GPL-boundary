@@ -206,6 +206,9 @@ fn build_sortmerna() {
         .define("SMR_NO_MAIN", None)
         .opt_level(3)
         .warnings(false)
+        // alp uses deprecated `register` keyword; Clang 16+ treats this as
+        // a hard error in C++17 mode even with -w. Suppress it explicitly.
+        .flag_if_supported("-Wno-register")
         .compile("smr_cpp");
 
     // Provide build_version symbols expected by options.cpp.
