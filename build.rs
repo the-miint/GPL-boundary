@@ -84,7 +84,12 @@ fn build_sortmerna() {
     let api_src = dir.join("src/smr_api");
     let cmph_dir = dir.join("3rdparty/cmph");
     let alp_dir = dir.join("3rdparty/alp");
-    let cq_dir = dir.join("3rdparty/concurrentqueue");
+    let cq_dir = PathBuf::from("vendor/concurrentqueue"); // vendored header-only lib
+
+    // Probe RocksDB early so we can pass its include paths to the C++ build.
+    let rocksdb = pkg_config::Config::new()
+        .probe("rocksdb")
+        .expect("RocksDB not found. Install librocksdb-dev (Debian/Ubuntu) or rocksdb (brew).");
 
     // -- C sources: cmph (23 files) + ssw.c --
     let cmph_files: Vec<PathBuf> = [
@@ -202,7 +207,13 @@ fn build_sortmerna() {
         .include(dir.join("include"))
         .include(&cmph_dir)
         .include(&alp_dir)
-        .include(&cq_dir)
+        .include(&cq_dir);
+    // RocksDB include paths from pkg-config (needed on macOS where brew
+    // installs to /opt/homebrew, not on the default include path)
+    for path in &rocksdb.include_paths {
+        cpp_build.include(path);
+    }
+    cpp_build
         .define("SMR_NO_MAIN", None)
         .opt_level(3)
         .warnings(false)
@@ -241,20 +252,23 @@ extern "C++" {
 }
 
 /// Link system libraries required by SortMeRNA.
+/// RocksDB is already probed via pkg-config in build_sortmerna() (which
+/// emits the link flags). This handles the remaining libraries.
 fn link_sortmerna_deps() {
-    // RocksDB via pkg-config (finds headers + link flags automatically)
-    pkg_config::Config::new()
-        .probe("rocksdb")
-        .expect("RocksDB not found. Install librocksdb-dev (Debian/Ubuntu) or rocksdb (brew).");
-
     // zlib (used directly by sortmerna for gzip support)
     println!("cargo:rustc-link-lib=z");
 
-    // C++ standard library
-    println!("cargo:rustc-link-lib=stdc++");
+    // C++ standard library (cc crate handles this for compiled objects,
+    // but we also need it for the final link of the Rust binary)
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "macos" {
+        println!("cargo:rustc-link-lib=c++");
+    } else {
+        println!("cargo:rustc-link-lib=stdc++");
+    }
 
     // Linux-specific: libdl for dynamic loading
-    if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "linux" {
+    if target_os == "linux" {
         println!("cargo:rustc-link-lib=dl");
     }
 }
