@@ -6,3 +6,7 @@
 	path = ext/prodigal
 	url = https://github.com/the-miint/prodigal.git
 	branch = v2.6.4-miint
+[submodule "ext/sortmerna"]
+	path = ext/sortmerna
+	url = git@github.com:the-miint/sortmerna.git
+	branch = v4.4.0-miint

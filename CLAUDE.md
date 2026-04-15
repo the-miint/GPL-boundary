@@ -71,6 +71,10 @@ GPL-licensed tools live as git submodules under `ext/`. Currently:
   branch `v2.3.0-miint`)
 - `ext/prodigal` -- Prodigal prokaryotic gene prediction (GPL-3.0, C99,
   branch `v2.6.4-miint`)
+- `ext/sortmerna` -- SortMeRNA rRNA filtering and sequence alignment
+  (LGPL-3.0, C++17, branch `v4.4.0-miint`). Requires system-installed
+  RocksDB and zlib. Build uses two `cc::Build` instances (C and C++17)
+  plus pkg-config for RocksDB discovery.
 
 **We control the submodule APIs** (the-miint org maintains forks). If an API
 does not fit our needs, we can modify it. However, changes require
@@ -105,8 +109,10 @@ cargo test           # unit + integration tests (uses real POSIX shared memory)
 make check           # fmt + clippy + test
 ```
 
-The `build.rs` compiles C sources from submodules using the `cc` crate. No
-system-level install of submodule libraries is needed.
+The `build.rs` compiles C/C++ sources from submodules using the `cc` crate.
+SortMeRNA requires system-installed RocksDB and zlib (`librocksdb-dev` and
+`libz-dev` on Debian/Ubuntu, or `brew install rocksdb zlib` on macOS).
+RocksDB is discovered via `pkg-config`.
 
 ## Code organization
 
@@ -121,9 +127,11 @@ src/
     mod.rs           # GplTool trait, ToolRegistration, inventory-based dispatch
     fasttree.rs      # FastTree FFI bindings + GplTool impl + tests
     prodigal.rs      # Prodigal FFI bindings + GplTool impl + tests
+    sortmerna.rs     # SortMeRNA FFI bindings + GplTool impl + tests
 ext/
   fasttree/          # git submodule (GPL-2.0+, C99)
   prodigal/          # git submodule (GPL-3.0, C99)
+  sortmerna/         # git submodule (LGPL-3.0, C++17)
 tests/
   build_sanity.rs    # Integration tests: binary links and runs correctly
 build.rs             # Per-tool C compilation functions via cc crate
@@ -231,6 +239,30 @@ responses, metadata-only tools). Labels must be `[a-z0-9-]+`.
 - `rbs_motif: Utf8` -- ribosome binding site motif
 - `rbs_spacer: Utf8` -- RBS spacer region
 
+**SortMeRNA input** (written by miint to shm_input):
+- `read_id: Utf8` -- sequence identifier
+- `sequence: Utf8` -- forward read nucleotide sequence
+- `sequence2: Utf8` (nullable) -- reverse read for paired-end; absence = single-end
+
+**SortMeRNA output** (written by gpl-boundary to shm_outputs, label "alignments"):
+- `read_id: Utf8` -- read identifier (from input)
+- `aligned: Int32` -- 1 if aligned, 0 otherwise
+- `strand: Int32` -- 1=forward, 0=reverse-complement, -1=unaligned
+- `ref_name: Utf8` (nullable) -- reference sequence ID, null if unaligned
+- `ref_start: Int32` -- 1-based start on reference, 0 if unaligned
+- `ref_end: Int32` -- 1-based end on reference, 0 if unaligned
+- `cigar: Utf8` (nullable) -- CIGAR string, null if unaligned
+- `score: Int32` -- Smith-Waterman alignment score, -1 if unaligned
+- `e_value: Float64` -- E-value of best alignment
+- `identity: Float64` -- percent identity (0-100)
+- `coverage: Float64` -- query coverage (0-100)
+- `edit_distance: Int32` -- edit distance (mismatches + gaps), -1 if unaligned
+
+SortMeRNA requires `ref_paths` (reference FASTA file paths) in the config
+JSON. Reference indexing is handled internally. Paired-end mode is inferred
+from the presence of the `sequence2` column — sequences are interleaved as
+`[fwd0, rev0, fwd1, rev1, ...]` for the C API.
+
 ## Arrow IPC write strategy
 
 `write_batch_to_output_shm` serializes to `Vec<u8>` then copies into shm.
@@ -266,3 +298,4 @@ via `struct_size` as first field in config.
 - **miint**: `../duckdb-miint` -- C++ DuckDB extension that spawns this binary
 - **fasttree**: `ext/fasttree` -- GPL phylogenetic tree library
 - **prodigal**: `ext/prodigal` -- GPL prokaryotic gene prediction library
+- **sortmerna**: `ext/sortmerna` -- LGPL rRNA filtering and alignment library
