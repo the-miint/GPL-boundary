@@ -75,6 +75,13 @@ GPL-licensed tools live as git submodules under `ext/`. Currently:
   (LGPL-3.0, C++17, branch `v4.4.0-miint`). Requires system-installed
   RocksDB and zlib. Build uses two `cc::Build` instances (C and C++17)
   plus pkg-config for RocksDB discovery.
+- `ext/bowtie2` -- Bowtie2 short read aligner (GPL-3.0, C++11, branch
+  `v2.5.5-miint`). Requires zlib. Uses global mutable state behind a mutex
+  (only one alignment per process at a time; acceptable for single-invocation
+  model). Build compiles ~54 .cpp files via `cc::Build` with `cpp(true)`.
+  The combined library includes both aligner and builder APIs; the builder
+  is used in tests to create index fixtures programmatically. Requires
+  pre-built `.bt2` index files on disk (path passed via `index_path` config).
 
 **We control the submodule APIs** (the-miint org maintains forks). If an API
 does not fit our needs, we can modify it. However, changes require
@@ -128,10 +135,12 @@ src/
     fasttree.rs      # FastTree FFI bindings + GplTool impl + tests
     prodigal.rs      # Prodigal FFI bindings + GplTool impl + tests
     sortmerna.rs     # SortMeRNA FFI bindings + GplTool impl + tests
+    bowtie2_align.rs # Bowtie2 aligner FFI bindings + GplTool impl + tests
 ext/
   fasttree/          # git submodule (GPL-2.0+, C99)
   prodigal/          # git submodule (GPL-3.0, C99)
   sortmerna/         # git submodule (LGPL-3.0, C++17)
+  bowtie2/           # git submodule (GPL-3.0, C++11)
 tests/
   build_sanity.rs    # Integration tests: binary links and runs correctly
 build.rs             # Per-tool C compilation functions via cc crate
@@ -262,6 +271,36 @@ SortMeRNA requires `ref_paths` (reference FASTA file paths) in the config
 JSON. Reference indexing is handled internally. Paired-end mode is inferred
 from the presence of the `sequence2` column — sequences are interleaved as
 `[fwd0, rev0, fwd1, rev1, ...]` for the C API.
+
+**Bowtie2-align input** (written by miint to shm_input):
+- `read_id: Utf8` -- read identifier
+- `sequence1: Utf8` -- mate 1 (or unpaired) DNA sequence
+- `sequence2: Utf8` (nullable) -- mate 2 sequence; absence or all-null = single-end
+- `qual1: Utf8` (nullable) -- Phred+33 quality string; null = FASTA (default quality)
+- `qual2: Utf8` (nullable) -- mate 2 quality string; null = FASTA
+
+**Bowtie2-align output** (written by gpl-boundary to shm_outputs, label "alignments"):
+- `read_id: Utf8` -- read name (QNAME)
+- `flags: UInt16` -- SAM flags
+- `reference: Utf8` -- reference name (RNAME); * if unmapped
+- `position: Int64` -- 1-based leftmost position; 0 if unmapped
+- `mapq: UInt8` -- mapping quality
+- `cigar: Utf8` -- CIGAR string; * if unmapped
+- `mate_reference: Utf8` -- mate reference name; * if unavailable
+- `mate_position: Int64` -- mate position; 0 if unavailable
+- `template_length: Int64` -- template length; 0 if unavailable
+- `tag_as: Int32` (nullable) -- AS:i alignment score
+- `tag_xs: Int32` (nullable) -- XS:i second-best score
+- `tag_nm: Int32` (nullable) -- NM:i edit distance
+- `tag_yt: Utf8` (nullable) -- YT:Z pairing type (UU/CP/DP/UP)
+- `tag_md: Utf8` (nullable) -- MD:Z mismatch string
+
+Bowtie2-align requires `index_path` (path to pre-built `.bt2` index files) in
+the config JSON. The output does not include `seq` or `qual` columns (caller
+already has the reads). Paired-end mode is inferred from the `sequence2`
+column. The tool has ~30 config parameters covering scoring, seeding,
+paired-end behavior, effort, and SAM output options — see `--describe
+bowtie2-align` for the full list.
 
 ## Arrow IPC write strategy
 

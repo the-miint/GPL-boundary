@@ -10,3 +10,7 @@
 	path = ext/sortmerna
 	url = git@github.com:the-miint/sortmerna.git
 	branch = v4.4.0-miint
+[submodule "ext/bowtie2"]
+	path = ext/bowtie2
+	url = https://github.com/the-miint/bowtie2.git
+	branch = v2.5.5-miint

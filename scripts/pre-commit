@@ -8,6 +8,49 @@
 
 set -euo pipefail
 
+# Warn if the local Rust toolchain is older than what CI uses (stable).
+# Newer clippy versions add lints — a clean local check can still fail in CI.
+check_toolchain_freshness() {
+    local local_version
+    local latest_stable
+    local local_minor
+    local stable_minor
+
+    local_version=$(rustc --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+    # Fetch the latest stable version from the release manifest (cached for 24h)
+    local cache_file="${TMPDIR:-/tmp}/rust-stable-version-cache"
+    local cache_max_age=86400  # 24 hours
+
+    if [[ -f "$cache_file" ]] && \
+       [[ $(( $(date +%s) - $(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || echo 0) )) -lt $cache_max_age ]]; then
+        latest_stable=$(cat "$cache_file")
+    else
+        latest_stable=$(curl -sf --max-time 5 \
+            "https://static.rust-lang.org/dist/channel-rust-stable.toml" 2>/dev/null \
+            | grep -A1 '^\[pkg\.rustc\]' \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+            | head -1 || echo "")
+        if [[ -n "$latest_stable" ]]; then
+            echo "$latest_stable" > "$cache_file"
+        fi
+    fi
+
+    if [[ -z "$latest_stable" ]]; then
+        return  # can't check, skip silently
+    fi
+
+    local_minor=$(echo "$local_version" | cut -d. -f2)
+    stable_minor=$(echo "$latest_stable" | cut -d. -f2)
+
+    if [[ "$local_minor" -lt "$stable_minor" ]]; then
+        echo ""
+        echo "WARNING: local Rust $local_version is behind stable $latest_stable"
+        echo "  CI uses stable — newer clippy may have additional lints."
+        echo "  Run: rustup update stable"
+        echo ""
+    fi
+}
+
 echo "pre-commit: checking formatting..."
 cargo fmt -- --check 2>&1 || {
     echo ""
@@ -21,3 +64,6 @@ cargo clippy -- -D warnings 2>&1 || {
     echo "Clippy found warnings. Fix them and re-stage."
     exit 1
 }
+
+# Non-blocking: warn about toolchain drift but don't fail the commit
+check_toolchain_freshness
