@@ -8,7 +8,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::protocol::Response;
-use crate::tools::{ConfigParam, FieldDescription, GplTool, ToolDescription, ToolRegistration};
+use crate::tools::{
+    ConfigParam, FieldDescription, GplTool, StreamingContext, ToolDescription, ToolRegistration,
+};
 
 // ---------------------------------------------------------------------------
 // FFI bindings — mirror ext/sortmerna/include/smr_api.h
@@ -157,6 +159,182 @@ fn smr_version_string() -> String {
             "unknown".to_string()
         } else {
             CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming context
+// ---------------------------------------------------------------------------
+
+/// Holds a SortMeRNA context for batched streaming. Reference indexing happens
+/// once during create and is reused across all run_batch calls.
+struct SortMeRnaStreamingContext {
+    ctx: *mut smr_context_t,
+    /// Reference path CStrings — must live for the session because ref_ptrs
+    /// holds raw pointers into them and smr_run_seqs uses them on every call.
+    #[allow(dead_code)]
+    ref_cstrings: Vec<CString>,
+    /// Raw pointers into ref_cstrings for the C API.
+    ref_ptrs: Vec<*const c_char>,
+}
+
+// Safety: The underlying C context is not thread-safe, but no shared
+// references to self.ctx are handed out. Only &mut self methods exist
+// (run_batch), so exclusive access is enforced at the type level.
+unsafe impl Send for SortMeRnaStreamingContext {}
+
+impl Drop for SortMeRnaStreamingContext {
+    fn drop(&mut self) {
+        if !self.ctx.is_null() {
+            unsafe { smr_ctx_destroy(self.ctx) };
+        }
+    }
+}
+
+impl StreamingContext for SortMeRnaStreamingContext {
+    fn run_batch(&mut self, shm_input: &str) -> Response {
+        let (read_ids, sequences, sequences2) = match SortMeRnaTool::read_input(shm_input) {
+            Ok(data) => data,
+            Err(e) => return Response::error(e),
+        };
+
+        if read_ids.is_empty() {
+            return Response::error("At least 1 read required");
+        }
+
+        let is_paired = sequences2.is_some();
+
+        // Build smr_seq_t array (per-batch, ephemeral)
+        let (seq_ids_c, seq_seqs_c, smr_seqs) = if is_paired {
+            let seqs2 = sequences2.as_ref().unwrap();
+            let mut ids = Vec::with_capacity(read_ids.len() * 2);
+            let mut seqs = Vec::with_capacity(sequences.len() * 2);
+            for i in 0..read_ids.len() {
+                let id = match CString::new(read_ids[i].as_str()) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Response::error(format!(
+                            "read_id '{}' contains interior null byte",
+                            read_ids[i]
+                        ))
+                    }
+                };
+                let s1 = match CString::new(sequences[i].as_str()) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Response::error(format!(
+                            "sequence for '{}' contains interior null byte",
+                            read_ids[i]
+                        ))
+                    }
+                };
+                let s2 = match CString::new(seqs2[i].as_str()) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Response::error(format!(
+                            "sequence2 for '{}' contains interior null byte",
+                            read_ids[i]
+                        ))
+                    }
+                };
+                ids.push(id.clone());
+                seqs.push(s1);
+                ids.push(id);
+                seqs.push(s2);
+            }
+            let smr: Vec<SmrSeq> = ids
+                .iter()
+                .zip(seqs.iter())
+                .map(|(id, seq)| SmrSeq {
+                    id: id.as_ptr(),
+                    sequence: seq.as_ptr(),
+                    quality: ptr::null(),
+                })
+                .collect();
+            (ids, seqs, smr)
+        } else {
+            let ids: Vec<CString> = match read_ids
+                .iter()
+                .map(|s| CString::new(s.as_str()))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(v) => v,
+                Err(_) => return Response::error("read_id contains interior null byte"),
+            };
+            let seqs: Vec<CString> = match sequences
+                .iter()
+                .map(|s| CString::new(s.as_str()))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(v) => v,
+                Err(_) => return Response::error("sequence contains interior null byte"),
+            };
+            let smr: Vec<SmrSeq> = ids
+                .iter()
+                .zip(seqs.iter())
+                .map(|(id, seq)| SmrSeq {
+                    id: id.as_ptr(),
+                    sequence: seq.as_ptr(),
+                    quality: ptr::null(),
+                })
+                .collect();
+            (ids, seqs, smr)
+        };
+
+        let _keep_ids = &seq_ids_c;
+        let _keep_seqs = &seq_seqs_c;
+
+        unsafe {
+            let mut output: *mut SmrOutput = ptr::null_mut();
+            let mut stats: SmrStats = std::mem::zeroed();
+
+            let rc = smr_run_seqs(
+                self.ctx,
+                self.ref_ptrs.as_ptr(),
+                self.ref_ptrs.len() as i32,
+                smr_seqs.as_ptr(),
+                smr_seqs.len() as i32,
+                &mut output,
+                &mut stats,
+            );
+
+            if rc != SMR_OK {
+                let err_msg = CStr::from_ptr(smr_last_error(self.ctx))
+                    .to_string_lossy()
+                    .into_owned();
+                let code_msg = CStr::from_ptr(smr_strerror(rc))
+                    .to_string_lossy()
+                    .into_owned();
+                return Response::error(format!("{code_msg}: {err_msg}"));
+            }
+
+            let batch = match soa_to_record_batch(&*output) {
+                Ok(b) => b,
+                Err(e) => {
+                    smr_output_free(output);
+                    return Response::error(e);
+                }
+            };
+
+            let shm_out = match crate::arrow_ipc::write_batch_to_output_shm(&batch, "alignments") {
+                Ok(v) => v,
+                Err(e) => {
+                    smr_output_free(output);
+                    return Response::error(e);
+                }
+            };
+
+            let result = serde_json::json!({
+                "total_reads": stats.total_reads,
+                "total_aligned": stats.total_aligned,
+                "total_id_cov_pass": stats.total_id_cov_pass,
+                "wall_time_sec": stats.wall_time_sec,
+            });
+
+            smr_output_free(output);
+
+            Response::ok(result, vec![shm_out])
         }
     }
 }
@@ -827,6 +1005,121 @@ impl GplTool for SortMeRnaTool {
             Response::ok(result, vec![shm_out])
         }
     }
+
+    fn create_streaming_context(
+        &self,
+        config: &serde_json::Value,
+    ) -> Result<Option<Box<dyn StreamingContext>>, String> {
+        // Extract and validate ref_paths
+        let ref_path_strs: Vec<String> = match config.get("ref_paths") {
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    v.as_str()
+                        .map(|s| s.to_string())
+                        .ok_or_else(|| format!("ref_paths[{i}] is not a string"))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => return Err("ref_paths must be an array of strings".to_string()),
+            None => return Err("Config missing required field: ref_paths".to_string()),
+        };
+        if ref_path_strs.is_empty() {
+            return Err("ref_paths must not be empty".to_string());
+        }
+
+        let ref_cstrings: Vec<CString> = ref_path_strs
+            .iter()
+            .map(|s| CString::new(s.as_str()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "ref_paths contains interior null byte".to_string())?;
+        let ref_ptrs: Vec<*const c_char> = ref_cstrings.iter().map(|s| s.as_ptr()).collect();
+
+        // Parse scoring/alignment config
+        let num_threads = config
+            .get("num_threads")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(2) as i32;
+        let match_score = config.get("match").and_then(|v| v.as_i64()).unwrap_or(2) as i32;
+        let mismatch = config
+            .get("mismatch")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-3) as i32;
+        let gap_open = config.get("gap_open").and_then(|v| v.as_i64()).unwrap_or(5) as i32;
+        let gap_ext = config.get("gap_ext").and_then(|v| v.as_i64()).unwrap_or(2) as i32;
+        let score_n = config.get("score_N").and_then(|v| v.as_i64()).unwrap_or(-3) as i32;
+        let evalue = config
+            .get("evalue")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(-1.0);
+        let seed_win_len = config
+            .get("seed_win_len")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(18) as u32;
+        let num_alignments = config
+            .get("num_alignments")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(1) as u32;
+        let best = config.get("best").and_then(|v| v.as_bool()).unwrap_or(true);
+        let forward_only = config
+            .get("forward_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let reverse_only = config
+            .get("reverse_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let full_search = config
+            .get("full_search")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let verbose = config
+            .get("verbose")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let workdir_cstring = config
+            .get("workdir")
+            .and_then(|v| v.as_str())
+            .and_then(|s| CString::new(s).ok());
+
+        unsafe {
+            let mut cfg: SmrConfig = std::mem::zeroed();
+            smr_config_init(&mut cfg);
+            cfg.num_threads = num_threads;
+            cfg.match_score = match_score;
+            cfg.mismatch = mismatch;
+            cfg.gap_open = gap_open;
+            cfg.gap_ext = gap_ext;
+            cfg.score_n = score_n;
+            cfg.evalue = evalue;
+            cfg.seed_win_len = seed_win_len;
+            cfg.num_alignments = num_alignments;
+            cfg.best = if best { 1 } else { 0 };
+            cfg.forward_only = if forward_only { 1 } else { 0 };
+            cfg.reverse_only = if reverse_only { 1 } else { 0 };
+            cfg.full_search = if full_search { 1 } else { 0 };
+
+            if let Some(ref wd) = workdir_cstring {
+                cfg.workdir = wd.as_ptr();
+            }
+
+            if verbose {
+                cfg.log_callback = Some(stderr_log_callback);
+            }
+
+            let ctx = smr_ctx_create(&cfg);
+            if ctx.is_null() {
+                return Err("Failed to create SortMeRNA context".to_string());
+            }
+
+            Ok(Some(Box::new(SortMeRnaStreamingContext {
+                ctx,
+                ref_cstrings,
+                ref_ptrs,
+            })))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1126,5 +1419,122 @@ ACCATATGGGAGAGCTCCCAACGCGTTGGA";
         assert_eq!(batches[0].num_rows(), 2);
 
         let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
+    }
+
+    // -- Streaming context tests --
+
+    #[test]
+    fn test_sortmerna_create_streaming_context() {
+        let tool = SortMeRnaTool;
+        let config = serde_json::json!({
+            "ref_paths": ["ext/sortmerna/data/test_ref.fasta"],
+        });
+        let result = tool.create_streaming_context(&config);
+        assert!(
+            result.is_ok(),
+            "create_streaming_context failed: {:?}",
+            result.err()
+        );
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn test_sortmerna_streaming_missing_ref_paths() {
+        let tool = SortMeRnaTool;
+        let config = serde_json::json!({});
+        match tool.create_streaming_context(&config) {
+            Err(e) => assert!(
+                e.contains("ref_paths"),
+                "Expected ref_paths error, got: {e}"
+            ),
+            Ok(_) => panic!("Expected error for missing ref_paths"),
+        }
+    }
+
+    #[test]
+    fn test_sortmerna_streaming_run_batch() {
+        let tool = SortMeRnaTool;
+        let config = serde_json::json!({
+            "ref_paths": ["ext/sortmerna/data/test_ref.fasta"],
+            "num_threads": 1,
+        });
+        let mut ctx = tool
+            .create_streaming_context(&config)
+            .expect("context creation failed")
+            .expect("tool should support streaming");
+
+        let input_name = unique_shm_name("smr-str-in");
+        let batch = make_input_batch(&["AB271211"], &[TEST_SEQ_AB271211]);
+        let _shm = write_arrow_to_shm(&input_name, &batch);
+
+        let response = ctx.run_batch(&input_name);
+        assert!(response.success, "run_batch failed: {:?}", response.error);
+        assert_eq!(response.shm_outputs.len(), 1);
+        assert_eq!(response.shm_outputs[0].label, "alignments");
+
+        let result = response.result.unwrap();
+        assert_eq!(result["total_aligned"], 1);
+
+        let out_batches = read_arrow_from_shm(&response.shm_outputs[0].name);
+        assert_eq!(out_batches.len(), 1);
+        let out = &out_batches[0];
+        let score_col = out
+            .column_by_name("score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert!(score_col.value(0) > 0, "Expected positive alignment score");
+
+        let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
+    }
+
+    #[test]
+    fn test_sortmerna_streaming_two_batches() {
+        let tool = SortMeRnaTool;
+        let config = serde_json::json!({
+            "ref_paths": ["ext/sortmerna/data/test_ref.fasta"],
+            "num_threads": 1,
+        });
+        let mut ctx = tool
+            .create_streaming_context(&config)
+            .expect("context creation failed")
+            .expect("tool should support streaming");
+
+        // Batch 1: forward read
+        let input1 = unique_shm_name("smr-str-b1");
+        let batch1 = make_input_batch(&["read_fwd"], &[TEST_SEQ_AB271211]);
+        let _shm1 = write_arrow_to_shm(&input1, &batch1);
+        let resp1 = ctx.run_batch(&input1);
+        assert!(resp1.success, "Batch 1 failed: {:?}", resp1.error);
+
+        let out1 = read_arrow_from_shm(&resp1.shm_outputs[0].name);
+        let strand1 = out1[0]
+            .column_by_name("strand")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(strand1, 1, "Forward read should have strand=1");
+        let _ = SharedMemory::unlink(&resp1.shm_outputs[0].name);
+
+        // Batch 2: reverse complement
+        let input2 = unique_shm_name("smr-str-b2");
+        let batch2 = make_input_batch(&["read_rc"], &[TEST_SEQ_AB271211_RC]);
+        let _shm2 = write_arrow_to_shm(&input2, &batch2);
+        let resp2 = ctx.run_batch(&input2);
+        assert!(resp2.success, "Batch 2 failed: {:?}", resp2.error);
+
+        let out2 = read_arrow_from_shm(&resp2.shm_outputs[0].name);
+        let strand2 = out2[0]
+            .column_by_name("strand")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(strand2, 0, "RC read should have strand=0");
+        let _ = SharedMemory::unlink(&resp2.shm_outputs[0].name);
     }
 }

@@ -2,7 +2,7 @@
 //! gene prediction, writes SOA genes as Arrow IPC back to shared memory.
 
 use crate::protocol::{Response, ShmOutput};
-use crate::tools::{ConfigParam, FieldDescription, GplTool, ToolDescription};
+use crate::tools::{ConfigParam, FieldDescription, GplTool, StreamingContext, ToolDescription};
 use arrow::array::{BooleanArray, Float64Array, Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -296,6 +296,78 @@ inventory::submit! {
     }
 }
 
+/// Parsed prodigal config values shared by execute() and create_streaming_context().
+struct ProdigalParsedConfig {
+    meta_mode: bool,
+    trans_table: c_int,
+    closed_ends: bool,
+    mask_regions: bool,
+    force_nonsd: bool,
+    start_weight: f64,
+    verbose: bool,
+}
+
+impl ProdigalParsedConfig {
+    fn from_json(config: &serde_json::Value) -> Self {
+        Self {
+            meta_mode: config
+                .get("meta_mode")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            trans_table: config
+                .get("trans_table")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(11) as c_int,
+            closed_ends: config
+                .get("closed_ends")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            mask_regions: config
+                .get("mask_regions")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            force_nonsd: config
+                .get("force_nonsd")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            start_weight: config
+                .get("start_weight")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(4.35),
+            verbose: config
+                .get("verbose")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        }
+    }
+
+    /// Build a C ProdigalConfig from parsed values.
+    unsafe fn to_c_config(&self) -> ProdigalConfig {
+        let mut pd: ProdigalConfig = std::mem::zeroed();
+        prodigal_config_init(&mut pd);
+        pd.trans_table = self.trans_table;
+        pd.closed_ends = if self.closed_ends { 1 } else { 0 };
+        pd.mask_regions = if self.mask_regions { 1 } else { 0 };
+        pd.force_nonsd = if self.force_nonsd { 1 } else { 0 };
+        pd.meta_mode = if self.meta_mode { 1 } else { 0 };
+        pd.start_weight = self.start_weight;
+        if self.verbose {
+            pd.log_callback = Some(stderr_log_callback);
+        }
+        pd
+    }
+}
+
+/// Convert the fixed-size `best_meta_desc` char array from ProdigalStats to String.
+fn best_meta_desc_to_string(stats: &ProdigalStats) -> String {
+    let bytes = &stats.best_meta_desc;
+    let nul_pos = bytes.iter().position(|&b| b == 0).unwrap_or(512);
+    let slice = &bytes[..nul_pos];
+    let u8_slice: &[u8] =
+        unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len()) };
+    String::from_utf8_lossy(u8_slice).into_owned()
+}
+
 impl ProdigalTool {
     /// Read Arrow IPC stream from shared memory, extract name and sequence columns.
     fn read_input(shm_input: &str) -> Result<(Vec<String>, Vec<String>), String> {
@@ -332,6 +404,132 @@ impl ProdigalTool {
     fn write_output(accumulator: GeneAccumulator) -> Result<ShmOutput, String> {
         let batch = accumulator.into_record_batch()?;
         crate::arrow_ipc::write_batch_to_output_shm(&batch, "genes")
+    }
+}
+
+// --- Streaming context ---
+
+/// Holds a prodigal context for batched streaming. The metagenomic bin
+/// initialization (~28MB) happens once on the first `find_genes` call
+/// and is reused across all subsequent batches.
+struct ProdigalStreamingContext {
+    ctx: *mut prodigal_ctx_t,
+}
+
+// Safety: The underlying C context is not thread-safe, but no shared
+// references to self.ctx are handed out. Only &mut self methods exist
+// (run_batch), so exclusive access is enforced at the type level.
+unsafe impl Send for ProdigalStreamingContext {}
+
+impl Drop for ProdigalStreamingContext {
+    fn drop(&mut self) {
+        if !self.ctx.is_null() {
+            unsafe { prodigal_destroy(self.ctx) };
+        }
+    }
+}
+
+impl StreamingContext for ProdigalStreamingContext {
+    fn run_batch(&mut self, shm_input: &str) -> Response {
+        let (names, sequences) = match ProdigalTool::read_input(shm_input) {
+            Ok(data) => data,
+            Err(e) => return Response::error(e),
+        };
+
+        if names.is_empty() {
+            return Response::error("At least 1 sequence required");
+        }
+
+        unsafe {
+            let mut accumulator = GeneAccumulator::new();
+            let mut last_stats: ProdigalStats = std::mem::zeroed();
+
+            for (name, sequence) in names.iter().zip(sequences.iter()) {
+                if sequence.len() > i32::MAX as usize {
+                    return Response::error(format!(
+                        "Sequence '{}' is too long: {} bytes (max {})",
+                        name,
+                        sequence.len(),
+                        i32::MAX
+                    ));
+                }
+                let c_seq = match CString::new(sequence.as_str()) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Response::error(format!(
+                            "Sequence '{name}' contains interior null byte"
+                        ));
+                    }
+                };
+                let c_header = match CString::new(name.as_str()) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Response::error(format!(
+                            "Sequence name '{name}' contains interior null byte"
+                        ));
+                    }
+                };
+                let seq_len = sequence.len() as i32;
+
+                // prodigal_set_sequence resets internal state from any previous
+                // sequence. The context is safe to reuse after errors — the
+                // next set_sequence call will reset.
+                let rc =
+                    prodigal_set_sequence(self.ctx, c_seq.as_ptr(), seq_len, c_header.as_ptr());
+                if rc != PRODIGAL_OK {
+                    let err_msg = CStr::from_ptr(prodigal_last_error(self.ctx))
+                        .to_string_lossy()
+                        .into_owned();
+                    let code_msg = CStr::from_ptr(prodigal_strerror(rc))
+                        .to_string_lossy()
+                        .into_owned();
+                    return Response::error(format!("{code_msg}: {err_msg}"));
+                }
+
+                let mut genes: *mut ProdigalGenesSoa = ptr::null_mut();
+                let mut stats: ProdigalStats = std::mem::zeroed();
+
+                let rc = prodigal_find_genes(self.ctx, &mut genes, &mut stats);
+                if rc != PRODIGAL_OK {
+                    let err_msg = CStr::from_ptr(prodigal_last_error(self.ctx))
+                        .to_string_lossy()
+                        .into_owned();
+                    let code_msg = CStr::from_ptr(prodigal_strerror(rc))
+                        .to_string_lossy()
+                        .into_owned();
+                    return Response::error(format!("{code_msg}: {err_msg}"));
+                }
+
+                if !genes.is_null() {
+                    if (*genes).n_genes > 0 {
+                        accumulator.append_from_soa(name, &*genes);
+                    }
+                    prodigal_genes_free(genes);
+                }
+                last_stats = stats;
+            }
+
+            let total_genes = accumulator.n_genes();
+
+            let shm_out = match ProdigalTool::write_output(accumulator) {
+                Ok(v) => v,
+                Err(e) => return Response::error(e),
+            };
+
+            let result = serde_json::json!({
+                "n_genes": total_genes,
+                "n_sequences": names.len(),
+                "stats": {
+                    "gc_content": last_stats.gc_content,
+                    "translation_table": last_stats.translation_table,
+                    "uses_sd": last_stats.uses_sd,
+                    "best_meta_bin": last_stats.best_meta_bin,
+                    "best_meta_desc": best_meta_desc_to_string(&last_stats),
+                }
+            });
+
+            Response::ok(result, vec![shm_out])
+        }
     }
 }
 
@@ -578,48 +776,10 @@ impl GplTool for ProdigalTool {
         }
 
         // Parse config
-        let meta_mode = config
-            .get("meta_mode")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        let trans_table = config
-            .get("trans_table")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(11) as c_int;
-        let closed_ends = config
-            .get("closed_ends")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let mask_regions = config
-            .get("mask_regions")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let force_nonsd = config
-            .get("force_nonsd")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let start_weight = config
-            .get("start_weight")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(4.35);
-        let verbose = config
-            .get("verbose")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let parsed = ProdigalParsedConfig::from_json(config);
 
         unsafe {
-            let mut pd_config: ProdigalConfig = std::mem::zeroed();
-            prodigal_config_init(&mut pd_config);
-            pd_config.trans_table = trans_table;
-            pd_config.closed_ends = if closed_ends { 1 } else { 0 };
-            pd_config.mask_regions = if mask_regions { 1 } else { 0 };
-            pd_config.force_nonsd = if force_nonsd { 1 } else { 0 };
-            pd_config.meta_mode = if meta_mode { 1 } else { 0 };
-            pd_config.start_weight = start_weight;
-
-            if verbose {
-                pd_config.log_callback = Some(stderr_log_callback);
-            }
+            let pd_config = parsed.to_c_config();
 
             let ctx = prodigal_create(&pd_config);
             if ctx.is_null() {
@@ -627,7 +787,7 @@ impl GplTool for ProdigalTool {
             }
 
             // Single-genome mode: train on all input sequences first
-            if !meta_mode {
+            if !parsed.meta_mode {
                 let c_seqs: Vec<CString> = match sequences
                     .iter()
                     .map(|s| CString::new(s.as_str()))
@@ -758,16 +918,6 @@ impl GplTool for ProdigalTool {
                 }
             };
 
-            // Convert best_meta_desc fixed-size char array to String
-            let best_meta_desc = {
-                let bytes = &last_stats.best_meta_desc;
-                let nul_pos = bytes.iter().position(|&b| b == 0).unwrap_or(512);
-                let slice = &bytes[..nul_pos];
-                let u8_slice: &[u8] =
-                    std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len());
-                String::from_utf8_lossy(u8_slice).into_owned()
-            };
-
             let result = serde_json::json!({
                 "n_genes": total_genes,
                 "n_sequences": names.len(),
@@ -776,13 +926,41 @@ impl GplTool for ProdigalTool {
                     "translation_table": last_stats.translation_table,
                     "uses_sd": last_stats.uses_sd,
                     "best_meta_bin": last_stats.best_meta_bin,
-                    "best_meta_desc": best_meta_desc,
+                    "best_meta_desc": best_meta_desc_to_string(&last_stats),
                 }
             });
 
             prodigal_destroy(ctx);
 
             Response::ok(result, vec![shm_out])
+        }
+    }
+
+    fn create_streaming_context(
+        &self,
+        config: &serde_json::Value,
+    ) -> Result<Option<Box<dyn StreamingContext>>, String> {
+        let mut parsed = ProdigalParsedConfig::from_json(config);
+
+        if !parsed.meta_mode {
+            return Err(
+                "Prodigal single-genome mode requires all sequences for training; \
+                 use meta_mode for streaming"
+                    .to_string(),
+            );
+        }
+        // Streaming always uses meta mode (enforce regardless of parsed value)
+        parsed.meta_mode = true;
+
+        unsafe {
+            let pd_config = parsed.to_c_config();
+
+            let ctx = prodigal_create(&pd_config);
+            if ctx.is_null() {
+                return Err("Failed to create prodigal context".to_string());
+            }
+
+            Ok(Some(Box::new(ProdigalStreamingContext { ctx })))
         }
     }
 }
@@ -926,6 +1104,98 @@ mod tests {
         let response = tool.execute(&config, "/nonexistent-shm-name");
         assert!(!response.success);
         assert!(response.error.unwrap().contains("Failed to open shm"));
+    }
+
+    // -- Streaming context tests --
+
+    #[test]
+    fn test_prodigal_create_streaming_context() {
+        let tool = ProdigalTool;
+        let config = serde_json::json!({"meta_mode": true});
+        let result = tool.create_streaming_context(&config);
+        assert!(
+            result.is_ok(),
+            "create_streaming_context failed: {:?}",
+            result.err()
+        );
+        assert!(
+            result.unwrap().is_some(),
+            "Expected Some(ctx) for meta_mode streaming"
+        );
+    }
+
+    #[test]
+    fn test_prodigal_streaming_rejects_single_genome() {
+        let tool = ProdigalTool;
+        let config = serde_json::json!({"meta_mode": false});
+        match tool.create_streaming_context(&config) {
+            Err(err) => assert!(
+                err.contains("single-genome") || err.contains("training"),
+                "Expected single-genome rejection, got: {err}"
+            ),
+            Ok(_) => panic!("Expected error for single-genome streaming"),
+        }
+    }
+
+    #[test]
+    fn test_prodigal_streaming_run_batch() {
+        let tool = ProdigalTool;
+        let config = serde_json::json!({"meta_mode": true, "trans_table": 11});
+        let mut ctx = tool
+            .create_streaming_context(&config)
+            .expect("context creation failed")
+            .expect("tool should support streaming");
+
+        let input_name = unique_shm_name("pd-str-in");
+        let batch = make_input_batch(&["contig_1", "contig_2"], &[TEST_SEQ_1, TEST_SEQ_2]);
+        let _input_shm = write_arrow_to_shm(&input_name, &batch);
+
+        let response = ctx.run_batch(&input_name);
+        assert!(response.success, "run_batch failed: {:?}", response.error);
+        assert_eq!(response.shm_outputs.len(), 1);
+        assert_eq!(response.shm_outputs[0].label, "genes");
+
+        let result = response.result.unwrap();
+        assert!(result["n_genes"].as_i64().unwrap() > 0);
+        assert_eq!(result["n_sequences"], 2);
+
+        let out_batches = read_arrow_from_shm(&response.shm_outputs[0].name);
+        assert_eq!(out_batches.len(), 1);
+        assert!(out_batches[0].num_rows() > 0);
+
+        let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
+    }
+
+    #[test]
+    fn test_prodigal_streaming_two_batches() {
+        let tool = ProdigalTool;
+        let config = serde_json::json!({"meta_mode": true});
+        let mut ctx = tool
+            .create_streaming_context(&config)
+            .expect("context creation failed")
+            .expect("tool should support streaming");
+
+        // Batch 1: one sequence
+        let input1 = unique_shm_name("pd-str-b1");
+        let batch1 = make_input_batch(&["contig_1"], &[TEST_SEQ_1]);
+        let _shm1 = write_arrow_to_shm(&input1, &batch1);
+        let resp1 = ctx.run_batch(&input1);
+        assert!(resp1.success, "Batch 1 failed: {:?}", resp1.error);
+        let genes1 = resp1.result.as_ref().unwrap()["n_genes"].as_i64().unwrap();
+        let _ = SharedMemory::unlink(&resp1.shm_outputs[0].name);
+
+        // Batch 2: different sequence
+        let input2 = unique_shm_name("pd-str-b2");
+        let batch2 = make_input_batch(&["contig_2"], &[TEST_SEQ_2]);
+        let _shm2 = write_arrow_to_shm(&input2, &batch2);
+        let resp2 = ctx.run_batch(&input2);
+        assert!(resp2.success, "Batch 2 failed: {:?}", resp2.error);
+        let genes2 = resp2.result.as_ref().unwrap()["n_genes"].as_i64().unwrap();
+        let _ = SharedMemory::unlink(&resp2.shm_outputs[0].name);
+
+        // Both batches should find genes independently
+        assert!(genes1 > 0, "Batch 1 found no genes");
+        assert!(genes2 > 0, "Batch 2 found no genes");
     }
 
     #[test]

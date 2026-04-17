@@ -11,7 +11,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::protocol::Response;
-use crate::tools::{ConfigParam, FieldDescription, GplTool, ToolDescription, ToolRegistration};
+use crate::tools::{
+    ConfigParam, FieldDescription, GplTool, StreamingContext, ToolDescription, ToolRegistration,
+};
 
 // ---------------------------------------------------------------------------
 // FFI bindings — mirror ext/bowtie2/bt2_api.h
@@ -544,6 +546,195 @@ fn build_config(
     }
 
     Ok((bt2, cstrings))
+}
+
+// ---------------------------------------------------------------------------
+// Streaming context
+// ---------------------------------------------------------------------------
+
+/// Holds a bowtie2 alignment context for batched streaming. The .bt2 index is
+/// loaded once during create and reused across all run_batch calls.
+struct Bowtie2StreamingContext {
+    ctx: *mut bt2_align_ctx_t,
+    /// CStrings backing the config's raw pointers. Kept alive for the session
+    /// in case the C library retains references (safe even if it deep-copies).
+    _config_cstrings: Vec<CString>,
+}
+
+// Safety: The underlying C context is not thread-safe, but no shared
+// references to self.ctx are handed out. Only &mut self methods exist
+// (run_batch), so exclusive access is enforced at the type level.
+unsafe impl Send for Bowtie2StreamingContext {}
+
+impl Drop for Bowtie2StreamingContext {
+    fn drop(&mut self) {
+        if !self.ctx.is_null() {
+            unsafe { bt2_align_destroy(self.ctx) };
+        }
+    }
+}
+
+impl StreamingContext for Bowtie2StreamingContext {
+    fn run_batch(&mut self, shm_input: &str) -> Response {
+        let input_data = match Bowtie2AlignTool::read_input(shm_input) {
+            Ok(data) => data,
+            Err(e) => return Response::error(e),
+        };
+
+        if input_data.read_ids.is_empty() {
+            return Response::error("At least 1 read required");
+        }
+
+        // Build per-batch C input arrays (ephemeral — dropped after bt2_align_run)
+        let name_cstrings: Vec<CString> = match input_data
+            .read_ids
+            .iter()
+            .map(|s| CString::new(s.as_str()))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(v) => v,
+            Err(_) => return Response::error("read_id contains interior null byte"),
+        };
+        let name_ptrs: Vec<*const c_char> = name_cstrings.iter().map(|s| s.as_ptr()).collect();
+
+        let seq1_cstrings: Vec<CString> = match input_data
+            .seqs1
+            .iter()
+            .map(|s| CString::new(s.as_str()))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(v) => v,
+            Err(_) => return Response::error("sequence1 contains interior null byte"),
+        };
+        let seq1_ptrs: Vec<*const c_char> = seq1_cstrings.iter().map(|s| s.as_ptr()).collect();
+
+        let qual1_cstrings: Vec<Option<CString>> = match input_data
+            .quals1
+            .iter()
+            .map(|opt| match opt {
+                Some(s) => CString::new(s.as_str()).map(Some),
+                None => Ok(None),
+            })
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(v) => v,
+            Err(_) => return Response::error("qual1 contains interior null byte"),
+        };
+        let qual1_ptrs: Vec<*const c_char> = qual1_cstrings
+            .iter()
+            .map(|opt| match opt {
+                Some(c) => c.as_ptr(),
+                None => ptr::null(),
+            })
+            .collect();
+        let all_quals_null = qual1_ptrs.iter().all(|p| p.is_null());
+
+        // Paired-end mate 2
+        let seq2_cstrings: Option<Vec<CString>> = match &input_data.seqs2 {
+            Some(seqs) => match seqs
+                .iter()
+                .map(|s| CString::new(s.as_str()))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(v) => Some(v),
+                Err(_) => return Response::error("sequence2 contains interior null byte"),
+            },
+            None => None,
+        };
+        let seq2_ptrs: Option<Vec<*const c_char>> = seq2_cstrings
+            .as_ref()
+            .map(|v| v.iter().map(|s| s.as_ptr()).collect());
+
+        let qual2_cstrings: Option<Vec<Option<CString>>> = match &input_data.quals2 {
+            Some(quals) => match quals
+                .iter()
+                .map(|opt| match opt {
+                    Some(s) => CString::new(s.as_str()).map(Some),
+                    None => Ok(None),
+                })
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(v) => Some(v),
+                Err(_) => return Response::error("qual2 contains interior null byte"),
+            },
+            None => None,
+        };
+        let qual2_ptrs: Option<Vec<*const c_char>> = qual2_cstrings.as_ref().map(|v| {
+            v.iter()
+                .map(|opt| match opt {
+                    Some(c) => c.as_ptr(),
+                    None => ptr::null(),
+                })
+                .collect()
+        });
+
+        unsafe {
+            let mut bt2_input: Bt2Input = std::mem::zeroed();
+            bt2_input_init(&mut bt2_input);
+            bt2_input.names = name_ptrs.as_ptr();
+            bt2_input.seqs = seq1_ptrs.as_ptr();
+            bt2_input.quals = if all_quals_null {
+                ptr::null()
+            } else {
+                qual1_ptrs.as_ptr()
+            };
+            bt2_input.n_reads = input_data.read_ids.len();
+
+            if let Some(ref s2_ptrs) = seq2_ptrs {
+                bt2_input.names2 = name_ptrs.as_ptr();
+                bt2_input.seqs2 = s2_ptrs.as_ptr();
+                bt2_input.quals2 = match qual2_ptrs.as_ref() {
+                    Some(q2) => q2.as_ptr(),
+                    None => ptr::null(),
+                };
+                bt2_input.n_reads2 = input_data.read_ids.len();
+            }
+
+            // Run alignment on the pre-loaded context
+            let mut output: *mut Bt2AlignOutput = ptr::null_mut();
+            let mut stats: Bt2AlignStats = std::mem::zeroed();
+
+            let rc = bt2_align_run(self.ctx, &bt2_input, &mut output, &mut stats);
+
+            if rc != BT2_OK {
+                let cat = CStr::from_ptr(bt2_strerror(rc))
+                    .to_string_lossy()
+                    .into_owned();
+                let detail = CStr::from_ptr(bt2_align_last_error(self.ctx))
+                    .to_string_lossy()
+                    .into_owned();
+                return Response::error(format!("{cat}: {detail}"));
+            }
+
+            let batch = match soa_to_record_batch(&*output) {
+                Ok(b) => b,
+                Err(e) => {
+                    bt2_align_output_free(output);
+                    return Response::error(e);
+                }
+            };
+
+            let shm_out = match crate::arrow_ipc::write_batch_to_output_shm(&batch, "alignments") {
+                Ok(v) => v,
+                Err(e) => {
+                    bt2_align_output_free(output);
+                    return Response::error(e);
+                }
+            };
+
+            let result = serde_json::json!({
+                "n_reads": stats.n_reads,
+                "n_aligned": stats.n_aligned,
+                "n_unaligned": stats.n_unaligned,
+                "n_aligned_concordant": stats.n_aligned_concordant,
+                "elapsed_ms": stats.elapsed_ms,
+            });
+
+            bt2_align_output_free(output);
+
+            Response::ok(result, vec![shm_out])
+        }
+    }
 }
 
 /// Convert bt2_align_output_t SOA arrays into an Arrow RecordBatch.
@@ -1252,9 +1443,7 @@ impl GplTool for Bowtie2AlignTool {
                     .collect::<Result<Vec<_>, _>>()
             })
             .transpose()
-            .unwrap_or_else(|_| {
-                None // will be caught below
-            });
+            .unwrap_or(None);
         if input_data.seqs2.is_some() && seq2_cstrings.is_none() {
             return Response::error("sequence2 contains interior null byte");
         }
@@ -1275,7 +1464,7 @@ impl GplTool for Bowtie2AlignTool {
                     .collect::<Result<Vec<_>, _>>()
             })
             .transpose()
-            .unwrap_or_else(|_| None);
+            .unwrap_or(None);
         if input_data.quals2.is_some() && qual2_cstrings.is_none() {
             return Response::error("qual2 contains interior null byte");
         }
@@ -1371,6 +1560,34 @@ impl GplTool for Bowtie2AlignTool {
             bt2_align_destroy(ctx);
 
             Response::ok(result, vec![shm_out])
+        }
+    }
+
+    fn create_streaming_context(
+        &self,
+        config: &serde_json::Value,
+    ) -> Result<Option<Box<dyn StreamingContext>>, String> {
+        let verbose = config
+            .get("verbose")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let (bt2_config, config_cstrings) = build_config(config, verbose)?;
+
+        unsafe {
+            let mut error_code: c_int = 0;
+            let ctx = bt2_align_create(&bt2_config, &mut error_code);
+            if ctx.is_null() {
+                let cat = CStr::from_ptr(bt2_strerror(error_code))
+                    .to_string_lossy()
+                    .into_owned();
+                return Err(format!("Failed to create bowtie2 context: {cat}"));
+            }
+
+            Ok(Some(Box::new(Bowtie2StreamingContext {
+                ctx,
+                _config_cstrings: config_cstrings,
+            })))
         }
     }
 }
@@ -1988,5 +2205,103 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
         assert!(meta_names.contains(&"n_reads"));
         assert!(meta_names.contains(&"n_aligned"));
         assert!(meta_names.contains(&"elapsed_ms"));
+    }
+
+    // -- Streaming context tests --
+
+    #[test]
+    fn test_bowtie2_create_streaming_context() {
+        let (_dir, prefix) = build_test_index();
+        let tool = Bowtie2AlignTool;
+        let config = serde_json::json!({"index_path": prefix});
+        let result = tool.create_streaming_context(&config);
+        assert!(
+            result.is_ok(),
+            "create_streaming_context failed: {:?}",
+            result.err()
+        );
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn test_bowtie2_streaming_bad_index_path() {
+        let tool = Bowtie2AlignTool;
+        let config = serde_json::json!({"index_path": "/nonexistent/path"});
+        match tool.create_streaming_context(&config) {
+            Err(e) => assert!(
+                e.contains("Failed") || e.contains("context"),
+                "Unexpected error: {e}"
+            ),
+            Ok(_) => panic!("Expected error for bad index path"),
+        }
+    }
+
+    #[test]
+    fn test_bowtie2_streaming_run_batch() {
+        let (_dir, prefix) = build_test_index();
+        let tool = Bowtie2AlignTool;
+        let config = serde_json::json!({"index_path": prefix});
+        let mut ctx = tool
+            .create_streaming_context(&config)
+            .expect("context creation failed")
+            .expect("tool should support streaming");
+
+        // Single-end read from TEST_REF[10..37]
+        let read_seq = &TEST_REF[10..37];
+        let input_name = unique_shm_name("bt2-str-in");
+        let batch = make_single_end_input(
+            &["read1"],
+            &[read_seq],
+            &[Some(&"I".repeat(read_seq.len()))],
+        );
+        let _shm = write_arrow_to_shm(&input_name, &batch);
+
+        let response = ctx.run_batch(&input_name);
+        assert!(response.success, "run_batch failed: {:?}", response.error);
+        assert_eq!(response.shm_outputs.len(), 1);
+        assert_eq!(response.shm_outputs[0].label, "alignments");
+
+        let result = response.result.unwrap();
+        assert_eq!(result["n_reads"], 1);
+        assert_eq!(result["n_aligned"], 1);
+
+        let out_batches = read_arrow_from_shm(&response.shm_outputs[0].name);
+        assert_eq!(out_batches.len(), 1);
+        assert!(out_batches[0].num_rows() > 0);
+
+        let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
+    }
+
+    #[test]
+    fn test_bowtie2_streaming_two_batches() {
+        let (_dir, prefix) = build_test_index();
+        let tool = Bowtie2AlignTool;
+        let config = serde_json::json!({"index_path": prefix});
+        let mut ctx = tool
+            .create_streaming_context(&config)
+            .expect("context creation failed")
+            .expect("tool should support streaming");
+
+        // Batch 1: read from positions 10-37
+        let read1 = &TEST_REF[10..37];
+        let input1 = unique_shm_name("bt2-str-b1");
+        let batch1 =
+            make_single_end_input(&["read_a"], &[read1], &[Some(&"I".repeat(read1.len()))]);
+        let _shm1 = write_arrow_to_shm(&input1, &batch1);
+        let resp1 = ctx.run_batch(&input1);
+        assert!(resp1.success, "Batch 1 failed: {:?}", resp1.error);
+        assert_eq!(resp1.result.as_ref().unwrap()["n_aligned"], 1);
+        let _ = SharedMemory::unlink(&resp1.shm_outputs[0].name);
+
+        // Batch 2: read from positions 50-77
+        let read2 = &TEST_REF[50..77];
+        let input2 = unique_shm_name("bt2-str-b2");
+        let batch2 =
+            make_single_end_input(&["read_b"], &[read2], &[Some(&"I".repeat(read2.len()))]);
+        let _shm2 = write_arrow_to_shm(&input2, &batch2);
+        let resp2 = ctx.run_batch(&input2);
+        assert!(resp2.success, "Batch 2 failed: {:?}", resp2.error);
+        assert_eq!(resp2.result.as_ref().unwrap()["n_aligned"], 1);
+        let _ = SharedMemory::unlink(&resp2.shm_outputs[0].name);
     }
 }

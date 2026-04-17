@@ -327,6 +327,9 @@ fn test_config_struct_abi_size() {
 }
 ```
 
+4. **(If streaming)** Multi-batch streaming roundtrip — see Step 6 for the
+   test template.
+
 If the tool accepts meaningfully different input types (e.g., nucleotide vs.
 protein), add a roundtrip test for each.
 
@@ -353,6 +356,50 @@ Verify introspection:
 cargo run -- --version            # should list newtool with version
 cargo run -- --list-tools         # should include "newtool"
 cargo run -- --describe newtool   # should show full schema/config docs
+```
+
+## Step 6 (optional): Add streaming support
+
+Add streaming support when a tool has expensive context creation (index
+loading, reference indexing, model initialization) AND processes independent
+records per batch. Tools where all input must be present at once (e.g.,
+FastTree) do not need streaming.
+
+### What to implement
+
+1. A `<Tool>StreamingContext` struct holding the C context pointer and any
+   session-lived state. Implement `Drop` to call the C `destroy()` function.
+2. Override `create_streaming_context()` on the `GplTool` impl. Parse config,
+   call C `create()`, return the context. Validate streaming is supported
+   (e.g., prodigal only supports streaming in meta mode).
+3. Implement `StreamingContext::run_batch()`. Read input from shm, call C
+   `run()`, convert output, write to output shm, return Response.
+
+### Streaming test template
+
+```rust
+#[test]
+fn test_newtool_streaming_two_batches() {
+    let tool = NewTool;
+    let config = serde_json::json!({/* ... */});
+    let mut ctx = tool.create_streaming_context(&config)
+        .expect("context creation failed")
+        .expect("tool should support streaming");
+
+    // Batch 1
+    let input1 = unique_shm_name("nt-str-1");
+    let _shm1 = write_arrow_to_shm(&input1, &make_input_batch(/* data */));
+    let resp1 = ctx.run_batch(&input1);
+    assert!(resp1.success, "Batch 1 failed: {:?}", resp1.error);
+    let _ = SharedMemory::unlink(&resp1.shm_outputs[0].name);
+
+    // Batch 2
+    let input2 = unique_shm_name("nt-str-2");
+    let _shm2 = write_arrow_to_shm(&input2, &make_input_batch(/* data */));
+    let resp2 = ctx.run_batch(&input2);
+    assert!(resp2.success, "Batch 2 failed: {:?}", resp2.error);
+    let _ = SharedMemory::unlink(&resp2.shm_outputs[0].name);
+}
 ```
 
 ## Common mistakes
@@ -384,6 +431,18 @@ Manual review against the C header is required when fields change.
 
 Each tool must have its own `cc::Build::new()` chain. Adding files to
 another tool's build causes symbol collisions.
+
+### Storing raw pointers to per-batch data in the streaming context
+
+Only store pointers to session-lived state (config strings, reference paths),
+never to per-batch input. Per-batch input is owned by the Rust adapter and
+freed after `run_batch()` returns.
+
+### Forgetting Drop on the streaming context
+
+The streaming context struct must implement `Drop` to call the C library's
+`destroy()` function. Without it, the C context leaks on every streaming
+session.
 
 ### Writing bulk data to JSON
 

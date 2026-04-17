@@ -152,6 +152,37 @@ If `tool_run()` returns an error code, the context should reset internally
 so the caller can call `tool_run()` again with different input. Document
 this behavior.
 
+### Context reuse for batched streaming
+
+GPL-boundary can keep a tool's context alive across multiple batches of input,
+calling `run()` repeatedly without `destroy()`/`create()` in between. This
+amortizes expensive initialization (index loading, model training) across an
+arbitrarily large dataset.
+
+To support batched streaming, your context must:
+
+- Accept repeated `run()` calls with different input after `create()`
+- Not require that all input be present at once
+- Maintain immutable reference data (indices, models) across calls
+- Reset per-run state (output buffers, sequence state) on each `run()` call
+- Recover from errors — a failed `run()` must not invalidate the context
+
+Multi-batch usage pattern:
+```c
+tool_ctx_t *ctx = tool_create(&config);
+for (int i = 0; i < n_batches; i++) {
+    tool_run(ctx, inputs[i], &output, &stats);
+    process(output);
+    tool_output_free(output);
+}
+tool_destroy(ctx);
+```
+
+Note: This is required only if the tool has expensive context creation AND
+processes independent records. Tools where all input must be present at once
+(e.g., multiple sequence alignment for tree building) do not need streaming
+support.
+
 ### Return NULL on allocation failure
 
 `tool_create()` should return `NULL` if memory allocation fails. The Rust
@@ -658,3 +689,4 @@ Before starting integration, verify your C API against this list:
 - [ ] ABI size-check test for config struct
 - [ ] Happy-path smoke test (Arrow IPC roundtrip through shared memory)
 - [ ] Bad-shm-name error test
+- [ ] Context supports multiple `run()` calls without `destroy()`/`create()` (required for batched streaming; skip if all input must be present at once)
