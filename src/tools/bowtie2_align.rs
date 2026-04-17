@@ -1443,9 +1443,7 @@ impl GplTool for Bowtie2AlignTool {
                     .collect::<Result<Vec<_>, _>>()
             })
             .transpose()
-            .unwrap_or_else(|_| {
-                None // will be caught below
-            });
+            .unwrap_or(None);
         if input_data.seqs2.is_some() && seq2_cstrings.is_none() {
             return Response::error("sequence2 contains interior null byte");
         }
@@ -1466,7 +1464,7 @@ impl GplTool for Bowtie2AlignTool {
                     .collect::<Result<Vec<_>, _>>()
             })
             .transpose()
-            .unwrap_or_else(|_| None);
+            .unwrap_or(None);
         if input_data.quals2.is_some() && qual2_cstrings.is_none() {
             return Response::error("qual2 contains interior null byte");
         }
