@@ -1,3 +1,4 @@
+pub mod bowtie2_align;
 pub mod fasttree;
 pub mod prodigal;
 pub mod sortmerna;
@@ -116,6 +117,15 @@ pub fn version_info() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_bowtie2_align_in_registry() {
+        let names = list_tools();
+        assert!(
+            names.contains(&"bowtie2-align".to_string()),
+            "bowtie2-align not found in registry: {names:?}"
+        );
+    }
 
     #[test]
     fn test_fasttree_in_registry() {

@@ -5,6 +5,7 @@ fn main() {
     build_fasttree();
     build_prodigal();
     build_sortmerna();
+    build_bowtie2();
     link_math();
 }
 
@@ -271,6 +272,151 @@ fn link_sortmerna_deps() {
     if target_os == "linux" {
         println!("cargo:rustc-link-lib=dl");
     }
+}
+
+/// Compile bowtie2 C++11 sources into a static library.
+///
+/// Bowtie2 is C++11 with extern "C" API wrappers (bt2_api.h). We compile the
+/// combined library (aligner + builder) so that tests can use bt2_build_* to
+/// create index fixtures without shipping binary index files.
+fn build_bowtie2() {
+    let dir = PathBuf::from("ext/bowtie2");
+
+    // SEARCH_CPPS from CMakeLists.txt (32 files)
+    let search_files: Vec<PathBuf> = [
+        "qual.cpp",
+        "pat.cpp",
+        "sam.cpp",
+        "read_qseq.cpp",
+        "aligner_seed_policy.cpp",
+        "aligner_seed.cpp",
+        "aligner_seed2.cpp",
+        "aligner_sw.cpp",
+        "aligner_sw_driver.cpp",
+        "aligner_cache.cpp",
+        "aligner_result.cpp",
+        "ref_coord.cpp",
+        "mask.cpp",
+        "pe.cpp",
+        "aln_sink.cpp",
+        "dp_framer.cpp",
+        "scoring.cpp",
+        "presets.cpp",
+        "unique.cpp",
+        "simple_func.cpp",
+        "random_util.cpp",
+        "aligner_bt.cpp",
+        "sse_util.cpp",
+        "aligner_swsse.cpp",
+        "outq.cpp",
+        "aligner_swsse_loc_i16.cpp",
+        "aligner_swsse_ee_i16.cpp",
+        "aligner_swsse_loc_u8.cpp",
+        "aligner_swsse_ee_u8.cpp",
+        "aligner_driver.cpp",
+        "bowtie_main.cpp",
+        "bt2_search.cpp",
+    ]
+    .iter()
+    .map(|f| dir.join(f))
+    .collect();
+
+    // API + build files for combined library (8 files)
+    let combined_files: Vec<PathBuf> = [
+        "bt2_api.cpp",
+        "bt2_api_common.cpp",
+        "bt2_sam_parse.cpp",
+        "aln_sink_columnar.cpp",
+        "bt2_build.cpp",
+        "diff_sample.cpp",
+        "bowtie_build_main.cpp",
+        "bt2_build_api.cpp",
+    ]
+    .iter()
+    .map(|f| dir.join(f))
+    .collect();
+
+    // SHARED_CPPS from CMakeLists.txt (14 files)
+    let shared_files: Vec<PathBuf> = [
+        "ccnt_lut.cpp",
+        "ref_read.cpp",
+        "alphabet.cpp",
+        "shmem.cpp",
+        "edit.cpp",
+        "bt2_idx.cpp",
+        "bt2_io.cpp",
+        "bt2_locks.cpp",
+        "bt2_util.cpp",
+        "reference.cpp",
+        "ds.cpp",
+        "multikey_qsort.cpp",
+        "limit.cpp",
+        "random_source.cpp",
+    ]
+    .iter()
+    .map(|f| dir.join(f))
+    .collect();
+
+    let mut build = cc::Build::new();
+    build.cpp(true);
+    build.std("c++11");
+
+    for f in &search_files {
+        build.file(f);
+    }
+    for f in &combined_files {
+        build.file(f);
+    }
+    for f in &shared_files {
+        build.file(f);
+    }
+
+    build
+        .include(&dir)
+        .include(dir.join("third_party"))
+        .define("BT2_NO_MAIN", None)
+        .define("BT2_BUILD_NO_MAIN", None)
+        .define("BOWTIE2", None)
+        .define("BOWTIE_MM", None)
+        .define("_LARGEFILE_SOURCE", None)
+        .define("_FILE_OFFSET_BITS", Some("64"))
+        .define("_GNU_SOURCE", None)
+        .define("NDEBUG", None)
+        .define("NO_SPINLOCK", None)
+        .define("WITH_QUEUELOCK", Some("1"))
+        // Stub version/build strings (only used in guarded showVersion paths)
+        .define("BOWTIE2_VERSION", Some("\"2.5.5\""))
+        .define("BUILD_HOST", Some("\"embedded\""))
+        .define("BUILD_TIME", Some("\"embedded\""))
+        .define("COMPILER_VERSION", Some("\"embedded\""))
+        .define("COMPILER_OPTIONS", Some("\"embedded\""));
+
+    // Architecture-specific flags
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    if target_arch == "x86_64" {
+        build.flag_if_supported("-msse2");
+        build.define("POPCNT_CAPABILITY", None);
+    } else if matches!(
+        target_arch.as_str(),
+        "aarch64" | "arm" | "s390x" | "powerpc64"
+    ) {
+        build.flag_if_supported("-fopenmp-simd");
+    }
+
+    build
+        .opt_level(3)
+        .flag_if_supported("-funroll-loops")
+        .warnings(false)
+        .compile("bowtie2_cpp");
+
+    // Bowtie2 needs pthreads on Linux (sortmerna already links stdc++/c++ and zlib)
+    if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "linux" {
+        println!("cargo:rustc-link-lib=pthread");
+    }
+
+    // Rebuild if any source in the submodule changes. With 54 compiled files,
+    // directory-level tracking is more practical than listing each one.
+    println!("cargo:rerun-if-changed=ext/bowtie2");
 }
 
 /// Link libm on Linux (required for math functions in C submodules).

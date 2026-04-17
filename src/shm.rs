@@ -84,9 +84,14 @@ extern "C" fn signal_handler(sig: libc::c_int) {
     }
 }
 
-/// Generate a unique output shm name using the process PID and a label.
+/// Generate a unique output shm name using the process PID, an atomic counter,
+/// and a label. The counter ensures uniqueness when a process creates multiple
+/// output segments with the same label (e.g., across test runs).
 /// Labels must be short ASCII identifiers (lowercase alphanumeric + hyphen).
 pub fn output_shm_name(label: &str) -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
     assert!(
         !label.is_empty()
             && label
@@ -95,7 +100,8 @@ pub fn output_shm_name(label: &str) -> String {
         "shm label must be non-empty and contain only [a-z0-9-], got: {label:?}"
     );
     let pid = std::process::id();
-    format!("/gpl-boundary-{pid}-{label}")
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("/gpl-boundary-{pid}-{n}-{label}")
 }
 
 // --- SharedMemory type ---
@@ -314,8 +320,8 @@ mod tests {
     #[test]
     fn test_output_shm_name_with_label() {
         let name = output_shm_name("tree");
-        let pid = std::process::id();
-        assert_eq!(name, format!("/gpl-boundary-{pid}-tree"));
+        assert!(name.starts_with("/gpl-boundary-"));
+        assert!(name.ends_with("-tree"));
     }
 
     #[test]
@@ -325,6 +331,13 @@ mod tests {
         assert_ne!(name_a, name_b);
         assert!(name_a.ends_with("-tree"));
         assert!(name_b.ends_with("-dist"));
+    }
+
+    #[test]
+    fn test_output_shm_name_unique_across_calls() {
+        let name_a = output_shm_name("tree");
+        let name_b = output_shm_name("tree");
+        assert_ne!(name_a, name_b, "Same label should produce unique names");
     }
 
     #[test]
