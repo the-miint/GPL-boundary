@@ -39,6 +39,23 @@ pub struct ToolDescription {
     pub response_metadata: Vec<FieldDescription>,
 }
 
+/// A reusable tool context for batched streaming. Created once per session
+/// via `GplTool::create_streaming_context`, then used for multiple batches.
+/// Holds expensive state (loaded index, reference DB) that is reused across
+/// `run_batch` calls. The `Drop` impl must call the C library's `destroy()`.
+pub trait StreamingContext {
+    /// Process one batch of input. Same contract as `GplTool::execute()` but
+    /// against a pre-loaded context: reads input from shm, creates output shm,
+    /// returns Response.
+    ///
+    /// **Caller responsibility**: after writing the Response to stdout, the
+    /// caller must call `shm::deregister_cleanup` for each `shm_outputs` entry.
+    /// Output shm is registered for signal-handler cleanup inside `run_batch`;
+    /// deregistering transfers ownership to miint. This must happen *after*
+    /// the response is on stdout to prevent leaks if a signal arrives mid-write.
+    fn run_batch(&mut self, shm_input: &str) -> Response;
+}
+
 /// Trait for GPL-licensed tools that can be dispatched.
 pub trait GplTool {
     fn name(&self) -> &str;
@@ -47,9 +64,21 @@ pub trait GplTool {
     /// (new/removed/renamed columns, type changes) so consumers can fail fast.
     fn schema_version(&self) -> u32;
     fn describe(&self) -> ToolDescription;
-    /// Execute the tool. The tool reads input from shm_input, creates its own
-    /// output shm, and returns a Response containing the output shm name and size.
+    /// Execute the tool (single-shot). The tool reads input from shm_input,
+    /// creates its own output shm, and returns a Response.
     fn execute(&self, config: &serde_json::Value, shm_input: &str) -> Response;
+
+    /// Create a streaming context for batched execution. Returns `Ok(Some(ctx))`
+    /// if the tool supports streaming, `Ok(None)` if it does not (default).
+    /// The context holds expensive state (loaded index, models) and is reused
+    /// across multiple `run_batch()` calls.
+    fn create_streaming_context(
+        &self,
+        config: &serde_json::Value,
+    ) -> Result<Option<Box<dyn StreamingContext>>, String> {
+        let _ = config;
+        Ok(None)
+    }
 }
 
 /// Registration entry for the tool registry. Each tool module calls
@@ -80,6 +109,29 @@ pub fn dispatch(request: &Request) -> Response {
             response
         }
         None => Response::error(format!("Unknown tool: {}", request.tool)),
+    }
+}
+
+/// Set up a streaming session for the named tool. Returns the streaming
+/// context and the tool's schema version, or an error Response.
+pub fn streaming_setup(
+    tool_name: &str,
+    config: &serde_json::Value,
+) -> Result<(Box<dyn StreamingContext>, u32), Response> {
+    let tool = all_tools().into_iter().find(|t| t.name() == tool_name);
+    match tool {
+        None => Err(Response::error(format!("Unknown tool: {tool_name}"))),
+        Some(t) => {
+            let schema_version = t.schema_version();
+            match t.create_streaming_context(config) {
+                Ok(Some(ctx)) => Ok((ctx, schema_version)),
+                Ok(None) => Err(Response::error(format!(
+                    "Tool '{}' does not support streaming",
+                    tool_name
+                ))),
+                Err(e) => Err(Response::error(e)),
+            }
+        }
     }
 }
 
@@ -160,6 +212,7 @@ mod tests {
             tool: "nonexistent".to_string(),
             config: serde_json::json!({}),
             shm_input: "/dummy".to_string(),
+            stream: false,
         };
         let response = dispatch(&request);
         assert!(!response.success);
@@ -179,6 +232,53 @@ mod tests {
         assert!(!desc.config_params.is_empty());
         assert!(!desc.input_schema.is_empty());
         assert!(!desc.output_schema.is_empty());
+    }
+
+    // -- StreamingContext and streaming_setup tests --
+
+    #[test]
+    fn test_streaming_context_trait_is_object_safe() {
+        struct DummyCtx;
+        impl StreamingContext for DummyCtx {
+            fn run_batch(&mut self, _shm_input: &str) -> Response {
+                Response::error("stub")
+            }
+        }
+        let mut ctx: Box<dyn StreamingContext> = Box::new(DummyCtx);
+        let resp = ctx.run_batch("/dummy");
+        assert!(!resp.success);
+    }
+
+    #[test]
+    fn test_default_create_streaming_context_returns_none() {
+        let tools = all_tools();
+        let fasttree = tools.iter().find(|t| t.name() == "fasttree").unwrap();
+        let result = fasttree.create_streaming_context(&serde_json::json!({}));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_streaming_setup_unknown_tool() {
+        match streaming_setup("nonexistent", &serde_json::json!({})) {
+            Err(resp) => assert!(resp.error.as_ref().unwrap().contains("Unknown tool")),
+            Ok(_) => panic!("Expected error for unknown tool"),
+        }
+    }
+
+    #[test]
+    fn test_streaming_setup_non_streaming_tool() {
+        match streaming_setup("fasttree", &serde_json::json!({})) {
+            Err(resp) => assert!(
+                resp.error
+                    .as_ref()
+                    .unwrap()
+                    .contains("does not support streaming"),
+                "Expected 'does not support streaming', got: {:?}",
+                resp.error
+            ),
+            Ok(_) => panic!("Expected error for non-streaming tool"),
+        }
     }
 
     #[test]

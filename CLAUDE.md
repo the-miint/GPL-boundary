@@ -21,6 +21,14 @@ spawns it as a short-lived child process.
   macOS (not `/dev/shm` file paths, which are Linux-only)
 - **WASM is a future goal**, not currently targeted
 
+**Batched streaming**: Tools with expensive context creation (bowtie2: index
+loading, sortmerna: reference indexing, prodigal: metagenomic bin
+initialization) support batched streaming. The `StreamingContext` trait
+provides `run_batch()` for per-batch work against a pre-loaded context. The
+protocol is lock-step NDJSON — at most 1 input + 1 output shm segment exists
+at any time, naturally respecting DuckDB backpressure. Single-genome prodigal
+does NOT support streaming (requires all sequences for training).
+
 ## Shared memory lifecycle (critical)
 
 This is the most important part of the architecture to understand.
@@ -101,6 +109,9 @@ Each tool gets:
    the `describe()` method on `GplTool`
 7. An ABI size-check test for each `#[repr(C)]` config struct
 8. Smoke tests using real shared memory (use `test_util` helpers)
+9. **(Optional) Streaming support** via `create_streaming_context()` on
+   `GplTool`. Required if the tool has expensive context creation and processes
+   independent records per batch. See `GUIDANCE_INTEGRATE.md` Step 6.
 
 Use `arrow_ipc::write_batch_to_output_shm()` and
 `arrow_ipc::read_batches_from_shm()` for Arrow IPC marshaling -- do not
@@ -131,7 +142,7 @@ src/
   shm.rs             # POSIX shared memory, cleanup registry, signal handlers
   test_util.rs       # Shared test helpers (cfg(test) only)
   tools/
-    mod.rs           # GplTool trait, ToolRegistration, inventory-based dispatch
+    mod.rs           # GplTool trait, ToolRegistration, StreamingContext trait, inventory-based dispatch
     fasttree.rs      # FastTree FFI bindings + GplTool impl + tests
     prodigal.rs      # Prodigal FFI bindings + GplTool impl + tests
     sortmerna.rs     # SortMeRNA FFI bindings + GplTool impl + tests
@@ -143,6 +154,7 @@ ext/
   bowtie2/           # git submodule (GPL-3.0, C++11)
 tests/
   build_sanity.rs    # Integration tests: binary links and runs correctly
+  streaming.rs       # Integration tests: NDJSON streaming protocol
 build.rs             # Per-tool C compilation functions via cc crate
 ```
 
@@ -178,6 +190,9 @@ These let miint programmatically discover capabilities without hardcoding.
 - **No bulk data in JSON**: sequences, trees, etc. always go through Arrow IPC
   in shared memory. JSON carries only tool name, parameters, shm paths, and
   lightweight result metadata.
+- **Streaming tests**: streaming-capable tools must have multi-batch smoke tests
+  verifying the context survives across `run_batch()` calls
+- **StreamingContext Drop**: must call the C library's `destroy()` function
 
 ## Protocol
 
@@ -210,6 +225,20 @@ from the tool's `schema_version()` method and is only present on success.
 Tools may produce multiple outputs (each a separate shm segment with a
 distinct label). `shm_outputs` is omitted from JSON when empty (error
 responses, metadata-only tools). Labels must be `[a-z0-9-]+`.
+
+Streaming request (first line of NDJSON):
+```json
+{"tool": "prodigal", "config": {"meta_mode": true}, "shm_input": "/input-0", "stream": true}
+```
+
+Subsequent batch requests (one per line):
+```json
+{"shm_input": "/input-1"}
+```
+
+EOF on stdin terminates the session. Each batch gets its own response line on
+stdout. Non-fatal batch errors return an error response; the session continues
+until EOF or IO error.
 
 ## Arrow schemas
 
@@ -331,6 +360,10 @@ Requirements: no global state, no `main()` (use `TOOL_NO_MAIN` define guard),
 no stdout/stderr (use log callback), no `exit()`/`abort()`, deterministic with
 seed, SOA outputs preferred (maps cleanly to Arrow columns), ABI versioning
 via `struct_size` as first field in config.
+
+Tools intended for batched streaming should follow the create/run*/destroy
+pattern where the context survives errors from `run()`. See
+GUIDANCE_API_LIBRARY.md for details.
 
 ## Related projects
 
