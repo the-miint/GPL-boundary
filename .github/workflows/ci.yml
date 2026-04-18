@@ -65,6 +65,72 @@ jobs:
                tools::bowtie2_align::tests::test_bowtie2_align_single_end_fastq_roundtrip \
             || true  # don't fail the step — we want the backtrace in the log
 
+  # Diagnostic: build bowtie2 via CMake instead of cc crate, then run the
+  # crashing test. Isolates whether the SIGSEGV is cc-crate-specific or
+  # inherent to bowtie2 when called from a Rust binary on macOS aarch64.
+  bowtie2-cmake-experiment:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        run: brew install rocksdb zlib cmake
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build bowtie2 via CMake
+        run: |
+          cd ext/bowtie2
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBOWTIE_MM=ON \
+            -DBOWTIE_SHARED_MEM=OFF \
+            -DNO_QUEUELOCK=OFF
+          cmake --build build --target bowtie2-combined-s-lib -j$(sysctl -n hw.logicalcpu)
+          echo "CMake library built:"
+          ls -la build/libbowtie2-combined-s-lib.a
+
+      - name: Build GPL-boundary with CMake-built bowtie2
+        env:
+          BT2_CMAKE_LIB: ${{ github.workspace }}/ext/bowtie2/build
+        run: cargo build --verbose
+
+      - name: Run bowtie2 tests with CMake-built library
+        env:
+          BT2_CMAKE_LIB: ${{ github.workspace }}/ext/bowtie2/build
+        run: |
+          cargo test --verbose -- --test-threads=1 \
+            tools::bowtie2_align::tests::test_bowtie2_align_single_end_fastq_roundtrip \
+            tools::bowtie2_align::tests::test_bowtie2_align_no_unal_zero_records \
+            tools::bowtie2_align::tests::test_bowtie2_align_paired_end_roundtrip
+
+      - name: Run bowtie2 tests under lldb if they crash
+        if: failure()
+        env:
+          BT2_CMAKE_LIB: ${{ github.workspace }}/ext/bowtie2/build
+        run: |
+          TEST_BIN=$(cargo test --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.executable != null and .target.name == "gpl-boundary" and (.executable | contains("/deps/"))) | .executable' \
+            | head -1)
+          if [ -z "$TEST_BIN" ]; then
+            TEST_BIN=$(ls -t target/debug/deps/gpl_boundary-* 2>/dev/null | grep -v '\.d$' | head -1)
+          fi
+          echo "Test binary: $TEST_BIN"
+          lldb -b \
+            -o "run" \
+            -o "thread list" \
+            -o "bt all" \
+            -o "frame select 0" \
+            -o "frame variable --show-types" \
+            -o "register read x0 x1 x19 x20" \
+            -o "quit" \
+            -- "$TEST_BIN" --test-threads=1 --exact \
+               tools::bowtie2_align::tests::test_bowtie2_align_single_end_fastq_roundtrip \
+            || true
+
   clippy:
     runs-on: ubuntu-latest
     steps:

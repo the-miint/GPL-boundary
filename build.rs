@@ -5,7 +5,24 @@ fn main() {
     build_fasttree();
     build_prodigal();
     build_sortmerna();
-    build_bowtie2();
+    // If BT2_CMAKE_LIB is set, link a pre-built CMake static library instead
+    // of compiling via cc. Used to diagnose macOS aarch64 SIGSEGV — isolates
+    // whether the crash is cc-crate-specific or inherent to bowtie2.
+    if let Ok(lib_dir) = env::var("BT2_CMAKE_LIB") {
+        println!("cargo:rustc-link-search=native={lib_dir}");
+        println!("cargo:rustc-link-lib=static=bowtie2-combined-s-lib");
+        // CMake build links C++ stdlib and pthreads
+        let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        if target_os == "macos" {
+            println!("cargo:rustc-link-lib=c++");
+        } else {
+            println!("cargo:rustc-link-lib=stdc++");
+            println!("cargo:rustc-link-lib=pthread");
+        }
+        println!("cargo:rerun-if-env-changed=BT2_CMAKE_LIB");
+    } else {
+        build_bowtie2();
+    }
     link_math();
 }
 
