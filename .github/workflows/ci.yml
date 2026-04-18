@@ -56,6 +56,9 @@ jobs:
           lldb -b \
             -o "run" \
             -o "bt all" \
+            -o "frame select 0" \
+            -o "frame variable --show-types" \
+            -o "register read x0 x1 x19 x20" \
             -o "quit" \
             -- "$TEST_BIN" --test-threads=1 --exact \
                tools::bowtie2_align::tests::test_bowtie2_align_single_end_fastq_roundtrip \
