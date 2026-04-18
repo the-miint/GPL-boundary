@@ -40,7 +40,7 @@ jobs:
         run: cargo test --verbose
 
       - name: Diagnose bowtie2 macOS SIGSEGV (lldb backtrace)
-        if: runner.os == 'macOS'
+        if: always() && runner.os == 'macOS'
         run: |
           # Build the test binary without running it
           TEST_BIN=$(cargo test --no-run --message-format=json 2>/dev/null \
@@ -51,13 +51,14 @@ jobs:
             exit 1
           fi
           echo "Test binary: $TEST_BIN"
-          # Run the crashing test under lldb for a backtrace
+          # Run a bowtie2 roundtrip test under lldb — any test that calls
+          # bt2_align_run segfaults on macOS aarch64
           lldb -b \
             -o "run" \
             -o "bt all" \
             -o "quit" \
             -- "$TEST_BIN" --test-threads=1 --exact \
-               tools::bowtie2_align::tests::test_bowtie2_align_no_unal_zero_records \
+               tools::bowtie2_align::tests::test_bowtie2_align_single_end_fastq_roundtrip \
             || true  # don't fail the step — we want the backtrace in the log
 
   clippy:
