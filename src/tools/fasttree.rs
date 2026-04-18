@@ -575,7 +575,7 @@ mod tests {
         let output_name = &response.shm_outputs[0].name;
         let output_size = response.shm_outputs[0].size;
         assert!(output_size > 0);
-        assert!(output_name.starts_with("/gpl-boundary-"));
+        assert!(output_name.starts_with("/gb-"));
         assert_eq!(response.shm_outputs[0].label, "tree");
 
         // Verify JSON metadata

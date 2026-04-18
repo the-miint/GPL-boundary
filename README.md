@@ -73,7 +73,7 @@ memory, and returns the name and size in the JSON response.
   "success": true,
   "schema_version": 1,
   "shm_outputs": [
-    { "name": "/gpl-boundary-1234-tree", "label": "tree", "size": 8192 }
+    { "name": "/gb-1234-0-tree", "label": "tree", "size": 8192 }
   ],
   "result": { "n_nodes": 7, "n_leaves": 4, "root": 6, "stats": { ... } }
 }
@@ -150,7 +150,7 @@ etc.) are documented per-tool in `--describe` output.
 - Allowed characters: alphanumeric, `-`, `_`, `.` (portable set).
 - gpl-boundary does not validate input names beyond passing them to
   `shm_open()`; invalid names produce OS-level errors.
-- Output names follow the pattern `/gpl-boundary-{pid}-{label}` where label
+- Output names follow the pattern `/gb-{pid}-{n}-{label}` where label
   is `[a-z0-9-]+`.
 
 ## Submodule API control

@@ -5,7 +5,7 @@
 //! ## Lifecycle
 //!
 //! gpl-boundary creates output shm regions with PID-based names
-//! (e.g., `/gpl-boundary-1234-out`). On normal exit or trappable signals
+//! (e.g., `/gb-1234-out`). On normal exit or trappable signals
 //! (SIGINT, SIGTERM), output shm is unlinked via the cleanup registry.
 //! SIGKILL cannot be trapped; the caller (miint) should clean up stale
 //! segments by checking if the PID in the name is still alive.
@@ -84,9 +84,14 @@ extern "C" fn signal_handler(sig: libc::c_int) {
     }
 }
 
-/// Generate a unique output shm name using the process PID and a label.
+/// Generate a unique output shm name using the process PID, an atomic counter,
+/// and a label. The counter ensures uniqueness when a process creates multiple
+/// output segments with the same label (e.g., across test runs).
 /// Labels must be short ASCII identifiers (lowercase alphanumeric + hyphen).
 pub fn output_shm_name(label: &str) -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
     assert!(
         !label.is_empty()
             && label
@@ -95,7 +100,17 @@ pub fn output_shm_name(label: &str) -> String {
         "shm label must be non-empty and contain only [a-z0-9-], got: {label:?}"
     );
     let pid = std::process::id();
-    format!("/gpl-boundary-{pid}-{label}")
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Prefix "gb" keeps names within the macOS POSIX shm 31-character limit.
+    // Budget: /gb-{pid}-{n}-{label} = 1+2+1+5+1+4+1+label ≤ 31
+    // With 5-digit PID, 4-digit counter: 15 + label ≤ 31 → label ≤ 16 chars.
+    let name = format!("/gb-{pid}-{n}-{label}");
+    assert!(
+        name.len() <= 31,
+        "shm name exceeds macOS 31-char limit: {name} ({} chars)",
+        name.len()
+    );
+    name
 }
 
 // --- SharedMemory type ---
@@ -278,7 +293,7 @@ mod tests {
 
     #[test]
     fn test_create_write_read_detach() {
-        let name = "/gpl-boundary-test-shm-detach";
+        let name = "/gb-test-shm-detach";
         let data = b"hello shared memory";
 
         // Create, write, and detach (keeps shm alive for readers)
@@ -300,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_owned_drop_unlinks() {
-        let name = "/gpl-boundary-test-shm-drop";
+        let name = "/gb-test-shm-drop";
 
         {
             let _shm = SharedMemory::create(name, 4096).unwrap();
@@ -314,8 +329,8 @@ mod tests {
     #[test]
     fn test_output_shm_name_with_label() {
         let name = output_shm_name("tree");
-        let pid = std::process::id();
-        assert_eq!(name, format!("/gpl-boundary-{pid}-tree"));
+        assert!(name.starts_with("/gb-"));
+        assert!(name.ends_with("-tree"));
     }
 
     #[test]
@@ -328,8 +343,15 @@ mod tests {
     }
 
     #[test]
+    fn test_output_shm_name_unique_across_calls() {
+        let name_a = output_shm_name("tree");
+        let name_b = output_shm_name("tree");
+        assert_ne!(name_a, name_b, "Same label should produce unique names");
+    }
+
+    #[test]
     fn test_cleanup_registry() {
-        let name = "/gpl-boundary-test-registry";
+        let name = "/gb-test-registry";
         let _shm = SharedMemory::create(name, 64).unwrap();
 
         // Detach so drop doesn't unlink
