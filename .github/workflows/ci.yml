@@ -42,19 +42,20 @@ jobs:
       - name: Diagnose bowtie2 macOS SIGSEGV (lldb backtrace)
         if: always() && runner.os == 'macOS'
         run: |
-          # Build the test binary without running it
+          # Find the test binary (in target/debug/deps/, not the main binary)
           TEST_BIN=$(cargo test --no-run --message-format=json 2>/dev/null \
-            | jq -r 'select(.executable != null and .target.name == "gpl-boundary") | .executable' \
+            | jq -r 'select(.executable != null and .target.name == "gpl-boundary" and (.executable | contains("/deps/"))) | .executable' \
             | head -1)
           if [ -z "$TEST_BIN" ]; then
-            echo "Could not find test binary"
-            exit 1
+            echo "Could not find test binary, falling back to glob"
+            TEST_BIN=$(ls -t target/debug/deps/gpl_boundary-* 2>/dev/null | grep -v '\.d$' | head -1)
           fi
           echo "Test binary: $TEST_BIN"
-          # Run a bowtie2 roundtrip test under lldb — any test that calls
-          # bt2_align_run segfaults on macOS aarch64
+          # Run one bowtie2 test under lldb to capture backtrace + variable dump.
+          # The test is #[ignore] on macOS, but running it directly bypasses that.
           lldb -b \
             -o "run" \
+            -o "thread list" \
             -o "bt all" \
             -o "frame select 0" \
             -o "frame variable --show-types" \
