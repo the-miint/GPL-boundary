@@ -1965,6 +1965,10 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "SIGSEGV in bowtie2 C library on macOS aarch64 with all-N input"
+    )]
     fn test_bowtie2_align_no_unal_zero_records() {
         let (_dir, index_prefix) = build_test_index();
 
