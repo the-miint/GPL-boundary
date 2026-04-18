@@ -1012,7 +1012,7 @@ mod tests {
         // Verify output shm metadata
         assert_eq!(response.shm_outputs.len(), 1);
         let output_name = &response.shm_outputs[0].name;
-        assert!(output_name.starts_with("/gpl-boundary-"));
+        assert!(output_name.starts_with("/gb-"));
         assert_eq!(response.shm_outputs[0].label, "genes");
         assert!(response.shm_outputs[0].size > 0);
 

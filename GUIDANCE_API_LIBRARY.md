@@ -577,7 +577,7 @@ mod tests {
         assert_eq!(response.shm_outputs.len(), 1);
 
         let output = &response.shm_outputs[0];
-        assert!(output.name.starts_with("/gpl-boundary-"));
+        assert!(output.name.starts_with("/gb-"));
         assert_eq!(output.label, "your-label");
         assert!(output.size > 0);
 

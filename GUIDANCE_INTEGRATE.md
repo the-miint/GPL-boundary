@@ -280,7 +280,7 @@ fn test_newtool_roundtrip() {
 
     assert!(response.success, "Failed: {:?}", response.error);
     assert_eq!(response.shm_outputs.len(), 1);
-    assert!(response.shm_outputs[0].name.starts_with("/gpl-boundary-"));
+    assert!(response.shm_outputs[0].name.starts_with("/gb-"));
     assert_eq!(response.shm_outputs[0].label, "your-label");
     assert!(response.shm_outputs[0].size > 0);
 

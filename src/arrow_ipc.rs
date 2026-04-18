@@ -92,7 +92,7 @@ mod tests {
         let shm_out = write_batch_to_output_shm(&batch, "test").unwrap();
         assert_eq!(shm_out.label, "test");
         assert!(shm_out.size > 0);
-        assert!(shm_out.name.contains("gpl-boundary-"));
+        assert!(shm_out.name.contains("gb-"));
         assert!(shm_out.name.ends_with("-test"));
 
         // Verify the data is readable

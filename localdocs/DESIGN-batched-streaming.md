@@ -421,7 +421,7 @@ burden.
   "success": true,
   "schema_version": 1,
   "shm_outputs": [
-    {"name": "/gpl-boundary-1234-0-alignments", "label": "alignments", "size": 52428800}
+    {"name": "/gb-1234-0-alignments", "label": "alignments", "size": 52428800}
   ],
   "result": {"n_reads": 100000, "n_aligned": 87432, "batch_index": 0}
 }
