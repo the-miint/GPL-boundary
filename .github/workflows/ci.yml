@@ -97,22 +97,26 @@ jobs:
       - name: Build GPL-boundary with CMake-built bowtie2
         env:
           BT2_CMAKE_LIB: ${{ github.workspace }}/ext/bowtie2/build
-        run: cargo build --verbose
+        run: |
+          # Force full rebuild to ensure CMake lib is used (not cached cc-crate build)
+          cargo clean -p gpl-boundary 2>/dev/null || true
+          cargo build --verbose
 
       - name: Run ALL tests with CMake-built bowtie2 (including ignored)
         env:
           BT2_CMAKE_LIB: ${{ github.workspace }}/ext/bowtie2/build
         run: cargo test --verbose -- --include-ignored
 
-      - name: Dump cc-crate compile commands for comparison
+      - name: Dump compile command comparison
+        if: always()
         run: |
-          echo "=== cc crate compile commands for bowtie2 ==="
-          # Force rebuild to capture commands
-          cargo clean -p gpl-boundary 2>/dev/null || true
-          CC_PRINT_COMMANDS=1 cargo build --verbose 2>&1 | grep -E "c\+\+|clang\+\+" | head -5
+          echo "=== CMake compile commands (first .cpp file) ==="
+          cat ext/bowtie2/build/compile_commands.json 2>/dev/null \
+            | jq -r '.[0].command' || echo "(no compile_commands.json)"
           echo ""
-          echo "=== CMake compile commands ==="
-          cat ext/bowtie2/build/compile_commands.json 2>/dev/null | jq -r '.[0].command' | head -1 || echo "No compile_commands.json (add -DCMAKE_EXPORT_COMPILE_COMMANDS=ON)"
+          echo "=== cc crate compile commands ==="
+          cargo clean -p gpl-boundary 2>/dev/null || true
+          cargo build -vv 2>&1 | grep "running:.*c++" | head -3
 
   clippy:
     runs-on: ubuntu-latest
