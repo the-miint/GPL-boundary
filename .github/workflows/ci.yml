@@ -102,10 +102,20 @@ jobs:
           cargo clean -p gpl-boundary 2>/dev/null || true
           cargo build --verbose
 
-      - name: Run ALL tests with CMake-built bowtie2 (including ignored)
+      - name: Run bowtie2 alignment tests with CMake-built library
         env:
           BT2_CMAKE_LIB: ${{ github.workspace }}/ext/bowtie2/build
-        run: cargo test --verbose -- --include-ignored
+        run: |
+          # Run each crashing test individually to see exactly which pass/fail
+          echo "=== test 1: single_end_fastq_roundtrip ==="
+          cargo test --verbose -- --test-threads=1 --include-ignored --exact \
+            tools::bowtie2_align::tests::test_bowtie2_align_single_end_fastq_roundtrip
+          echo "=== test 2: no_unal_zero_records ==="
+          cargo test --verbose -- --test-threads=1 --include-ignored --exact \
+            tools::bowtie2_align::tests::test_bowtie2_align_no_unal_zero_records
+          echo "=== test 3: paired_end_roundtrip ==="
+          cargo test --verbose -- --test-threads=1 --include-ignored --exact \
+            tools::bowtie2_align::tests::test_bowtie2_align_paired_end_roundtrip
 
       - name: Dump compile command comparison
         if: always()
