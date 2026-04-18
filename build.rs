@@ -394,7 +394,9 @@ fn build_bowtie2() {
         .define("BT2_NO_MAIN", None)
         .define("BT2_BUILD_NO_MAIN", None)
         .define("BOWTIE2", None)
-        .define("BOWTIE_MM", None)
+        // BOWTIE_MM intentionally NOT defined. It enables memory-mapped index
+        // loading (mmap of .bt2 files) which is unnecessary for GPL-boundary's
+        // single-process model and causes SIGSEGV on macOS aarch64.
         .define("_LARGEFILE_SOURCE", None)
         .define("_FILE_OFFSET_BITS", Some("64"))
         .define("_GNU_SOURCE", None)
