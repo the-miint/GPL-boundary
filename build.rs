@@ -374,6 +374,17 @@ fn build_bowtie2() {
     .map(|f| dir.join(f))
     .collect();
 
+    // Use -O0 on macOS aarch64 to work around SIGSEGV in bowtie2.
+    // The crash is in MemoryPatternSource::nextBatch on a worker thread —
+    // likely optimization-exposed UB in sstring.h on arm64.
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let bt2_opt_level: u32 = if target_os == "macos" && target_arch == "aarch64" {
+        0
+    } else {
+        3
+    };
+
     let mut build = cc::Build::new();
     build.cpp(true);
     build.std("c++11");
@@ -423,7 +434,7 @@ fn build_bowtie2() {
     }
 
     build
-        .opt_level(3)
+        .opt_level(bt2_opt_level)
         .flag_if_supported("-funroll-loops")
         .warnings(false)
         .compile("bowtie2_cpp");
