@@ -2021,7 +2021,7 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
         assert!(response.success, "Failed: {:?}", response.error);
         assert_eq!(response.shm_outputs.len(), 1);
         assert_eq!(response.shm_outputs[0].label, "alignments");
-        assert!(response.shm_outputs[0].name.starts_with("/gpl-boundary-"));
+        assert!(response.shm_outputs[0].name.starts_with("/gb-"));
         assert!(response.shm_outputs[0].size > 0);
 
         let result = response.result.unwrap();

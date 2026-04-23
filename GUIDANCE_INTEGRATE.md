@@ -50,16 +50,24 @@ fn main() {
 fn build_newtool() {
     let dir = PathBuf::from("ext/newtool");
 
-    cc::Build::new()
+    let mut build = cc::Build::new();
+    build
         .file(dir.join("newtool_core.c"))
         .file(dir.join("newtool_api.c"))
         .include(&dir)
         .define("NEWTOOL_NO_MAIN", None)
+        .flag("-fvisibility=hidden")
         .opt_level(3)
         .flag_if_supported("-finline-functions")
         .flag_if_supported("-funroll-loops")
-        .warnings(false)
-        .compile("newtool_c");
+        .warnings(false);
+
+    // C++ builds also need -fvisibility-inlines-hidden
+    if is_cpp {
+        build.flag("-fvisibility-inlines-hidden");
+    }
+
+    build.compile("newtool_c");
 
     println!("cargo:rerun-if-changed=ext/newtool/newtool_core.c");
     println!("cargo:rerun-if-changed=ext/newtool/newtool_api.c");
@@ -70,6 +78,11 @@ fn build_newtool() {
 Key points:
 - **Separate `cc::Build` per tool** -- never add files to another tool's build
 - **`define("NEWTOOL_NO_MAIN", None)`** -- suppresses the submodule's `main()`
+- **`flag("-fvisibility=hidden")`** -- **required**. Hides all symbols except
+  the `extern "C"` API. Without this, internal C/C++ symbols (template
+  instantiations, static helpers) leak into the Rust binary's symbol table
+  and can collide with system/runtime symbols, causing crashes on macOS
+  aarch64. For C++ builds, also add `flag("-fvisibility-inlines-hidden")`.
 - **`compile("newtool_c")`** -- unique static library name
 - **`cargo:rerun-if-changed`** for every source and header file the build uses
 - Add tool-specific defines as needed (e.g., `USE_DOUBLE` for precision)
@@ -280,7 +293,7 @@ fn test_newtool_roundtrip() {
 
     assert!(response.success, "Failed: {:?}", response.error);
     assert_eq!(response.shm_outputs.len(), 1);
-    assert!(response.shm_outputs[0].name.starts_with("/gpl-boundary-"));
+    assert!(response.shm_outputs[0].name.starts_with("/gb-"));
     assert_eq!(response.shm_outputs[0].label, "your-label");
     assert!(response.shm_outputs[0].size > 0);
 

@@ -21,6 +21,7 @@ fn build_fasttree() {
         .include(&dir)
         .define("FASTTREE_NO_MAIN", None)
         .define("USE_DOUBLE", None)
+        .flag("-fvisibility=hidden")
         .opt_level(3)
         .flag_if_supported("-finline-functions")
         .flag_if_supported("-funroll-loops")
@@ -48,6 +49,7 @@ fn build_prodigal() {
         .file(dir.join("prodigal_api.c"))
         .include(&dir)
         .define("PRODIGAL_NO_MAIN", None)
+        .flag("-fvisibility=hidden")
         .opt_level(3)
         .flag_if_supported("-finline-functions")
         .flag_if_supported("-funroll-loops")
@@ -130,6 +132,7 @@ fn build_sortmerna() {
         .file(smr_src.join("ssw.c"))
         .include(&cmph_dir)
         .include(dir.join("include"))
+        .flag("-fvisibility=hidden")
         .opt_level(3)
         .warnings(false)
         .compile("smr_c");
@@ -216,6 +219,8 @@ fn build_sortmerna() {
     }
     cpp_build
         .define("SMR_NO_MAIN", None)
+        .flag("-fvisibility=hidden")
+        .flag("-fvisibility-inlines-hidden")
         .opt_level(3)
         .warnings(false)
         // alp uses deprecated `register` keyword; Clang 16+ treats this as
@@ -230,7 +235,7 @@ fn build_sortmerna() {
     std::fs::write(
         &build_ver_path,
         r#"
-extern "C++" {
+namespace sortmerna {
     const char* sortmerna_build_compile_date = "embedded";
     const char* sortmerna_build_git_sha = "embedded";
     const char* sortmerna_build_git_date = "embedded";
@@ -242,6 +247,7 @@ extern "C++" {
     cc::Build::new()
         .cpp(true)
         .file(&build_ver_path)
+        .flag("-fvisibility=hidden")
         .warnings(false)
         .compile("smr_build_version");
 
@@ -403,7 +409,13 @@ fn build_bowtie2() {
         build.flag_if_supported("-fopenmp-simd");
     }
 
+    // Hide all C++ symbols — only the extern "C" bt2_* API is needed by Rust.
+    // Without this, C++ template instantiations (SStringExpandable, EList, etc.)
+    // leak into the Rust binary's symbol table and collide with system/runtime
+    // symbols on macOS aarch64, causing SIGSEGV in worker threads.
     build
+        .flag("-fvisibility=hidden")
+        .flag("-fvisibility-inlines-hidden")
         .opt_level(3)
         .flag_if_supported("-funroll-loops")
         .warnings(false)

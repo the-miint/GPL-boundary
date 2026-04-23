@@ -35,7 +35,7 @@ pub struct BatchRequest {
 /// A single shared memory output segment.
 #[derive(Debug, Serialize, Clone)]
 pub struct ShmOutput {
-    /// POSIX shared memory name (e.g., "/gpl-boundary-1234-tree").
+    /// POSIX shared memory name (e.g., "/gb-1234-0-tree").
     pub name: String,
     /// Tool-defined label identifying this output (e.g., "tree", "alignment").
     pub label: String,

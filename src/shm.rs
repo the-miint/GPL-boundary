@@ -5,7 +5,7 @@
 //! ## Lifecycle
 //!
 //! gpl-boundary creates output shm regions with PID-based names
-//! (e.g., `/gpl-boundary-1234-out`). On normal exit or trappable signals
+//! (e.g., `/gb-1234-out`). On normal exit or trappable signals
 //! (SIGINT, SIGTERM), output shm is unlinked via the cleanup registry.
 //! SIGKILL cannot be trapped; the caller (miint) should clean up stale
 //! segments by checking if the PID in the name is still alive.
@@ -101,7 +101,16 @@ pub fn output_shm_name(label: &str) -> String {
     );
     let pid = std::process::id();
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("/gpl-boundary-{pid}-{n}-{label}")
+    // Prefix "gb" keeps names within the macOS POSIX shm 31-character limit.
+    // Budget: /gb-{pid}-{n}-{label} = 1+2+1+5+1+4+1+label ≤ 31
+    // With 5-digit PID, 4-digit counter: 15 + label ≤ 31 → label ≤ 16 chars.
+    let name = format!("/gb-{pid}-{n}-{label}");
+    assert!(
+        name.len() <= 31,
+        "shm name exceeds macOS 31-char limit: {name} ({} chars)",
+        name.len()
+    );
+    name
 }
 
 // --- SharedMemory type ---
@@ -284,7 +293,7 @@ mod tests {
 
     #[test]
     fn test_create_write_read_detach() {
-        let name = "/gpl-boundary-test-shm-detach";
+        let name = "/gb-test-shm-detach";
         let data = b"hello shared memory";
 
         // Create, write, and detach (keeps shm alive for readers)
@@ -306,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_owned_drop_unlinks() {
-        let name = "/gpl-boundary-test-shm-drop";
+        let name = "/gb-test-shm-drop";
 
         {
             let _shm = SharedMemory::create(name, 4096).unwrap();
@@ -320,7 +329,7 @@ mod tests {
     #[test]
     fn test_output_shm_name_with_label() {
         let name = output_shm_name("tree");
-        assert!(name.starts_with("/gpl-boundary-"));
+        assert!(name.starts_with("/gb-"));
         assert!(name.ends_with("-tree"));
     }
 
@@ -342,7 +351,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_registry() {
-        let name = "/gpl-boundary-test-registry";
+        let name = "/gb-test-registry";
         let _shm = SharedMemory::create(name, 64).unwrap();
 
         // Detach so drop doesn't unlink

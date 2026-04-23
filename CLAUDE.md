@@ -39,7 +39,7 @@ This is the most important part of the architecture to understand.
 2. **miint** spawns `gpl-boundary`, writes JSON request to stdin (includes
    `shm_input` name)
 3. **gpl-boundary** reads input from shm, runs tool, creates output shm(s) with
-   PID-based names (`/gpl-boundary-{pid}-{label}`), writes Arrow IPC results
+   PID-based names (`/gb-{pid}-{n}-{label}`), writes Arrow IPC results
 4. **gpl-boundary** responds via stdout with `shm_outputs` array (name, label,
    size for each output)
 5. **miint** reads response, opens each output shm, reads `size` bytes of
@@ -52,7 +52,7 @@ gpl-boundary installs signal handlers for SIGINT and SIGTERM that unlink any
 output shm it has created. This prevents leaks on graceful termination.
 
 **SIGKILL cannot be trapped.** The PID-based naming convention
-(`/gpl-boundary-{pid}-{label}`) lets miint detect and clean up stale segments
+(`/gb-{pid}-{n}-{label}`) lets miint detect and clean up stale segments
 by checking if the PID is still alive.
 
 ### Cleanup registry
@@ -211,7 +211,7 @@ Response (stdout JSON):
   "success": true,
   "schema_version": 1,
   "shm_outputs": [
-    { "name": "/gpl-boundary-1234-tree", "label": "tree", "size": 8192 }
+    { "name": "/gb-1234-0-tree", "label": "tree", "size": 8192 }
   ],
   "result": { "n_nodes": 7, "n_leaves": 4, "root": 6, "stats": { ... } }
 }
