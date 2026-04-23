@@ -28,6 +28,10 @@ fn test_version_output() {
         stdout.contains("gpl_boundary"),
         "Version output missing gpl_boundary: {stdout}"
     );
+    assert!(
+        stdout.contains("bowtie2-align"),
+        "Version output missing bowtie2-align: {stdout}"
+    );
 }
 
 #[test]
@@ -46,5 +50,9 @@ fn test_list_tools_output() {
     assert!(
         stdout.contains("prodigal"),
         "list-tools missing prodigal: {stdout}"
+    );
+    assert!(
+        stdout.contains("bowtie2-align"),
+        "list-tools missing bowtie2-align: {stdout}"
     );
 }

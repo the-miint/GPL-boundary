@@ -14,12 +14,28 @@ pub struct Request {
     /// POSIX shared memory name for the input Arrow IPC data.
     /// Created and owned by the caller (miint).
     pub shm_input: String,
+
+    /// When true, the process stays alive after the first response and reads
+    /// subsequent BatchRequest messages from stdin until EOF. The tool's
+    /// context (loaded index, models) is reused across batches.
+    /// Absent or false = single-shot (existing behavior).
+    #[serde(default)]
+    pub stream: bool,
+}
+
+/// A subsequent batch request in streaming mode. Contains only the shm name
+/// for the next batch of input. Tool name and config are fixed for the session
+/// (established by the initial Request).
+#[derive(Debug, Deserialize)]
+pub struct BatchRequest {
+    /// POSIX shared memory name for this batch's input Arrow IPC data.
+    pub shm_input: String,
 }
 
 /// A single shared memory output segment.
 #[derive(Debug, Serialize, Clone)]
 pub struct ShmOutput {
-    /// POSIX shared memory name (e.g., "/gpl-boundary-1234-tree").
+    /// POSIX shared memory name (e.g., "/gb-1234-0-tree").
     pub name: String,
     /// Tool-defined label identifying this output (e.g., "tree", "alignment").
     pub label: String,
@@ -126,6 +142,49 @@ mod tests {
         assert!(json.get("shm_outputs").is_none());
         assert!(json.get("schema_version").is_none());
         assert!(json.get("result").is_none());
+    }
+
+    // -- Request.stream field tests --
+
+    #[test]
+    fn test_request_stream_true() {
+        let req: Request =
+            serde_json::from_str(r#"{"tool":"foo","shm_input":"/x","stream":true}"#).unwrap();
+        assert!(req.stream);
+    }
+
+    #[test]
+    fn test_request_stream_absent() {
+        let req: Request = serde_json::from_str(r#"{"tool":"foo","shm_input":"/x"}"#).unwrap();
+        assert!(!req.stream);
+    }
+
+    #[test]
+    fn test_request_stream_false() {
+        let req: Request =
+            serde_json::from_str(r#"{"tool":"foo","shm_input":"/x","stream":false}"#).unwrap();
+        assert!(!req.stream);
+    }
+
+    // -- BatchRequest tests --
+
+    #[test]
+    fn test_batch_request_deserialize() {
+        let batch: BatchRequest = serde_json::from_str(r#"{"shm_input":"/batch-1"}"#).unwrap();
+        assert_eq!(batch.shm_input, "/batch-1");
+    }
+
+    #[test]
+    fn test_batch_request_missing_shm_input() {
+        let result = serde_json::from_str::<BatchRequest>("{}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_batch_request_ignores_extra_fields() {
+        let batch: BatchRequest =
+            serde_json::from_str(r#"{"shm_input":"/x","extra":"whatever"}"#).unwrap();
+        assert_eq!(batch.shm_input, "/x");
     }
 
     #[test]

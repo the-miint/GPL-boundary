@@ -28,7 +28,7 @@ into the Rust project. Covers the five files to touch (`.gitmodules`,
 the `cc::Build` pattern, FFI binding conventions (`#[repr(C)]`, manual not
 bindgen), Arrow schema definitions, `GplTool` trait implementation,
 `inventory::submit!` auto-registration, required test patterns (roundtrip,
-bad shm, ABI size check), and verification commands.
+bad shm, ABI size check, streaming multi-batch), and verification commands.
 
 Use this document when you have a C library that already meets the API
 contract and you are ready to add it to the repository.
