@@ -352,14 +352,24 @@ directory of `index_path` exists. Config knobs: `nthreads`, `seed`, `offrate`,
 
 ## Arrow IPC write strategy
 
-`write_batch_to_output_shm` serializes to `Vec<u8>` then copies into shm.
-Alternatives were investigated and rejected:
-- **Over-allocate + ftruncate**: unsafe with existing mmap (SIGBUS risk if
-  accessing pages beyond truncated size)
-- **Two-pass counting writer**: viable but marginal benefit, adds complexity
-- **Temporary file**: strictly worse than Vec approach
+**Output (`write_batch_to_output_shm`)**: zero-copy via `arrow_ipc::ShmWriter`,
+which `shm_open`s a fresh segment, sparsely reserves `GPL_BOUNDARY_MAX_SHM_BYTES`
+virtual bytes (default 1 GiB), and `mmap`s once. The Arrow `StreamWriter` writes
+directly into the mapping. On `finish()` the writer `munmap`s, `ftruncate`s the fd
+down to the exact written byte count (releasing unused pages back to the kernel),
+and closes. There is no intermediate `Vec<u8>` and no remap during writing. POSIX
+shm objects are sparse on Linux and macOS, so the 1 GiB reservation is virtually
+free for normal-sized outputs. If a tool produces an output larger than the cap,
+`Write::write` returns `WriteZero` and the writer's `Drop` unlinks the partial
+segment.
 
-Revisit if profiling shows this is a bottleneck for large outputs.
+**Input (`read_batches_from_shm`)**: zero-copy via Arrow's
+`Buffer::from_custom_allocation`. The `SharedMemory` mmap is wrapped as a
+`Buffer` whose Arc-counted `Allocation` owner is the mapping itself. Arrow's
+`StreamDecoder` slices that buffer for each batch body without copying. The
+returned `RecordBatch`es reference the mmap directly; the mapping survives
+until the last batch (and any column derived from it) is dropped, even after
+`shm_unlink`. Verified by `arrow_ipc::tests::test_input_mmap_outlives_unlink`.
 
 ## C API contract for submodules
 
