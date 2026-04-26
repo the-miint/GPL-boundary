@@ -5,7 +5,7 @@
 GPL-boundary provides a legally appropriate process-isolation boundary between
 GPL-licensed bioinformatics tools and the BSD-licensed miint DuckDB extension.
 GPL code runs in a separate Rust binary; miint (C++, at `../duckdb-miint`)
-spawns it as a short-lived child process.
+spawns it as a long-lived daemon (one per DuckDB instance).
 
 ## Architecture
 
@@ -24,10 +24,36 @@ spawns it as a short-lived child process.
 **Batched streaming**: Tools with expensive context creation (bowtie2: index
 loading, sortmerna: reference indexing, prodigal: metagenomic bin
 initialization) support batched streaming. The `StreamingContext` trait
-provides `run_batch()` for per-batch work against a pre-loaded context. The
-protocol is lock-step NDJSON — at most 1 input + 1 output shm segment exists
-at any time, naturally respecting DuckDB backpressure. Single-genome prodigal
-does NOT support streaming (requires all sequences for training).
+provides `run_batch()` for per-batch work against a pre-loaded context.
+Single-genome prodigal does NOT support streaming (requires all sequences for
+training).
+
+**Per-fingerprint dispatch**: every batch carries its own `(tool, config)`
+pair. The coordinator computes a canonical-config fingerprint and routes to
+a per-fingerprint worker. Distinct fingerprints execute concurrently;
+same-fingerprint batches serialize through one worker (preserving
+per-fingerprint order).
+
+- `bowtie2-align` → **subprocess workers** (`gpl-boundary --worker
+  bowtie2-align`). Each fingerprint is its own child process, sidestepping
+  bowtie2's process-wide alignment mutex.
+- everything else → **in-process workers** with a dedicated worker thread
+  per fingerprint.
+
+**Eviction (sweeper thread, default 100ms tick)**:
+- Idle deadline: workers past `worker_idle_ms` AND with `in_flight == 0` are
+  evicted. Required for bowtie2 since loaded indexes are hundreds of MB.
+- Budget pressure: a new subprocess fingerprint over `max_workers` evicts
+  the LRU idle subprocess; if all workers are in-flight, the new submit is
+  queued and dispatched when a slot frees up.
+- In-flight batches are protected from eviction.
+
+**Crash handling**: if a subprocess child exits unexpectedly (segfault,
+OOM kill), the parent's reader thread surfaces an error response for the
+in-flight batch, marks the fingerprint dead so subsequent same-fingerprint
+batches fail fast, and best-effort sweeps any orphan
+`/dev/shm/gb-{child_pid}-*` segments. Distinct fingerprints are unaffected;
+no auto-respawn — restart gpl-boundary to recover the dead fingerprint.
 
 ## Shared memory lifecycle (critical)
 
@@ -221,9 +247,16 @@ There is no single-shot mode.
 }}
 ```
 - `idle_timeout_ms` — auto-exit after this much stdin silence. Default
-  60_000. Set to `0` to disable. Phase 3 reads this; the rest of the
-  fields are accepted for forward-compatibility with Phase 4's worker
-  pool and currently ignored.
+  60_000. Set to `0` to disable.
+- `max_workers` — soft cap on resident subprocess workers (only
+  bowtie2-align uses subprocesses today). Default 4.
+- `workers_per_fingerprint` — per-fingerprint subprocess cap. Default
+  1; bowtie2's process-wide global mutex makes >1 useless.
+- `max_idle_workers` — idle subprocess workers retained after a burst.
+  Default 4.
+- `worker_idle_ms` — per-worker idle deadline. The sweeper evicts a
+  worker when its `last_used + worker_idle_ms < now` AND it has no
+  in-flight batch. Default 300_000.
 
 **Init reply** carries the wire-protocol version:
 ```json
@@ -241,7 +274,8 @@ There is no single-shot mode.
  "batch_id": 42}
 ```
 - `batch_id` is optional but recommended. Echoed verbatim on the matching
-  response so out-of-order completions in Phase 4 can be correlated.
+  response so out-of-order completions across distinct fingerprints can be
+  correlated.
 - **Multi-fingerprint dispatch:** every batch carries its own
   `(tool, config)` and is routed independently. Distinct fingerprints
   may complete out of order; correlate responses via `batch_id`.

@@ -76,14 +76,15 @@ handshake, a batch request, or a `shutdown` sentinel.
 // gpl-boundary replies:
 {"success": true, "protocol_version": 1}
 
-// 2. One or more batch requests
+// 2. One or more batch requests — each carries its own (tool, config)
 {"tool": "fasttree",
  "config": {"seq_type": "nucleotide", "seed": 12345},
  "shm_input": "/miint-input-uuid",
  "batch_id": 42}
-// gpl-boundary replies:
+// gpl-boundary replies (responses may arrive out of submission order
+// across distinct fingerprints — correlate by `batch_id`):
 {"success": true,
- "schema_version": 1,
+ "schema_version": 2,
  "batch_id": 42,
  "shm_outputs": [{"name": "/gb-1234-0-tree", "label": "tree", "size": 8192}],
  "result": {"n_nodes": 7, "n_leaves": 4, "root": 6}}
@@ -93,14 +94,48 @@ handshake, a batch request, or a `shutdown` sentinel.
 ```
 
 `protocol_version` (init reply) is bumped on any wire-envelope change;
-`schema_version` (per response) is bumped on per-tool output schema
-changes. Both let consumers detect drift without parsing the data.
+`schema_version` (per response, per-tool) is bumped on per-tool output
+schema changes. Both let consumers detect drift without parsing the data.
 
-Phase 3 enforces a single `(tool, config)` per session — a mismatched
-batch returns an error. Phase 4 will route per fingerprint to a worker
-pool. Tools with expensive setup (bowtie2 index loading, sortmerna
+The dispatcher routes batches by `(tool, canonical_config)` fingerprint:
+distinct fingerprints get distinct workers and run in parallel. Tools
+with expensive setup (bowtie2 index loading, sortmerna reference
 indexing, prodigal metagenomic init) reuse a long-lived context across
 batches in the session.
+
+### Worker routing and eviction
+
+- `bowtie2-align` → **subprocess workers**. Each fingerprint gets its
+  own `gpl-boundary --worker bowtie2-align` child process so distinct
+  indexes can align in parallel without colliding on bowtie2's
+  process-wide alignment mutex.
+- everything else → **in-process workers**. Each fingerprint gets a
+  dedicated worker thread; same-fingerprint batches serialize through
+  its mpsc input queue, distinct fingerprints run concurrently.
+
+A sweeper thread evicts workers that pass `worker_idle_ms` (default 5
+min) AND have no in-flight batch — required for bowtie2 since loaded
+indexes can be hundreds of MB and cannot stay resident indefinitely.
+When a new subprocess fingerprint arrives over the `max_workers`
+budget (default 4), the LRU idle subprocess is evicted; if every
+existing worker is in-flight, the new submit is queued and dispatched
+when a slot frees up.
+
+Init knobs (all optional, JSON values on the `init` line):
+
+| field | default | effect |
+|---|---|---|
+| `idle_timeout_ms` | 60_000 | Auto-shutdown after this much stdin silence; `0` disables. |
+| `max_workers` | 4 | Soft cap on resident subprocess workers. |
+| `workers_per_fingerprint` | 1 | Per-fingerprint subprocess cap (today: 1; bowtie2's global mutex makes >1 useless). |
+| `max_idle_workers` | 4 | Idle subprocess workers retained after a burst. |
+| `worker_idle_ms` | 300_000 | Per-worker idle deadline in ms. |
+
+If a subprocess child crashes mid-batch, the parent surfaces an error
+response for the in-flight batch, marks the fingerprint dead (so
+subsequent same-fingerprint batches fail fast until session restart),
+and best-effort sweeps any orphan `/dev/shm/gb-{child_pid}-*` segments.
+Distinct fingerprints are unaffected.
 
 ## Architecture
 
@@ -109,20 +144,27 @@ miint (C++ DuckDB ext)                    gpl-boundary (Rust)
 ======================                    ===================
 1. Spawn gpl-boundary                   ► Read {"init":{...}}, reply
                                           {"success":true,"protocol_version":1}
+                                          Spawn sweeper thread + forwarder
 2. For each batch:
    Create input shm, write Arrow IPC
-   Send {"tool":...,"shm_input":...}    ► Read line
-                                          mmap input shm (zero-copy)
-                                          Run tool against session ctx
-                                          Create output shm via ShmWriter
-                                            (sparse mmap, no Vec memcpy)
-                                          Write batch response to stdout
-3. Read response line
+   Send {"tool":...,"shm_input":...}    ► Read line, compute fingerprint
+                                          Get-or-create worker
+                                            (bowtie2-align: subprocess child)
+                                            (others: in-process worker thread)
+                                          Worker mmaps input shm (zero-copy),
+                                            runs tool, creates output shm via
+                                            sparse-mmap ShmWriter (no Vec memcpy),
+                                            sends Response to coordinator
+                                          Coordinator forwards Response to stdout
+3. Read response line (out-of-order across fingerprints — match batch_id)
    Open each output shm, read `size` bytes of Arrow IPC
    Unlink input + output shm
-4. Send {"shutdown":true}               ► Drop streaming context
-                                          (calls C library destroy)
-                                          Exit 0
+... continue submitting more batches ...
+   Sweeper evicts idle workers past `worker_idle_ms`; LRU evicts on
+   max_workers pressure; in-flight batches are protected from eviction.
+4. Send {"shutdown":true}               ► Drain in-flight + pending batches
+                                          Close all workers (C destroy /
+                                            child reap), exit 0
 ```
 
 ### Shared memory lifecycle

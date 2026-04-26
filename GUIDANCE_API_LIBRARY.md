@@ -427,9 +427,15 @@ Do not create threads unless the caller opts in via a config parameter:
 int n_threads;   /* 0 = single-threaded; >0 = use this many threads */
 ```
 
-GPL-boundary spawns your tool as a child process. Thread creation inside
-the library is allowed but must be controllable. The default must be
-single-threaded.
+GPL-boundary runs your tool either in-process on a dedicated worker
+thread (one per `(tool, config)` fingerprint) or in a per-fingerprint
+subprocess (used today only for `bowtie2-align`, where bowtie2's
+process-wide global mutex would otherwise serialize distinct indexes).
+Either way your library should treat itself as single-threaded by
+default and let internal threading be opt-in. Subprocess routing is
+chosen on a per-tool basis in `src/registry.rs::build_worker`; it's
+the right call when the C library has process-wide global state that
+prevents multiple contexts from coexisting in one address space.
 
 If you use OpenMP, guard it:
 ```c
@@ -463,12 +469,25 @@ used and how much glue code is needed.
 | C type | Arrow type | Notes |
 |--------|-----------|-------|
 | `int` / `int32_t` | `Int32` | Node indices, counts, flags |
-| `int64_t` | `Int64` | Large counts, timestamps |
+| `int64_t` | `Int64` | Large counts, timestamps, indices that may exceed 2³¹ |
 | `double` | `Float64` | Scores, distances, likelihoods |
 | `float` | `Float32` | Use only if precision is genuinely sufficient |
-| `int` (0/nonzero) | `Boolean` | `is_leaf`, `is_valid`, etc. |
-| `const char *` | `Utf8` | Names, labels; NULL maps to Arrow null |
+| `int` (0/nonzero) | `Boolean` | `is_tip`, `is_valid`, etc. |
+| `const char *` | `Utf8` | Names, labels; NULL maps to Arrow NULL |
 | `const char **` | `Utf8` (nullable) | Array of strings, some may be NULL |
+
+### Prefer Arrow NULL over sentinel values
+
+When a numeric output is genuinely "absent" (read didn't align, support
+wasn't computed, branch length undefined), emit it as Arrow NULL rather
+than a `-1` / `0` / `NaN` sentinel. The Rust adapter is responsible for
+the C-sentinel → Arrow-NULL translation, but it can only do this if
+your C struct gives it a clean signal: either a separate boolean (e.g.
+`int aligned[N]`) or a documented sentinel value the adapter can test
+for. Document the sentinel explicitly in the header — the FastTree
+header documents `-1` for `support` and the Rust side translates that
+to NULL on emission. Avoid silently abusing `0` or `INT_MIN` as a
+sentinel in a column where they could also be valid values.
 
 Avoid:
 - **Bitfields**: no portable way to access from Rust

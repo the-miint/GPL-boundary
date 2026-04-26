@@ -165,9 +165,17 @@ pub fn input_schema() -> Schema {
 
 fn output_schema() -> Schema {
     Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("score", DataType::Float64, false),
-        Field::new("name", DataType::Utf8, true),   // nullable if applicable
+        // Index columns: prefer Int64 for any column that could plausibly
+        // exceed 2³¹ — node indices, alignment positions, etc. Int32 is
+        // fine only for small bounded counts (children counts, flags).
+        Field::new("id", DataType::Int64, false),
+        // Optional / "absent" values: use nullable columns rather than
+        // sentinel values like -1 or 0. Translate the C library's
+        // sentinel (documented in its header) to Arrow NULL on emission.
+        // See FastTree v2 (`branch_length`, `support`) and SortMeRNA v2
+        // (alignment-only columns gated on `aligned == 0`) for examples.
+        Field::new("score", DataType::Float64, true),
+        Field::new("name", DataType::Utf8, true),
     ])
 }
 ```
@@ -415,6 +423,52 @@ fn test_newtool_streaming_two_batches() {
 }
 ```
 
+## Routing in the daemon
+
+Once a tool's `inventory::submit!` registration is in place, the daemon
+dispatcher routes batches to it automatically based on a `(tool_name,
+canonical_config)` fingerprint. Two routing decisions matter for new
+tools:
+
+- **In-process vs. subprocess.** Default is in-process: the registry
+  spawns a dedicated worker thread per fingerprint, the streaming
+  context (or stateless dispatch) runs there, responses flow back via
+  the worker's `Sender<Response>`. Same-fingerprint batches serialize
+  through the worker thread's mpsc queue; distinct fingerprints run
+  concurrently. The exception is **subprocess routing**, used today
+  only for `bowtie2-align` because bowtie2 has process-wide global
+  state behind a mutex — multiple contexts cannot coexist in one
+  address space, so each fingerprint gets its own
+  `gpl-boundary --worker bowtie2-align` child process. Add subprocess
+  routing for a new tool only if the C library has the same
+  process-wide-state limitation; the routing decision lives in
+  `src/registry.rs::build_worker`.
+
+- **Eviction.** The sweeper thread evicts workers past
+  `worker_idle_ms` AND with `in_flight == 0`, plus LRU eviction of
+  idle subprocess workers under `max_workers` budget pressure. This
+  applies uniformly — no per-tool opt-in required. If your tool's
+  context holds expensive resources (loaded indexes, reference DBs),
+  the eviction path frees them when the fingerprint goes idle long
+  enough; you don't need to do anything special, just make sure the
+  streaming context's `Drop` impl correctly tears down the C
+  resources.
+
+## Schema versioning
+
+Bump `schema_version()` whenever you make a breaking change to the
+output schema (renames, type changes, removed columns). The version
+is per-tool and surfaces in every response's `schema_version` field
+plus the `--describe` output. Phase 5 conventions worth following on
+new tools:
+
+- Prefer `Int64` for index columns; reserve `Int32` for bounded
+  counts.
+- Prefer Arrow NULL over `-1`/`0`/`NaN` sentinels; gate on a clear
+  signal (a sibling `aligned == 0` flag, or a documented C sentinel).
+- Pick column names that match consumer vocabulary (e.g. `is_tip`
+  rather than `is_leaf` for tree nodes).
+
 ## Common mistakes
 
 ### Forgetting `cargo:rerun-if-changed` in build.rs
@@ -462,6 +516,18 @@ session.
 Sequences, trees, matrices, and other bulk data always go through Arrow IPC
 in shared memory. JSON carries only tool name, parameters, shm paths, and
 lightweight result metadata.
+
+### Sentinel values in non-nullable columns
+
+If your C library uses `-1` (or `0`, or `INT_MIN`) to mean "absent",
+emit the Arrow column as nullable and translate the sentinel to NULL
+in the SOA→RecordBatch conversion. Non-nullable columns with
+in-band sentinels force every consumer to remember the per-column
+sentinel value, and produce silently-wrong joins when the sentinel
+collides with a valid value. See `src/tools/fasttree.rs` and
+`src/tools/sortmerna.rs` for the pattern: gate either on a clean
+sibling column (e.g. SortMeRNA's `aligned == 0`) or on a documented
+out-of-range value (e.g. FastTree's `parent == -1` for root).
 
 ## Updating CLAUDE.md
 

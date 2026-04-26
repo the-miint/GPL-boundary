@@ -660,7 +660,18 @@ fn test_subprocess_idle_eviction_does_not_break_reuse() {
 /// (yet). Linux-only (uses /proc).
 #[cfg(target_os = "linux")]
 fn find_worker_child(parent_pid: u32) -> Option<u32> {
-    let entries = std::fs::read_dir("/proc").ok()?;
+    find_worker_children(parent_pid).into_iter().next()
+}
+
+/// All `gpl-boundary --worker` processes whose parent is `parent_pid`,
+/// in arbitrary order. Linux-only.
+#[cfg(target_os = "linux")]
+fn find_worker_children(parent_pid: u32) -> Vec<u32> {
+    let mut found = Vec::new();
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return found,
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -668,7 +679,10 @@ fn find_worker_child(parent_pid: u32) -> Option<u32> {
             Ok(p) => p,
             Err(_) => continue,
         };
-        let status = std::fs::read_to_string(path.join("status")).ok()?;
+        let status = match std::fs::read_to_string(path.join("status")) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
         let mut proc_name = "";
         let mut ppid: u32 = 0;
         for line in status.lines() {
@@ -679,16 +693,14 @@ fn find_worker_child(parent_pid: u32) -> Option<u32> {
             }
         }
         if proc_name.starts_with("gpl-boundary") && ppid == parent_pid {
-            // Verify cmdline contains --worker so we don't accidentally
-            // pick up an unrelated gpl-boundary instance.
             let cmdline =
                 std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default();
             if cmdline.contains("--worker") {
-                return Some(pid);
+                found.push(pid);
             }
         }
     }
-    None
+    found
 }
 
 #[cfg(target_os = "linux")]
@@ -1107,6 +1119,127 @@ fn test_subprocess_inflight_batch_protected_from_eviction() {
         1500,
         "A1 should have processed all 1500 reads"
     );
+
+    let _guards: Vec<ShmGuard> = batch_responses
+        .iter()
+        .flat_map(|r| {
+            r["shm_outputs"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|o| o["name"].as_str().map(ShmGuard::adopt))
+                        .collect::<Vec<ShmGuard>>()
+                })
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_subprocess_max_workers_bounds_resident_children() {
+    // Cross-cutting verification: with `max_workers: 2`, cycling 5
+    // distinct bowtie2 fingerprints sequentially must leave AT MOST 2
+    // worker subprocesses resident at any later sample. The eviction
+    // path should reap the LRU child each time a new fingerprint
+    // arrives over budget. We sample the descendant set after every
+    // batch and assert the upper bound across the whole run, then a
+    // final sample after shutdown asserts zero survivors.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut indexes = Vec::new();
+    for i in 0..5 {
+        let path = tmp
+            .path()
+            .join(format!("idx-bound-{i}"))
+            .to_string_lossy()
+            .into_owned();
+        let r = if i % 2 == 0 { REF_A } else { REF_B };
+        build_index(&path, &format!("ref{i}"), r);
+        indexes.push(path);
+    }
+
+    let read_a: String = REF_A.chars().skip(10).take(30).collect();
+    let read_b: String = REF_B.chars().skip(10).take(30).collect();
+    let mut shms = Vec::new();
+    for i in 0..5 {
+        let r = if i % 2 == 0 {
+            read_a.as_str()
+        } else {
+            read_b.as_str()
+        };
+        shms.push(ShmGuard::create_with_batch(
+            &format!("ph4-bound-{i}"),
+            &make_align_batch(&format!("r{i}"), r),
+        ));
+    }
+
+    let mut child = spawn_daemon();
+    let parent_pid = child.id();
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        // max_workers=2, very long idle deadline so eviction is purely
+        // budget-driven (we want LRU pressure, not idle pressure).
+        stdin
+            .write_all(init_with_eviction(2, 2, 600_000).as_bytes())
+            .unwrap();
+        stdin.flush().unwrap();
+    }
+
+    let mut max_observed_children = 0usize;
+    for (i, idx) in indexes.iter().enumerate() {
+        {
+            let stdin = child.stdin.as_mut().unwrap();
+            stdin
+                .write_all(
+                    format!(
+                        "{{\"tool\":\"bowtie2-align\",\
+                         \"config\":{{\"index_path\":\"{idx}\",\"seed\":1}},\
+                         \"shm_input\":\"{}\",\"batch_id\":{i}}}\n",
+                        shms[i].name()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            stdin.flush().unwrap();
+        }
+        // Allow the batch to round-trip + sweeper to react.
+        std::thread::sleep(Duration::from_millis(150));
+        let live = find_worker_children(parent_pid).len();
+        max_observed_children = max_observed_children.max(live);
+        assert!(
+            live <= 2,
+            "max_workers=2 violated: {live} live children after batch {i}"
+        );
+    }
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(b"{\"shutdown\":true}\n").unwrap();
+    }
+    drop(child.stdin.take());
+
+    let out = child.wait_with_output().expect("daemon wait");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let post_shutdown = find_worker_children(parent_pid);
+    assert!(
+        post_shutdown.is_empty(),
+        "Expected zero worker children after shutdown, found {post_shutdown:?}"
+    );
+    assert!(
+        max_observed_children >= 1,
+        "Test must have actually exercised the worker-spawn path"
+    );
+
+    let lines = parse_lines(&out.stdout);
+    let batch_responses = &lines[1..];
+    assert_eq!(batch_responses.len(), 5, "Expected 5 batch responses");
+    for r in batch_responses {
+        assert!(r["success"].as_bool().unwrap(), "Batch failed: {r}");
+    }
 
     let _guards: Vec<ShmGuard> = batch_responses
         .iter()
