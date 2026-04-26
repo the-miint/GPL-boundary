@@ -96,7 +96,7 @@ impl ShmWriter {
     }
 
     pub fn new_with_capacity(label: &str, max_capacity: usize) -> io::Result<Self> {
-        let name = crate::shm::output_shm_name(label);
+        let name = crate::shm::output_shm_name(label)?;
         let c_name = CString::new(name.as_str())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 

@@ -590,12 +590,17 @@ fn test_fingerprint_ignores_config_key_order() {
 }
 
 #[test]
-fn test_fingerprint_mismatch_in_session_returns_error() {
-    // First batch uses prodigal/meta_mode=true. Second batch uses
-    // prodigal/meta_mode=false. Phase 3 enforces single-fingerprint per
-    // session — the second batch must error without disturbing the
-    // already-loaded context for the first fingerprint.
-    let shm1 = ShmGuard::create_with_batch("ph3-fp1", &make_prodigal_batch(&["c1"], &[TEST_SEQ_1]));
+fn test_two_fingerprints_in_one_session() {
+    // Phase 4 step 2 lifts the Phase 3 single-fingerprint constraint. Two
+    // batches with distinct (tool, config) fingerprints must each succeed
+    // — the registry creates one InProcessSlot per fingerprint and routes
+    // batches accordingly. Both prodigal contexts use meta_mode=true (so
+    // both can stream) but distinct trans_table values to force different
+    // fingerprints.
+    let shm1 =
+        ShmGuard::create_with_batch("ph4-fp-a", &make_prodigal_batch(&["c1"], &[TEST_SEQ_1]));
+    let shm2 =
+        ShmGuard::create_with_batch("ph4-fp-b", &make_prodigal_batch(&["c2"], &[TEST_SEQ_2]));
 
     let mut child = spawn_daemon();
     {
@@ -604,7 +609,8 @@ fn test_fingerprint_mismatch_in_session_returns_error() {
         stdin
             .write_all(
                 format!(
-                    "{{\"tool\":\"prodigal\",\"config\":{{\"meta_mode\":true}},\
+                    "{{\"tool\":\"prodigal\",\
+                     \"config\":{{\"meta_mode\":true,\"trans_table\":11}},\
                      \"shm_input\":\"{}\",\"batch_id\":1}}\n",
                     shm1.name()
                 )
@@ -614,9 +620,10 @@ fn test_fingerprint_mismatch_in_session_returns_error() {
         stdin
             .write_all(
                 format!(
-                    "{{\"tool\":\"prodigal\",\"config\":{{\"meta_mode\":false}},\
+                    "{{\"tool\":\"prodigal\",\
+                     \"config\":{{\"meta_mode\":true,\"trans_table\":4}},\
                      \"shm_input\":\"{}\",\"batch_id\":2}}\n",
-                    shm1.name()
+                    shm2.name()
                 )
                 .as_bytes(),
             )
@@ -626,27 +633,34 @@ fn test_fingerprint_mismatch_in_session_returns_error() {
     drop(child.stdin.take());
 
     let out = child.wait_with_output().expect("Failed to wait");
-    assert!(out.status.success());
-    let lines = parse_lines(&out.stdout);
-    assert_eq!(lines.len(), 3);
-
-    assert!(lines[1]["success"].as_bool().unwrap());
-    assert_eq!(lines[1]["batch_id"].as_u64().unwrap(), 1);
-
-    assert!(!lines[2]["success"].as_bool().unwrap());
     assert!(
-        lines[2]["error"]
-            .as_str()
-            .unwrap()
-            .contains("Phase 3 supports a single (tool, config) per session"),
-        "Unexpected error: {}",
-        lines[2]["error"]
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(lines[2]["batch_id"].as_u64().unwrap(), 2);
+    let lines = parse_lines(&out.stdout);
+    assert_eq!(lines.len(), 3, "Expected init reply + 2 batch responses");
 
-    if let Some(outputs) = lines[1]["shm_outputs"].as_array() {
-        for o in outputs {
-            unlink_shm(o["name"].as_str().unwrap());
+    // Step 3 made dispatch async, so cross-fingerprint responses can
+    // arrive in either order. Find each response by batch_id rather than
+    // assuming line index = submission order.
+    let batch_responses = &lines[1..];
+    let r1 = batch_responses
+        .iter()
+        .find(|r| r["batch_id"].as_u64() == Some(1))
+        .expect("missing response with batch_id=1");
+    let r2 = batch_responses
+        .iter()
+        .find(|r| r["batch_id"].as_u64() == Some(2))
+        .expect("missing response with batch_id=2");
+    assert!(r1["success"].as_bool().unwrap(), "{}", r1);
+    assert!(r2["success"].as_bool().unwrap(), "{}", r2);
+
+    for resp in batch_responses {
+        if let Some(outputs) = resp["shm_outputs"].as_array() {
+            for o in outputs {
+                unlink_shm(o["name"].as_str().unwrap());
+            }
         }
     }
 }

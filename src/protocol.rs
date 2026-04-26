@@ -22,15 +22,10 @@ pub enum ControlMessage {
 }
 
 /// Session-wide knobs set by the init message. All fields optional; any
-/// missing field uses its default. Phase 3 reads `idle_timeout_ms`; the
-/// pool-related fields (`max_workers`, `workers_per_fingerprint`,
-/// `max_idle_workers`, `worker_idle_ms`) are accepted now so callers can
-/// send them without a protocol change in Phase 4 — they are ignored by
-/// the Phase 3 single-fingerprint dispatcher.
+/// missing field uses its default. The pool-related fields apply to
+/// subprocess workers (currently only `bowtie2-align`); they have no
+/// effect on in-process tools.
 #[derive(Debug, Default, Deserialize)]
-#[allow(dead_code)] // Phase 4 reads max_workers / workers_per_fingerprint /
-                    // max_idle_workers / worker_idle_ms; accepting them now means Phase 4 lands
-                    // without another protocol break.
 pub struct InitParams {
     /// Auto-shutdown after this many ms of stdin silence. `0` disables.
     /// Default 60_000.
@@ -51,24 +46,26 @@ pub struct InitParams {
 }
 
 /// One batch request. Every batch carries its own `tool` + `config` so the
-/// Phase 4 dispatcher can route by `(tool, config_fingerprint)` without a
-/// further protocol change. Phase 3 enforces that a single session uses a
-/// single fingerprint and rejects mismatched batches.
-#[derive(Debug, Deserialize, Clone)]
+/// dispatcher can route by `(tool, config_fingerprint)` without a further
+/// protocol change.
+///
+/// `Serialize` is needed by `SubprocessWorker` to forward batches over a
+/// pipe to the child gpl-boundary worker process — the child uses the same
+/// type to deserialize.
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BatchRequest {
     pub tool: String,
     #[serde(default)]
     pub config: serde_json::Value,
     pub shm_input: String,
     /// Echoed back on the matching response so out-of-order completions
-    /// (Phase 4) can be correlated. Optional in Phase 3 (single-fingerprint,
-    /// in-order), required in practice for Phase 4.
+    /// can be correlated.
     #[serde(default)]
     pub batch_id: Option<u64>,
 }
 
 /// A single shared memory output segment.
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ShmOutput {
     pub name: String,
     pub label: String,
@@ -87,7 +84,11 @@ impl ShmOutput {
 
 /// Response sent on stdout. Bulk results travel in `shm_outputs`; JSON
 /// carries only metadata.
-#[derive(Debug, Default, Serialize)]
+///
+/// `Deserialize` is needed by `SubprocessWorker`'s reader thread, which
+/// parses NDJSON lines from a child gpl-boundary worker process and
+/// forwards them onto the coordinator's response channel.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Response {
     pub success: bool,
 

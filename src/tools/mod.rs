@@ -45,7 +45,16 @@ pub struct ToolDescription {
 /// via `GplTool::create_streaming_context`, then used for multiple batches.
 /// Holds expensive state (loaded index, reference DB) that is reused across
 /// `run_batch` calls. The `Drop` impl must call the C library's `destroy()`.
-pub trait StreamingContext {
+///
+/// `Send` is required because the Phase 4 worker registry stores contexts
+/// inside an `Arc<dyn Worker>` whose `Mutex<Option<Box<dyn StreamingContext>>>`
+/// must be `Send + Sync`. The contexts themselves are not accessed concurrently
+/// — the Mutex guarantees single-threaded use of the underlying C state — but
+/// they may be created on one thread and dropped on another (e.g. during
+/// step-4 idle-deadline eviction from a sweeper thread). Any C library held
+/// inside a context must therefore be safe to free from a thread other than
+/// the one that constructed it. All current submodules satisfy this.
+pub trait StreamingContext: Send {
     /// Process one batch of input. Same contract as `GplTool::execute()` but
     /// against a pre-loaded context: reads input from shm, creates output shm,
     /// returns Response.
@@ -165,6 +174,16 @@ pub fn describe_tool(name: &str) -> Option<ToolDescription> {
         .into_iter()
         .find(|t| t.name() == name)
         .map(|t| t.describe())
+}
+
+/// Look up the schema version for `name` without paying the cost of a full
+/// `describe()`. Used by the subprocess worker to populate response
+/// `schema_version` after `streaming_setup` succeeds.
+pub fn tool_schema_version(name: &str) -> Option<u32> {
+    all_tools()
+        .into_iter()
+        .find(|t| t.name() == name)
+        .map(|t| t.schema_version())
 }
 
 /// Version info for gpl-boundary and all tools.
