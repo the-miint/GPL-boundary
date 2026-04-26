@@ -11,13 +11,23 @@ miint is a BSD-licensed DuckDB extension. Some bioinformatics tools it needs to 
 
 ## Supported tools
 
-| Tool | License | Description |
-|------|---------|-------------|
-| [FastTree](https://github.com/the-miint/fasttree) | GPL-2.0+ | Approximately-maximum-likelihood phylogenetic trees |
+| Tool | License | Description | Streaming |
+|------|---------|-------------|-----------|
+| [FastTree](https://github.com/the-miint/fasttree) | GPL-2.0+ | Approximately-maximum-likelihood phylogenetic trees | no |
+| [Prodigal](https://github.com/the-miint/prodigal) | GPL-3.0 | Prokaryotic gene prediction | metagenomic mode only |
+| [SortMeRNA](https://github.com/the-miint/sortmerna) | LGPL-3.0 | rRNA filtering and sequence alignment | yes |
+| [Bowtie2 (align)](https://github.com/the-miint/bowtie2) | GPL-3.0 | Short read aligner; requires `.bt2` index (built in process or via `bowtie2-build`) | yes |
+| [Bowtie2 (build)](https://github.com/the-miint/bowtie2) | GPL-3.0 | Build a `.bt2` index from in-memory FASTA-style sequences | no |
 
 ## Building
 
-Requires Rust toolchain and a C compiler.
+Requires a Rust toolchain, a C/C++ compiler, and the following system
+libraries (needed by SortMeRNA):
+
+- RocksDB (`librocksdb-dev` on Debian/Ubuntu, `brew install rocksdb` on macOS)
+- zlib (`libz-dev` on Debian/Ubuntu, `brew install zlib` on macOS)
+
+RocksDB is discovered via `pkg-config`.
 
 ```bash
 # Clone with submodules
@@ -47,6 +57,9 @@ gpl-boundary --list-tools
 
 # Full tool description (config params, Arrow schemas, response metadata)
 gpl-boundary --describe fasttree
+gpl-boundary --describe prodigal
+gpl-boundary --describe sortmerna
+gpl-boundary --describe bowtie2-align
 ```
 
 ## Usage

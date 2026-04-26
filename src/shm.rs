@@ -351,17 +351,37 @@ mod tests {
 
     #[test]
     fn test_cleanup_registry() {
-        let name = "/gb-test-registry";
-        let _shm = SharedMemory::create(name, 64).unwrap();
-
-        // Detach so drop doesn't unlink
+        // Use a unique name so this test doesn't fight with parallel tests.
+        let name = format!("/gb-test-reg-{}", std::process::id());
+        let _shm = SharedMemory::create(&name, 64).unwrap();
         _shm.detach();
 
-        // Register and cleanup
-        register_for_cleanup(name);
-        cleanup_all();
+        // Register, then verify the name is in the registry.
+        register_for_cleanup(&name);
+        {
+            let registry = CLEANUP_REGISTRY.lock().unwrap();
+            assert!(
+                registry.iter().any(|n| n == &name),
+                "Expected {name} to be in cleanup registry"
+            );
+        }
 
-        // Should be gone
-        assert!(SharedMemory::open_readonly(name).is_err());
+        // Deregister and verify removal. We deliberately do NOT call
+        // cleanup_all() here — it drains the entire global registry, which
+        // would unlink shm segments registered by tests running in parallel
+        // (e.g. arrow_ipc::tests::test_write_batch_to_output_shm). Production
+        // only calls cleanup_all() from the signal handler at process exit.
+        deregister_cleanup(&name);
+        {
+            let registry = CLEANUP_REGISTRY.lock().unwrap();
+            assert!(
+                !registry.iter().any(|n| n == &name),
+                "Expected {name} to be removed from cleanup registry"
+            );
+        }
+
+        // Manually unlink the shm we created so the test cleans up after itself.
+        let _ = SharedMemory::unlink(&name);
+        assert!(SharedMemory::open_readonly(&name).is_err());
     }
 }

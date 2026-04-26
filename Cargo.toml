@@ -11,13 +11,17 @@ serde_json = "1"
 arrow = { version = "58", default-features = false, features = ["ipc", "ffi"] }
 inventory = "0.3"
 libc = "0.2"
+# tempfile is used by bowtie2_build to materialize Arrow input as a FASTA
+# tempfile before invoking the bowtie2 C builder (which only accepts disk
+# paths). TODO(phase-6): remove this once bowtie2's C API gains an in-memory
+# bt2_build_input_t, per the Phase 1 follow-up in PLAN-p0-gaps-tdd.md.
+tempfile = "3"
 
 [build-dependencies]
 cc = "1"
 pkg-config = "0.3"
 
 [dev-dependencies]
-tempfile = "3"
 
 [[bin]]
 name = "gpl-boundary"

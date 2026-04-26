@@ -1,4 +1,6 @@
 pub mod bowtie2_align;
+pub mod bowtie2_build;
+pub mod bowtie2_ffi;
 pub mod fasttree;
 pub mod prodigal;
 pub mod sortmerna;
@@ -176,6 +178,15 @@ mod tests {
         assert!(
             names.contains(&"bowtie2-align".to_string()),
             "bowtie2-align not found in registry: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_bowtie2_build_in_registry() {
+        let names = list_tools();
+        assert!(
+            names.contains(&"bowtie2-build".to_string()),
+            "bowtie2-build not found in registry: {names:?}"
         );
     }
 

@@ -147,6 +147,7 @@ src/
     prodigal.rs      # Prodigal FFI bindings + GplTool impl + tests
     sortmerna.rs     # SortMeRNA FFI bindings + GplTool impl + tests
     bowtie2_align.rs # Bowtie2 aligner FFI bindings + GplTool impl + tests
+    bowtie2_build.rs # Bowtie2 index builder FFI bindings + GplTool impl + tests
 ext/
   fasttree/          # git submodule (GPL-2.0+, C99)
   prodigal/          # git submodule (GPL-3.0, C99)
@@ -154,6 +155,7 @@ ext/
   bowtie2/           # git submodule (GPL-3.0, C++11)
 tests/
   build_sanity.rs    # Integration tests: binary links and runs correctly
+  bowtie2_build.rs   # Integration tests: bowtie2 index builder + round-trip with align
   streaming.rs       # Integration tests: NDJSON streaming protocol
 build.rs             # Per-tool C compilation functions via cc crate
 ```
@@ -330,6 +332,23 @@ already has the reads). Paired-end mode is inferred from the `sequence2`
 column. The tool has ~30 config parameters covering scoring, seeding,
 paired-end behavior, effort, and SAM output options — see `--describe
 bowtie2-align` for the full list.
+
+**Bowtie2-build input** (written by miint to shm_input):
+- `name: Utf8` -- sequence identifier
+- `sequence: Utf8` -- DNA sequence (different lengths allowed)
+
+**Bowtie2-build output**: no Arrow output. The `result` JSON carries:
+- `elapsed_ms: integer` -- wall-clock build time
+- `n_sequences: integer` -- sequences in input
+- `n_bases: integer` -- total bases in input
+- `index_files: array<string>` -- absolute paths of `.bt2` (or `.bt2l`) files written
+
+Bowtie2-build requires `index_path` (output basename for `.bt2` files) in the
+config JSON. The tool materializes the input Arrow batches to a tempfile FASTA
+and then invokes bowtie2's C builder API on disk paths — the in-memory build
+path is not yet exposed by the bowtie2 C API. Caller must ensure the parent
+directory of `index_path` exists. Config knobs: `nthreads`, `seed`, `offrate`,
+`packed`, `verbose` — see `--describe bowtie2-build`.
 
 ## Arrow IPC write strategy
 

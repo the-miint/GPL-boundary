@@ -113,34 +113,8 @@ pub struct Bt2Input {
     pub n_reads2: usize,
 }
 
-// Build API types — used only for test fixture creation
-#[cfg(test)]
-#[repr(C)]
-pub struct Bt2BuildConfig {
-    pub struct_size: usize,
-    pub ref_paths: *const *const c_char,
-    pub n_ref_paths: usize,
-    pub output_base: *const c_char,
-    pub nthreads: c_int,
-    pub seed: i64,
-    pub offrate: c_int,
-    pub packed: c_int,
-    pub quiet: c_int,
-    pub log_fn: Option<unsafe extern "C" fn(*mut c_void, c_int, *const c_char)>,
-    pub log_user_data: *mut c_void,
-}
-
-#[cfg(test)]
-#[repr(C)]
-pub struct Bt2BuildStats {
-    pub elapsed_ms: i64,
-}
-
 #[allow(non_camel_case_types)]
 type bt2_align_ctx_t = c_void;
-#[cfg(test)]
-#[allow(non_camel_case_types)]
-type bt2_build_ctx_t = c_void;
 
 extern "C" {
     fn bt2_align_config_init(config: *mut Bt2AlignConfig);
@@ -157,24 +131,10 @@ extern "C" {
         stats_out: *mut Bt2AlignStats,
     ) -> c_int;
     fn bt2_align_output_free(output: *mut Bt2AlignOutput);
-    fn bt2_strerror(code: c_int) -> *const c_char;
     fn bt2_align_last_error(ctx: *const bt2_align_ctx_t) -> *const c_char;
-
-    // Build API -- used only for test fixture creation
-    #[cfg(test)]
-    fn bt2_build_config_init(config: *mut Bt2BuildConfig);
-    #[cfg(test)]
-    fn bt2_build_create(
-        config: *const Bt2BuildConfig,
-        error_out: *mut c_int,
-    ) -> *mut bt2_build_ctx_t;
-    #[cfg(test)]
-    fn bt2_build_run(ctx: *mut bt2_build_ctx_t, stats_out: *mut Bt2BuildStats) -> c_int;
-    #[cfg(test)]
-    fn bt2_build_destroy(ctx: *mut bt2_build_ctx_t);
 }
 
-const BT2_OK: c_int = 0;
+use crate::tools::bowtie2_ffi::{bt2_strerror, BT2_OK, BT2_VERSION};
 
 // Preset constants
 const BT2_PRESET_VERY_FAST: c_int = 0;
@@ -236,10 +196,6 @@ inventory::submit! {
         create: || Box::new(Bowtie2AlignTool),
     }
 }
-
-// Version from BT2_API_VERSION macros in bt2_api.h — no runtime version
-// function exists, so this must be updated manually when the submodule updates.
-const BT2_VERSION: &str = "0.2.0";
 
 // ---------------------------------------------------------------------------
 // Input data
@@ -1601,6 +1557,10 @@ mod tests {
     use super::*;
     use crate::shm::SharedMemory;
     use crate::test_util::{read_arrow_from_shm, unique_shm_name, write_arrow_to_shm};
+    use crate::tools::bowtie2_build::{
+        bt2_build_config_init, bt2_build_create, bt2_build_destroy, bt2_build_run, Bt2BuildConfig,
+        Bt2BuildStats,
+    };
 
     // -- Test input helpers --
 

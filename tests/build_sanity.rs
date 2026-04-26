@@ -32,6 +32,10 @@ fn test_version_output() {
         stdout.contains("bowtie2-align"),
         "Version output missing bowtie2-align: {stdout}"
     );
+    assert!(
+        stdout.contains("bowtie2-build"),
+        "Version output missing bowtie2-build: {stdout}"
+    );
 }
 
 #[test]
@@ -54,5 +58,9 @@ fn test_list_tools_output() {
     assert!(
         stdout.contains("bowtie2-align"),
         "list-tools missing bowtie2-align: {stdout}"
+    );
+    assert!(
+        stdout.contains("bowtie2-build"),
+        "list-tools missing bowtie2-build: {stdout}"
     );
 }
