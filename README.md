@@ -64,53 +64,65 @@ gpl-boundary --describe bowtie2-align
 
 ## Usage
 
-miint spawns gpl-boundary as a child process. The JSON request provides the
-tool name, config parameters, and the POSIX shared memory name where input
-Arrow IPC data has been written. gpl-boundary creates its own output shared
-memory, and returns the name and size in the JSON response.
+miint spawns gpl-boundary as a long-lived child process and drives a session
+via NDJSON on stdin/stdout. Every line is one JSON object: an `init`
+handshake, a batch request, or a `shutdown` sentinel.
 
-### Request (stdin)
+### Session
 
-```json
-{
-  "tool": "fasttree",
-  "config": { "seq_type": "nucleotide", "seed": 12345 },
-  "shm_input": "/miint-input-uuid"
-}
+```jsonc
+// 1. Init handshake (required first line)
+{"init": {"idle_timeout_ms": 60000}}
+// gpl-boundary replies:
+{"success": true, "protocol_version": 1}
+
+// 2. One or more batch requests
+{"tool": "fasttree",
+ "config": {"seq_type": "nucleotide", "seed": 12345},
+ "shm_input": "/miint-input-uuid",
+ "batch_id": 42}
+// gpl-boundary replies:
+{"success": true,
+ "schema_version": 1,
+ "batch_id": 42,
+ "shm_outputs": [{"name": "/gb-1234-0-tree", "label": "tree", "size": 8192}],
+ "result": {"n_nodes": 7, "n_leaves": 4, "root": 6}}
+
+// 3. Graceful shutdown — or close stdin, or wait idle_timeout_ms
+{"shutdown": true}
 ```
 
-### Response (stdout)
+`protocol_version` (init reply) is bumped on any wire-envelope change;
+`schema_version` (per response) is bumped on per-tool output schema
+changes. Both let consumers detect drift without parsing the data.
 
-```json
-{
-  "success": true,
-  "schema_version": 1,
-  "shm_outputs": [
-    { "name": "/gb-1234-0-tree", "label": "tree", "size": 8192 }
-  ],
-  "result": { "n_nodes": 7, "n_leaves": 4, "root": 6, "stats": { ... } }
-}
-```
+Phase 3 enforces a single `(tool, config)` per session — a mismatched
+batch returns an error. Phase 4 will route per fingerprint to a worker
+pool. Tools with expensive setup (bowtie2 index loading, sortmerna
+indexing, prodigal metagenomic init) reuse a long-lived context across
+batches in the session.
 
 ## Architecture
 
 ```
 miint (C++ DuckDB ext)                    gpl-boundary (Rust)
 ======================                    ===================
-1. Create input shm, write Arrow IPC
-2. Spawn gpl-boundary
-   Write JSON request to stdin
-   Close stdin
-3.                                        Read JSON from stdin
-                                          mmap input shm
-                                          Run tool (e.g., fasttree)
-                                          Create output shm
-                                          Write Arrow IPC results
-                                          Write JSON response to stdout
-                                          Exit
-4. Read JSON from stdout
+1. Spawn gpl-boundary                   ► Read {"init":{...}}, reply
+                                          {"success":true,"protocol_version":1}
+2. For each batch:
+   Create input shm, write Arrow IPC
+   Send {"tool":...,"shm_input":...}    ► Read line
+                                          mmap input shm (zero-copy)
+                                          Run tool against session ctx
+                                          Create output shm via ShmWriter
+                                            (sparse mmap, no Vec memcpy)
+                                          Write batch response to stdout
+3. Read response line
    Open each output shm, read `size` bytes of Arrow IPC
-   Unlink input and all output shm
+   Unlink input + output shm
+4. Send {"shutdown":true}               ► Drop streaming context
+                                          (calls C library destroy)
+                                          Exit 0
 ```
 
 ### Shared memory lifecycle

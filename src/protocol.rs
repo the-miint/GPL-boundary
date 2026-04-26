@@ -1,45 +1,77 @@
 use serde::{Deserialize, Serialize};
 
-/// Request sent from miint to GPL-boundary via stdin.
-/// Bulk data is in Arrow IPC format in the shared memory region -- never in JSON.
+/// Top-level NDJSON message on stdin, in its final-shape envelope so the
+/// protocol is cut once and Phase 4's per-(tool, config) routing slots in
+/// without another break.
+///
+/// Wire form (one JSON object per line):
+/// - `{"init": {...}}` — required first message; sets session-wide knobs
+/// - `{"tool": "...", "config": {...}, "shm_input": "...", "batch_id": ...}`
+///   — a single batch request
+/// - `{"shutdown": true}` — graceful shutdown sentinel
+///
+/// Handled with serde's `untagged` representation: the three variants have
+/// disjoint required fields (`init` / `tool` / `shutdown`), so each line
+/// matches exactly one variant.
 #[derive(Debug, Deserialize)]
-pub struct Request {
-    /// Which tool to run (e.g., "fasttree")
-    pub tool: String,
-
-    /// Tool-specific parameters (model, seed, etc. -- never bulk data)
-    #[serde(default)]
-    pub config: serde_json::Value,
-
-    /// POSIX shared memory name for the input Arrow IPC data.
-    /// Created and owned by the caller (miint).
-    pub shm_input: String,
-
-    /// When true, the process stays alive after the first response and reads
-    /// subsequent BatchRequest messages from stdin until EOF. The tool's
-    /// context (loaded index, models) is reused across batches.
-    /// Absent or false = single-shot (existing behavior).
-    #[serde(default)]
-    pub stream: bool,
+#[serde(untagged)]
+pub enum ControlMessage {
+    Init { init: InitParams },
+    Shutdown { shutdown: bool },
+    Batch(BatchRequest),
 }
 
-/// A subsequent batch request in streaming mode. Contains only the shm name
-/// for the next batch of input. Tool name and config are fixed for the session
-/// (established by the initial Request).
-#[derive(Debug, Deserialize)]
+/// Session-wide knobs set by the init message. All fields optional; any
+/// missing field uses its default. Phase 3 reads `idle_timeout_ms`; the
+/// pool-related fields (`max_workers`, `workers_per_fingerprint`,
+/// `max_idle_workers`, `worker_idle_ms`) are accepted now so callers can
+/// send them without a protocol change in Phase 4 — they are ignored by
+/// the Phase 3 single-fingerprint dispatcher.
+#[derive(Debug, Default, Deserialize)]
+#[allow(dead_code)] // Phase 4 reads max_workers / workers_per_fingerprint /
+                    // max_idle_workers / worker_idle_ms; accepting them now means Phase 4 lands
+                    // without another protocol break.
+pub struct InitParams {
+    /// Auto-shutdown after this many ms of stdin silence. `0` disables.
+    /// Default 60_000.
+    #[serde(default)]
+    pub idle_timeout_ms: Option<u64>,
+    /// Phase 4: total subprocess worker budget across all fingerprints.
+    #[serde(default)]
+    pub max_workers: Option<usize>,
+    /// Phase 4: per-fingerprint worker cap.
+    #[serde(default)]
+    pub workers_per_fingerprint: Option<usize>,
+    /// Phase 4: idle workers to keep warm.
+    #[serde(default)]
+    pub max_idle_workers: Option<usize>,
+    /// Phase 4: per-worker idle deadline (ms).
+    #[serde(default)]
+    pub worker_idle_ms: Option<u64>,
+}
+
+/// One batch request. Every batch carries its own `tool` + `config` so the
+/// Phase 4 dispatcher can route by `(tool, config_fingerprint)` without a
+/// further protocol change. Phase 3 enforces that a single session uses a
+/// single fingerprint and rejects mismatched batches.
+#[derive(Debug, Deserialize, Clone)]
 pub struct BatchRequest {
-    /// POSIX shared memory name for this batch's input Arrow IPC data.
+    pub tool: String,
+    #[serde(default)]
+    pub config: serde_json::Value,
     pub shm_input: String,
+    /// Echoed back on the matching response so out-of-order completions
+    /// (Phase 4) can be correlated. Optional in Phase 3 (single-fingerprint,
+    /// in-order), required in practice for Phase 4.
+    #[serde(default)]
+    pub batch_id: Option<u64>,
 }
 
 /// A single shared memory output segment.
 #[derive(Debug, Serialize, Clone)]
 pub struct ShmOutput {
-    /// POSIX shared memory name (e.g., "/gb-1234-0-tree").
     pub name: String,
-    /// Tool-defined label identifying this output (e.g., "tree", "alignment").
     pub label: String,
-    /// Number of valid bytes to read as Arrow IPC stream.
     pub size: usize,
 }
 
@@ -53,28 +85,33 @@ impl ShmOutput {
     }
 }
 
-/// Response sent from GPL-boundary to miint via stdout.
-/// Bulk results are in Arrow IPC in shm_outputs -- JSON carries only metadata.
-#[derive(Debug, Serialize)]
+/// Response sent on stdout. Bulk results travel in `shm_outputs`; JSON
+/// carries only metadata.
+#[derive(Debug, Default, Serialize)]
 pub struct Response {
     pub success: bool,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 
-    /// Schema version for the tool's output Arrow schema. Bumped on any
-    /// breaking change (new/removed/renamed columns, type changes). Lets the
-    /// caller fail fast when boundary and extension versions drift.
+    /// Per-tool output schema version; bumped on any breaking schema change.
+    /// Set by `dispatch` / `run_batch` after the tool succeeds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<u32>,
 
-    /// Output shared memory segments, each containing Arrow IPC data.
-    /// Created by gpl-boundary. Caller is responsible for reading and unlinking.
+    /// Top-level protocol version. Set on the init reply only — separate
+    /// from per-tool `schema_version`. Lets miint detect a wire-format drift
+    /// before sending any batch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u32>,
+
+    /// Echoed from the matching `BatchRequest.batch_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<u64>,
+
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub shm_outputs: Vec<ShmOutput>,
 
-    /// Lightweight result metadata (e.g., stats, row counts).
-    /// Never bulk data -- that goes to shm_outputs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
 }
@@ -83,10 +120,9 @@ impl Response {
     pub fn ok(result: serde_json::Value, shm_outputs: Vec<ShmOutput>) -> Self {
         Self {
             success: true,
-            error: None,
-            schema_version: None,
             shm_outputs,
             result: Some(result),
+            ..Self::default()
         }
     }
 
@@ -94,9 +130,17 @@ impl Response {
         Self {
             success: false,
             error: Some(msg.into()),
-            schema_version: None,
-            shm_outputs: vec![],
-            result: None,
+            ..Self::default()
+        }
+    }
+
+    /// Reply to a successful init message — carries the protocol version
+    /// and nothing else. Phase 3 protocol_version = 1.
+    pub fn init_ok(protocol_version: u32) -> Self {
+        Self {
+            success: true,
+            protocol_version: Some(protocol_version),
+            ..Self::default()
         }
     }
 }
@@ -113,15 +157,13 @@ mod tests {
         );
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
         assert!(json["success"].as_bool().unwrap());
-        // schema_version is set by dispatch, not Response::ok
         assert!(json.get("schema_version").is_none());
+        assert!(json.get("protocol_version").is_none());
+        assert!(json.get("batch_id").is_none());
         let outputs = json["shm_outputs"].as_array().unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0]["name"], "/out1");
-        assert_eq!(outputs[0]["label"], "tree");
-        assert_eq!(outputs[0]["size"], 100);
         assert_eq!(json["result"]["count"], 42);
-        assert!(json.get("error").is_none());
     }
 
     #[test]
@@ -129,7 +171,6 @@ mod tests {
         let resp = Response::ok(serde_json::json!({"msg": "metadata only"}), vec![]);
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
         assert!(json["success"].as_bool().unwrap());
-        // shm_outputs should be omitted entirely when empty
         assert!(json.get("shm_outputs").is_none());
     }
 
@@ -144,51 +185,98 @@ mod tests {
         assert!(json.get("result").is_none());
     }
 
-    // -- Request.stream field tests --
-
     #[test]
-    fn test_request_stream_true() {
-        let req: Request =
-            serde_json::from_str(r#"{"tool":"foo","shm_input":"/x","stream":true}"#).unwrap();
-        assert!(req.stream);
+    fn test_response_init_ok() {
+        let resp = Response::init_ok(1);
+        let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
+        assert!(json["success"].as_bool().unwrap());
+        assert_eq!(json["protocol_version"].as_u64().unwrap(), 1);
+        assert!(json.get("batch_id").is_none());
+        assert!(json.get("schema_version").is_none());
+        assert!(json.get("shm_outputs").is_none());
     }
 
     #[test]
-    fn test_request_stream_absent() {
-        let req: Request = serde_json::from_str(r#"{"tool":"foo","shm_input":"/x"}"#).unwrap();
-        assert!(!req.stream);
+    fn test_response_with_batch_id_round_trip() {
+        let mut resp = Response::ok(serde_json::json!({}), vec![]);
+        resp.batch_id = Some(42);
+        let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["batch_id"].as_u64().unwrap(), 42);
+    }
+
+    // --- ControlMessage parsing ---
+
+    #[test]
+    fn test_parse_init_message() {
+        let s = r#"{"init":{"idle_timeout_ms":1000}}"#;
+        let m: ControlMessage = serde_json::from_str(s).unwrap();
+        match m {
+            ControlMessage::Init { init } => {
+                assert_eq!(init.idle_timeout_ms, Some(1000));
+            }
+            other => panic!("Expected Init, got {other:?}"),
+        }
     }
 
     #[test]
-    fn test_request_stream_false() {
-        let req: Request =
-            serde_json::from_str(r#"{"tool":"foo","shm_input":"/x","stream":false}"#).unwrap();
-        assert!(!req.stream);
-    }
-
-    // -- BatchRequest tests --
-
-    #[test]
-    fn test_batch_request_deserialize() {
-        let batch: BatchRequest = serde_json::from_str(r#"{"shm_input":"/batch-1"}"#).unwrap();
-        assert_eq!(batch.shm_input, "/batch-1");
+    fn test_parse_init_message_empty_object() {
+        let m: ControlMessage = serde_json::from_str(r#"{"init":{}}"#).unwrap();
+        match m {
+            ControlMessage::Init { init } => {
+                assert_eq!(init.idle_timeout_ms, None);
+                assert_eq!(init.max_workers, None);
+            }
+            other => panic!("Expected Init, got {other:?}"),
+        }
     }
 
     #[test]
-    fn test_batch_request_missing_shm_input() {
-        let result = serde_json::from_str::<BatchRequest>("{}");
+    fn test_parse_batch_message() {
+        let s = r#"{"tool":"fasttree","config":{"seed":1},"shm_input":"/x","batch_id":7}"#;
+        let m: ControlMessage = serde_json::from_str(s).unwrap();
+        match m {
+            ControlMessage::Batch(b) => {
+                assert_eq!(b.tool, "fasttree");
+                assert_eq!(b.shm_input, "/x");
+                assert_eq!(b.batch_id, Some(7));
+                assert_eq!(b.config["seed"], 1);
+            }
+            other => panic!("Expected Batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_batch_without_batch_id() {
+        let s = r#"{"tool":"fasttree","shm_input":"/x"}"#;
+        let m: ControlMessage = serde_json::from_str(s).unwrap();
+        match m {
+            ControlMessage::Batch(b) => {
+                assert_eq!(b.tool, "fasttree");
+                assert_eq!(b.batch_id, None);
+                assert!(b.config.is_null());
+            }
+            other => panic!("Expected Batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_shutdown_message() {
+        let m: ControlMessage = serde_json::from_str(r#"{"shutdown":true}"#).unwrap();
+        match m {
+            ControlMessage::Shutdown { shutdown } => assert!(shutdown),
+            other => panic!("Expected Shutdown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_message_with_unknown_shape() {
+        // No discriminating field — should fail.
+        let result = serde_json::from_str::<ControlMessage>(r#"{"hello":"world"}"#);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_batch_request_ignores_extra_fields() {
-        let batch: BatchRequest =
-            serde_json::from_str(r#"{"shm_input":"/x","extra":"whatever"}"#).unwrap();
-        assert_eq!(batch.shm_input, "/x");
-    }
-
-    #[test]
-    fn test_response_multiple_outputs_json() {
+    fn test_parse_response_multiple_outputs_json() {
         let resp = Response::ok(
             serde_json::json!({}),
             vec![

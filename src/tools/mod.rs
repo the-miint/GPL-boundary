@@ -5,7 +5,7 @@ pub mod fasttree;
 pub mod prodigal;
 pub mod sortmerna;
 
-use crate::protocol::{Request, Response};
+use crate::protocol::{BatchRequest, Response};
 
 /// Description of an Arrow schema field for introspection.
 #[derive(serde::Serialize)]
@@ -99,8 +99,11 @@ fn all_tools() -> Vec<Box<dyn GplTool>> {
         .collect()
 }
 
-/// Dispatch a request to the appropriate tool.
-pub fn dispatch(request: &Request) -> Response {
+/// Dispatch a single batch to the appropriate tool. Stateless: each call
+/// runs the tool's `execute` from scratch. Phase 4's worker pool will keep
+/// long-lived contexts; Phase 3 still falls through to this path for tools
+/// that don't expose `create_streaming_context`.
+pub fn dispatch(request: &BatchRequest) -> Response {
     let tool = all_tools().into_iter().find(|t| t.name() == request.tool);
     match tool {
         Some(t) => {
@@ -114,24 +117,38 @@ pub fn dispatch(request: &Request) -> Response {
     }
 }
 
-/// Set up a streaming session for the named tool. Returns the streaming
-/// context and the tool's schema version, or an error Response.
+/// `(streaming context, tool schema_version)` returned by a successful
+/// `streaming_setup` call.
+pub type StreamingSession = (Box<dyn StreamingContext>, u32);
+
+/// Try to set up a streaming context for the named tool.
+///
+/// Three outcomes:
+/// - `Err(response)` — real failure: unknown tool name, OR the tool supports
+///   streaming but `create_streaming_context` returned an error (e.g.
+///   bowtie2 index not found). The caller should surface this response
+///   directly to the client; do NOT fall back to per-batch dispatch.
+/// - `Ok(None)` — the tool exists but does not implement streaming (i.e.
+///   `create_streaming_context` returned `Ok(None)`). Caller should fall
+///   through to `dispatch` for each batch; there is no long-lived context
+///   to set up.
+/// - `Ok(Some((ctx, schema_version)))` — context successfully created;
+///   reuse `ctx` across all batches in the session.
 pub fn streaming_setup(
     tool_name: &str,
     config: &serde_json::Value,
-) -> Result<(Box<dyn StreamingContext>, u32), Response> {
+) -> Result<Option<StreamingSession>, Response> {
     let tool = all_tools().into_iter().find(|t| t.name() == tool_name);
     match tool {
         None => Err(Response::error(format!("Unknown tool: {tool_name}"))),
         Some(t) => {
             let schema_version = t.schema_version();
             match t.create_streaming_context(config) {
-                Ok(Some(ctx)) => Ok((ctx, schema_version)),
-                Ok(None) => Err(Response::error(format!(
-                    "Tool '{}' does not support streaming",
-                    tool_name
+                Ok(Some(ctx)) => Ok(Some((ctx, schema_version))),
+                Ok(None) => Ok(None),
+                Err(e) => Err(Response::error(format!(
+                    "Failed to create streaming context for '{tool_name}': {e}"
                 ))),
-                Err(e) => Err(Response::error(e)),
             }
         }
     }
@@ -219,11 +236,11 @@ mod tests {
 
     #[test]
     fn test_dispatch_unknown_tool() {
-        let request = Request {
+        let request = BatchRequest {
             tool: "nonexistent".to_string(),
             config: serde_json::json!({}),
             shm_input: "/dummy".to_string(),
-            stream: false,
+            batch_id: None,
         };
         let response = dispatch(&request);
         assert!(!response.success);
@@ -273,22 +290,22 @@ mod tests {
     fn test_streaming_setup_unknown_tool() {
         match streaming_setup("nonexistent", &serde_json::json!({})) {
             Err(resp) => assert!(resp.error.as_ref().unwrap().contains("Unknown tool")),
-            Ok(_) => panic!("Expected error for unknown tool"),
+            Ok(_) => panic!("Expected Err for unknown tool"),
         }
     }
 
     #[test]
-    fn test_streaming_setup_non_streaming_tool() {
+    fn test_streaming_setup_non_streaming_tool_returns_ok_none() {
+        // FastTree exists but does not support streaming. Returning
+        // `Ok(None)` lets the caller fall through to `dispatch` per batch
+        // without conflating "no streaming support" with "init failed".
         match streaming_setup("fasttree", &serde_json::json!({})) {
-            Err(resp) => assert!(
-                resp.error
-                    .as_ref()
-                    .unwrap()
-                    .contains("does not support streaming"),
-                "Expected 'does not support streaming', got: {:?}",
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("FastTree should not return a streaming context"),
+            Err(resp) => panic!(
+                "Expected Ok(None) for non-streaming tool, got Err: {:?}",
                 resp.error
             ),
-            Ok(_) => panic!("Expected error for non-streaming tool"),
         }
     }
 

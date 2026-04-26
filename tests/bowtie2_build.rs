@@ -110,9 +110,14 @@ fn make_fasta_batch(names: &[&str], sequences: &[&str]) -> RecordBatch {
     .unwrap()
 }
 
+/// Drive a daemon session that runs exactly one batch and shuts down. Returns
+/// the batch's response object (skipping the init reply line).
 fn run_request(req: serde_json::Value) -> serde_json::Value {
-    let mut req_str = serde_json::to_string(&req).unwrap();
-    req_str.push('\n');
+    let mut session = String::new();
+    session.push_str("{\"init\":{}}\n");
+    session.push_str(&serde_json::to_string(&req).unwrap());
+    session.push('\n');
+    session.push_str("{\"shutdown\":true}\n");
 
     let output = Command::new(env!("CARGO_BIN_EXE_gpl-boundary"))
         .stdin(Stdio::piped())
@@ -124,7 +129,7 @@ fn run_request(req: serde_json::Value) -> serde_json::Value {
                 .stdin
                 .as_mut()
                 .unwrap()
-                .write_all(req_str.as_bytes())
+                .write_all(session.as_bytes())
                 .unwrap();
             child.wait_with_output()
         })
@@ -132,8 +137,19 @@ fn run_request(req: serde_json::Value) -> serde_json::Value {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!("Failed to parse response JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert!(
+        lines.len() >= 2,
+        "Expected at least init reply + 1 batch response. \
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // lines[0] is the init reply (success + protocol_version). The batch
+    // response is the next line.
+    serde_json::from_str(lines[1]).unwrap_or_else(|e| {
+        panic!(
+            "Failed to parse batch response JSON: {e}\nline: {}",
+            lines[1]
+        )
     })
 }
 

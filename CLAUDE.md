@@ -198,49 +198,74 @@ These let miint programmatically discover capabilities without hardcoding.
 
 ## Protocol
 
-Request (stdin JSON):
-```json
-{
-  "tool": "fasttree",
-  "config": { "seq_type": "nucleotide", "seed": 12345 },
-  "shm_input": "/miint-input-uuid"
-}
+Daemon-only NDJSON over stdin/stdout. Every invocation is a session.
+There is no single-shot mode.
+
+```
+1. {"init": {...}}                         ← required first line
+   ←  {"success": true, "protocol_version": 1}
+2. {"tool":"...","config":{...},"shm_input":"...","batch_id":N}   (≥0 times)
+   ←  {"success": true, "schema_version": K, "batch_id": N,
+        "shm_outputs": [...], "result": {...}}
+3. {"shutdown": true}  OR  EOF  OR  idle_timeout_ms expires       ← exit 0
 ```
 
-Response (stdout JSON):
+**Init message** (first line, required):
 ```json
-{
-  "success": true,
-  "schema_version": 1,
-  "shm_outputs": [
-    { "name": "/gb-1234-0-tree", "label": "tree", "size": 8192 }
-  ],
-  "result": { "n_nodes": 7, "n_leaves": 4, "root": 6, "stats": { ... } }
-}
+{"init": {
+  "idle_timeout_ms": 60000,
+  "max_workers": 4,
+  "workers_per_fingerprint": 1,
+  "max_idle_workers": 4,
+  "worker_idle_ms": 300000
+}}
 ```
+- `idle_timeout_ms` — auto-exit after this much stdin silence. Default
+  60_000. Set to `0` to disable. Phase 3 reads this; the rest of the
+  fields are accepted for forward-compatibility with Phase 4's worker
+  pool and currently ignored.
 
-`schema_version` is an integer that is bumped on any breaking output schema
-change (new/removed/renamed columns, type changes). It lets consumers fail
-fast when boundary and extension versions drift. It is set by `dispatch()`
-from the tool's `schema_version()` method and is only present on success.
-
-Tools may produce multiple outputs (each a separate shm segment with a
-distinct label). `shm_outputs` is omitted from JSON when empty (error
-responses, metadata-only tools). Labels must be `[a-z0-9-]+`.
-
-Streaming request (first line of NDJSON):
+**Init reply** carries the wire-protocol version:
 ```json
-{"tool": "prodigal", "config": {"meta_mode": true}, "shm_input": "/input-0", "stream": true}
+{"success": true, "protocol_version": 1}
 ```
+- `protocol_version` is incremented on any breaking change to the wire
+  envelope (init/batch/shutdown shape, response field set). Separate from
+  per-tool `schema_version`.
 
-Subsequent batch requests (one per line):
+**Batch request** (one per line, any number):
 ```json
-{"shm_input": "/input-1"}
+{"tool": "fasttree",
+ "config": {"seq_type": "nucleotide", "seed": 12345},
+ "shm_input": "/miint-input-uuid",
+ "batch_id": 42}
 ```
+- `batch_id` is optional but recommended. Echoed verbatim on the matching
+  response so out-of-order completions in Phase 4 can be correlated.
+- **Phase 3 single-fingerprint constraint:** every batch in a session must
+  share the same `(tool, config)` pair. A mismatched batch returns an
+  error response without disturbing the established context. Phase 4
+  lifts this and routes per fingerprint.
 
-EOF on stdin terminates the session. Each batch gets its own response line on
-stdout. Non-fatal batch errors return an error response; the session continues
-until EOF or IO error.
+**Batch response**:
+```json
+{"success": true,
+ "schema_version": 1,
+ "batch_id": 42,
+ "shm_outputs": [{"name": "/gb-1234-0-tree", "label": "tree", "size": 8192}],
+ "result": {"n_nodes": 7, "n_leaves": 4, "root": 6}}
+```
+- `schema_version` — per-tool, bumped on breaking output-schema changes.
+- `shm_outputs` — omitted when empty. Labels match `[a-z0-9-]+`.
+- `result` — lightweight metadata; bulk data always travels in
+  `shm_outputs`.
+
+**Shutdown** (graceful):
+```json
+{"shutdown": true}
+```
+Or close stdin (EOF), or wait `idle_timeout_ms`. All three result in a
+clean exit code 0; in-flight batches complete before exit.
 
 ## Arrow schemas
 
