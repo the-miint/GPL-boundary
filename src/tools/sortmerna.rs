@@ -3,7 +3,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::Arc;
 
-use arrow::array::{Array, Float64Array, Int32Array, StringArray};
+use arrow::array::{Array, Float64Array, Int32Array, Int32Builder, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -123,20 +123,26 @@ unsafe extern "C" fn stderr_log_callback(
 // Arrow schemas
 // ---------------------------------------------------------------------------
 
+/// Output schema. Schema version 2 (Phase 5) replaces the prior `-1` /
+/// `0` sentinels in alignment-only columns with NULL when `aligned == 0`.
+/// `aligned` itself stays non-nullable (always 0 or 1). Quality metrics
+/// `e_value`, `identity`, `coverage` are kept as Float64 — the C library
+/// emits zeros for unaligned reads and downstream consumers already
+/// guard on `aligned`.
 fn output_schema() -> Schema {
     Schema::new(vec![
         Field::new("read_id", DataType::Utf8, false),
         Field::new("aligned", DataType::Int32, false),
-        Field::new("strand", DataType::Int32, false),
+        Field::new("strand", DataType::Int32, true),
         Field::new("ref_name", DataType::Utf8, true),
-        Field::new("ref_start", DataType::Int32, false),
-        Field::new("ref_end", DataType::Int32, false),
+        Field::new("ref_start", DataType::Int32, true),
+        Field::new("ref_end", DataType::Int32, true),
         Field::new("cigar", DataType::Utf8, true),
-        Field::new("score", DataType::Int32, false),
+        Field::new("score", DataType::Int32, true),
         Field::new("e_value", DataType::Float64, false),
         Field::new("identity", DataType::Float64, false),
         Field::new("coverage", DataType::Float64, false),
-        Field::new("edit_distance", DataType::Int32, false),
+        Field::new("edit_distance", DataType::Int32, true),
     ])
 }
 
@@ -404,6 +410,14 @@ impl SortMeRnaTool {
 }
 
 /// Convert smr_output_t SOA arrays into an Arrow RecordBatch.
+///
+/// Schema v2 sentinel translation: when `aligned[i] == 0`, the
+/// alignment-only columns (`strand`, `ref_start`, `ref_end`, `score`,
+/// `edit_distance`) emit NULL instead of the C library's prior
+/// `-1`/`0` sentinels. `ref_name` and `cigar` were already nullable in
+/// v1; their NULL semantics carry over unchanged. `e_value`, `identity`,
+/// `coverage` stay as zero-valued floats for unaligned reads — callers
+/// gate on `aligned` for those metrics.
 unsafe fn soa_to_record_batch(output: &SmrOutput) -> Result<RecordBatch, String> {
     let n = output.num_reads as usize;
 
@@ -453,6 +467,30 @@ unsafe fn soa_to_record_batch(output: &SmrOutput) -> Result<RecordBatch, String>
         })
         .collect();
 
+    // Build the alignment-only Int32 columns with NULL on unaligned
+    // rows. We use one builder per column rather than a closure so the
+    // hot loop stays a tight switch on `aligned[i]`.
+    let mut strand_b = Int32Builder::with_capacity(n);
+    let mut ref_start_b = Int32Builder::with_capacity(n);
+    let mut ref_end_b = Int32Builder::with_capacity(n);
+    let mut score_b = Int32Builder::with_capacity(n);
+    let mut edit_distance_b = Int32Builder::with_capacity(n);
+    for i in 0..n {
+        if aligned[i] == 0 {
+            strand_b.append_null();
+            ref_start_b.append_null();
+            ref_end_b.append_null();
+            score_b.append_null();
+            edit_distance_b.append_null();
+        } else {
+            strand_b.append_value(strand[i]);
+            ref_start_b.append_value(ref_start[i]);
+            ref_end_b.append_value(ref_end[i]);
+            score_b.append_value(score[i]);
+            edit_distance_b.append_value(edit_distance[i]);
+        }
+    }
+
     let schema = Arc::new(output_schema());
     RecordBatch::try_new(
         schema,
@@ -461,26 +499,26 @@ unsafe fn soa_to_record_batch(output: &SmrOutput) -> Result<RecordBatch, String>
                 read_ids.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
             )),
             Arc::new(Int32Array::from(aligned.to_vec())),
-            Arc::new(Int32Array::from(strand.to_vec())),
+            Arc::new(strand_b.finish()),
             Arc::new(StringArray::from(
                 ref_names
                     .iter()
                     .map(|s| s.as_deref())
                     .collect::<Vec<Option<&str>>>(),
             )),
-            Arc::new(Int32Array::from(ref_start.to_vec())),
-            Arc::new(Int32Array::from(ref_end.to_vec())),
+            Arc::new(ref_start_b.finish()),
+            Arc::new(ref_end_b.finish()),
             Arc::new(StringArray::from(
                 cigars
                     .iter()
                     .map(|s| s.as_deref())
                     .collect::<Vec<Option<&str>>>(),
             )),
-            Arc::new(Int32Array::from(score.to_vec())),
+            Arc::new(score_b.finish()),
             Arc::new(Float64Array::from(e_value.to_vec())),
             Arc::new(Float64Array::from(identity.to_vec())),
             Arc::new(Float64Array::from(coverage.to_vec())),
-            Arc::new(Int32Array::from(edit_distance.to_vec())),
+            Arc::new(edit_distance_b.finish()),
         ],
     )
     .map_err(|e| format!("Failed to create Arrow RecordBatch: {e}"))
@@ -496,7 +534,7 @@ impl GplTool for SortMeRnaTool {
     }
 
     fn schema_version(&self) -> u32 {
-        1
+        2
     }
 
     fn describe(&self) -> ToolDescription {
@@ -655,62 +693,62 @@ impl GplTool for SortMeRnaTool {
                 FieldDescription {
                     name: "strand",
                     arrow_type: "Int32",
-                    nullable: false,
-                    description: "1=forward, 0=reverse-complement, -1=unaligned",
+                    nullable: true,
+                    description: "1=forward, 0=reverse-complement; NULL if unaligned",
                 },
                 FieldDescription {
                     name: "ref_name",
                     arrow_type: "Utf8",
                     nullable: true,
-                    description: "Reference sequence ID; null if unaligned",
+                    description: "Reference sequence ID; NULL if unaligned",
                 },
                 FieldDescription {
                     name: "ref_start",
                     arrow_type: "Int32",
-                    nullable: false,
-                    description: "1-based start on reference; 0 if unaligned",
+                    nullable: true,
+                    description: "1-based start on reference; NULL if unaligned",
                 },
                 FieldDescription {
                     name: "ref_end",
                     arrow_type: "Int32",
-                    nullable: false,
-                    description: "1-based end on reference; 0 if unaligned",
+                    nullable: true,
+                    description: "1-based end on reference; NULL if unaligned",
                 },
                 FieldDescription {
                     name: "cigar",
                     arrow_type: "Utf8",
                     nullable: true,
-                    description: "CIGAR string; null if unaligned",
+                    description: "CIGAR string; NULL if unaligned",
                 },
                 FieldDescription {
                     name: "score",
                     arrow_type: "Int32",
-                    nullable: false,
-                    description: "Smith-Waterman alignment score; -1 if unaligned",
+                    nullable: true,
+                    description: "Smith-Waterman alignment score; NULL if unaligned",
                 },
                 FieldDescription {
                     name: "e_value",
                     arrow_type: "Float64",
                     nullable: false,
-                    description: "E-value of best alignment",
+                    description: "E-value of best alignment (0.0 when unaligned)",
                 },
                 FieldDescription {
                     name: "identity",
                     arrow_type: "Float64",
                     nullable: false,
-                    description: "Percent identity (0-100)",
+                    description: "Percent identity (0-100; 0.0 when unaligned)",
                 },
                 FieldDescription {
                     name: "coverage",
                     arrow_type: "Float64",
                     nullable: false,
-                    description: "Query coverage (0-100)",
+                    description: "Query coverage (0-100; 0.0 when unaligned)",
                 },
                 FieldDescription {
                     name: "edit_distance",
                     arrow_type: "Int32",
-                    nullable: false,
-                    description: "Edit distance (mismatches + gaps); -1 if unaligned",
+                    nullable: true,
+                    description: "Edit distance (mismatches + gaps); NULL if unaligned",
                 },
             ],
             response_metadata: vec![
@@ -1244,6 +1282,123 @@ ACCATATGGGAGAGCTCCCAACGCGTTGGA";
             std::mem::size_of::<SmrConfig>(),
             config.struct_size,
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Schema v2: NULL emission for unaligned rows. Built from a fixture
+    // SmrOutput so we can deterministically exercise the unaligned path
+    // without depending on a synthesized-no-hit reference dataset.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_soa_to_record_batch_unaligned_emits_null() {
+        // 2 rows: row 0 aligned, row 1 unaligned.
+        let read_a = CString::new("read_a").unwrap();
+        let read_b = CString::new("read_b").unwrap();
+        let read_ids: [*const c_char; 2] = [read_a.as_ptr(), read_b.as_ptr()];
+        let aligned: [i32; 2] = [1, 0];
+        let strand: [i32; 2] = [1, -1];
+        let ref_index: [i32; 2] = [0, -1];
+        let e_value: [f64; 2] = [1e-30, 0.0];
+        let identity: [f64; 2] = [99.0, 0.0];
+        let coverage: [f64; 2] = [100.0, 0.0];
+        let ref_start: [i32; 2] = [10, 0];
+        let ref_end: [i32; 2] = [40, 0];
+        let score: [i32; 2] = [42, -1];
+        let edit_distance: [i32; 2] = [0, -1];
+        let cigar_a = CString::new("30M").unwrap();
+        let cigars: [*const c_char; 2] = [cigar_a.as_ptr(), ptr::null()];
+        let ref_name_a = CString::new("ref1").unwrap();
+        let ref_names: [*const c_char; 2] = [ref_name_a.as_ptr(), ptr::null()];
+
+        let output = SmrOutput {
+            num_reads: 2,
+            num_aligned: 1,
+            read_ids: read_ids.as_ptr(),
+            aligned: aligned.as_ptr(),
+            ref_index: ref_index.as_ptr(),
+            e_value: e_value.as_ptr(),
+            identity: identity.as_ptr(),
+            coverage: coverage.as_ptr(),
+            ref_start: ref_start.as_ptr(),
+            ref_end: ref_end.as_ptr(),
+            cigar: cigars.as_ptr(),
+            ref_name: ref_names.as_ptr(),
+            strand: strand.as_ptr(),
+            score: score.as_ptr(),
+            edit_distance: edit_distance.as_ptr(),
+        };
+
+        let batch = unsafe { soa_to_record_batch(&output) }.unwrap();
+        assert_eq!(batch.num_rows(), 2);
+
+        let strand_col = batch
+            .column_by_name("strand")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let ref_start_col = batch
+            .column_by_name("ref_start")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let ref_end_col = batch
+            .column_by_name("ref_end")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let score_col = batch
+            .column_by_name("score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let edit_distance_col = batch
+            .column_by_name("edit_distance")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        // Aligned row: real values.
+        assert_eq!(strand_col.value(0), 1);
+        assert_eq!(ref_start_col.value(0), 10);
+        assert_eq!(ref_end_col.value(0), 40);
+        assert_eq!(score_col.value(0), 42);
+        assert_eq!(edit_distance_col.value(0), 0);
+
+        // Unaligned row: every alignment-only column NULL.
+        assert!(strand_col.is_null(1), "strand must be NULL for unaligned");
+        assert!(
+            ref_start_col.is_null(1),
+            "ref_start must be NULL for unaligned"
+        );
+        assert!(ref_end_col.is_null(1), "ref_end must be NULL for unaligned");
+        assert!(score_col.is_null(1), "score must be NULL for unaligned");
+        assert!(
+            edit_distance_col.is_null(1),
+            "edit_distance must be NULL for unaligned"
+        );
+
+        // ref_name and cigar were already nullable in v1; verify they
+        // still emit NULL on the unaligned row.
+        let ref_name_col = batch
+            .column_by_name("ref_name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let cigar_col = batch
+            .column_by_name("cigar")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(ref_name_col.is_null(1));
+        assert!(cigar_col.is_null(1));
     }
 
     // ---------------------------------------------------------------

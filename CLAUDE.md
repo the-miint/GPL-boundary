@@ -242,20 +242,21 @@ There is no single-shot mode.
 ```
 - `batch_id` is optional but recommended. Echoed verbatim on the matching
   response so out-of-order completions in Phase 4 can be correlated.
-- **Phase 3 single-fingerprint constraint:** every batch in a session must
-  share the same `(tool, config)` pair. A mismatched batch returns an
-  error response without disturbing the established context. Phase 4
-  lifts this and routes per fingerprint.
+- **Multi-fingerprint dispatch:** every batch carries its own
+  `(tool, config)` and is routed independently. Distinct fingerprints
+  may complete out of order; correlate responses via `batch_id`.
 
 **Batch response**:
 ```json
 {"success": true,
- "schema_version": 1,
+ "schema_version": 2,
  "batch_id": 42,
  "shm_outputs": [{"name": "/gb-1234-0-tree", "label": "tree", "size": 8192}],
  "result": {"n_nodes": 7, "n_leaves": 4, "root": 6}}
 ```
-- `schema_version` — per-tool, bumped on breaking output-schema changes.
+- `schema_version` — per-tool (FastTree=2, Prodigal=1, SortMeRNA=2,
+  Bowtie2=1, Bowtie2-build=1 as of writing); bumped on breaking
+  output-schema changes.
 - `shm_outputs` — omitted when empty. Labels match `[a-z0-9-]+`.
 - `result` — lightweight metadata; bulk data always travels in
   `shm_outputs`.
@@ -273,14 +274,15 @@ clean exit code 0; in-flight batches complete before exit.
 - `name: Utf8` -- sequence identifier
 - `sequence: Utf8` -- aligned sequence (all must be equal length)
 
-**FastTree output** (written by gpl-boundary to shm_outputs, label "tree"):
-- `id: Int32` -- node index [0, n_nodes)
-- `parent: Int32` -- parent node index (-1 for root)
-- `branch_length: Float64`
-- `support: Float64` -- SH-like local support (-1 if not computed)
-- `n_children: Int32` -- 0 for leaves
-- `is_leaf: Boolean`
-- `name: Utf8` (nullable) -- leaf name, null for internal nodes
+**FastTree output** (written by gpl-boundary to shm_outputs, label "tree"; schema_version=2):
+- `node_index: Int64` -- node index [0, n_nodes)
+- `parent_index: Int64` (nullable) -- parent node's `node_index`; NULL for the root
+- `edge_id: Int64` (nullable) -- inbound-edge join key (= `node_index` for non-root); NULL for the root. miint joins downstream tree-edge tables on this column.
+- `branch_length: Float64` (nullable) -- NULL when the C library emits NaN
+- `support: Float64` (nullable) -- SH-like local support [0, 1]; NULL when not computed (replaces the prior -1 sentinel)
+- `n_children: Int32` -- 0 for tips
+- `is_tip: Boolean` -- whether node is a tip (renamed from `is_leaf`)
+- `name: Utf8` (nullable) -- tip name, NULL for internal nodes
 
 **Prodigal input** (written by miint to shm_input):
 - `name: Utf8` -- contig identifier
@@ -309,19 +311,22 @@ clean exit code 0; in-flight batches complete before exit.
 - `sequence: Utf8` -- forward read nucleotide sequence
 - `sequence2: Utf8` (nullable) -- reverse read for paired-end; absence = single-end
 
-**SortMeRNA output** (written by gpl-boundary to shm_outputs, label "alignments"):
+**SortMeRNA output** (written by gpl-boundary to shm_outputs, label "alignments"; schema_version=2):
 - `read_id: Utf8` -- read identifier (from input)
 - `aligned: Int32` -- 1 if aligned, 0 otherwise
-- `strand: Int32` -- 1=forward, 0=reverse-complement, -1=unaligned
-- `ref_name: Utf8` (nullable) -- reference sequence ID, null if unaligned
-- `ref_start: Int32` -- 1-based start on reference, 0 if unaligned
-- `ref_end: Int32` -- 1-based end on reference, 0 if unaligned
-- `cigar: Utf8` (nullable) -- CIGAR string, null if unaligned
-- `score: Int32` -- Smith-Waterman alignment score, -1 if unaligned
-- `e_value: Float64` -- E-value of best alignment
-- `identity: Float64` -- percent identity (0-100)
-- `coverage: Float64` -- query coverage (0-100)
-- `edit_distance: Int32` -- edit distance (mismatches + gaps), -1 if unaligned
+- `strand: Int32` (nullable) -- 1=forward, 0=reverse-complement; NULL if unaligned
+- `ref_name: Utf8` (nullable) -- reference sequence ID; NULL if unaligned
+- `ref_start: Int32` (nullable) -- 1-based start on reference; NULL if unaligned
+- `ref_end: Int32` (nullable) -- 1-based end on reference; NULL if unaligned
+- `cigar: Utf8` (nullable) -- CIGAR string; NULL if unaligned
+- `score: Int32` (nullable) -- Smith-Waterman alignment score; NULL if unaligned
+- `e_value: Float64` -- E-value of best alignment (0.0 when unaligned)
+- `identity: Float64` -- percent identity (0-100; 0.0 when unaligned)
+- `coverage: Float64` -- query coverage (0-100; 0.0 when unaligned)
+- `edit_distance: Int32` (nullable) -- edit distance (mismatches + gaps); NULL if unaligned
+
+Schema v2 (Phase 5) replaced the prior `-1` / `0` sentinels in the
+alignment-only columns with NULL keyed off `aligned == 0`.
 
 SortMeRNA requires `ref_paths` (reference FASTA file paths) in the config
 JSON. Reference indexing is handled internally. Paired-end mode is inferred

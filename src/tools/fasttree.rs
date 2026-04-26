@@ -3,7 +3,9 @@
 
 use crate::protocol::{Response, ShmOutput};
 use crate::tools::{ConfigParam, FieldDescription, GplTool, ToolDescription};
-use arrow::array::{BooleanArray, Float64Array, Int32Array, StringArray};
+use arrow::array::{
+    BooleanArray, Float64Builder, Int32Array, Int64Array, Int64Builder, StringArray,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use std::ffi::{CStr, CString};
@@ -120,14 +122,33 @@ pub fn input_schema() -> Schema {
 }
 
 /// Output schema: SOA tree columnar data for miint.
+///
+/// Schema version 2 (Phase 5) renames and widens for miint's tree-edge
+/// join semantics:
+/// - `node_index` (Int64): node index `[0, n_nodes)`. Renamed from `id`.
+/// - `parent_index` (Int64, nullable): parent's `node_index`; NULL for the
+///   root (no -1 sentinel).
+/// - `edge_id` (Int64, nullable): join key for the inbound edge of each
+///   non-root node. Convention: `edge_id == node_index`. NULL for the
+///   root. miint's downstream tree-edge tables join on this column.
+/// - `branch_length` (Float64, nullable): NaN from the C library is
+///   emitted as NULL.
+/// - `support` (Float64, nullable): the C library's `-1` "not computed"
+///   sentinel is emitted as NULL.
+/// - `n_children` (Int32): kept narrow — children counts never exceed
+///   the leaf count of a tiny binary tree.
+/// - `is_tip` (Boolean): renamed from `is_leaf` to match miint's
+///   tree vocabulary.
+/// - `name` (Utf8, nullable): leaf name; NULL for internal nodes.
 fn output_schema() -> Schema {
     Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("parent", DataType::Int32, false),
-        Field::new("branch_length", DataType::Float64, false),
-        Field::new("support", DataType::Float64, false),
+        Field::new("node_index", DataType::Int64, false),
+        Field::new("parent_index", DataType::Int64, true),
+        Field::new("edge_id", DataType::Int64, true),
+        Field::new("branch_length", DataType::Float64, true),
+        Field::new("support", DataType::Float64, true),
         Field::new("n_children", DataType::Int32, false),
-        Field::new("is_leaf", DataType::Boolean, false),
+        Field::new("is_tip", DataType::Boolean, false),
         Field::new("name", DataType::Utf8, true),
     ])
 }
@@ -192,7 +213,7 @@ impl GplTool for FastTreeTool {
     }
 
     fn schema_version(&self) -> u32 {
-        1
+        2
     }
 
     fn describe(&self) -> ToolDescription {
@@ -262,46 +283,53 @@ impl GplTool for FastTreeTool {
             ],
             output_schema: vec![
                 FieldDescription {
-                    name: "id",
-                    arrow_type: "Int32",
+                    name: "node_index",
+                    arrow_type: "Int64",
                     nullable: false,
                     description: "Node index [0, n_nodes)",
                 },
                 FieldDescription {
-                    name: "parent",
-                    arrow_type: "Int32",
-                    nullable: false,
-                    description: "Parent node index (-1 for root)",
+                    name: "parent_index",
+                    arrow_type: "Int64",
+                    nullable: true,
+                    description: "Parent node's node_index; NULL for the root",
+                },
+                FieldDescription {
+                    name: "edge_id",
+                    arrow_type: "Int64",
+                    nullable: true,
+                    description:
+                        "Inbound-edge join key (= node_index for non-root); NULL for the root",
                 },
                 FieldDescription {
                     name: "branch_length",
                     arrow_type: "Float64",
-                    nullable: false,
-                    description: "Branch length to parent",
+                    nullable: true,
+                    description: "Branch length to parent; NULL when the C library emits NaN",
                 },
                 FieldDescription {
                     name: "support",
                     arrow_type: "Float64",
-                    nullable: false,
-                    description: "SH-like local support value (-1 if not computed)",
+                    nullable: true,
+                    description: "SH-like local support [0, 1]; NULL when not computed",
                 },
                 FieldDescription {
                     name: "n_children",
                     arrow_type: "Int32",
                     nullable: false,
-                    description: "Number of children (0 for leaves)",
+                    description: "Number of children (0 for tips)",
                 },
                 FieldDescription {
-                    name: "is_leaf",
+                    name: "is_tip",
                     arrow_type: "Boolean",
                     nullable: false,
-                    description: "Whether node is a leaf",
+                    description: "Whether node is a tip (formerly is_leaf)",
                 },
                 FieldDescription {
                     name: "name",
                     arrow_type: "Utf8",
                     nullable: true,
-                    description: "Leaf name (null for internal nodes)",
+                    description: "Tip name (NULL for internal nodes)",
                 },
             ],
             response_metadata: vec![
@@ -480,16 +508,65 @@ impl GplTool for FastTreeTool {
 }
 
 /// Convert fasttree SOA tree to an Arrow RecordBatch.
+///
+/// Sentinel translation (schema v2):
+/// - `parent[i] == -1` (root) → NULL `parent_index`, NULL `edge_id`.
+/// - `parent[i] != -1` → `parent_index = parent[i] as i64`,
+///   `edge_id = i as i64` (one inbound edge per non-root node;
+///   miint joins downstream tables on `edge_id`).
+/// - `branch_length[i].is_nan()` → NULL.
+/// - `support[i] < 0.0` → NULL (FastTree emits -1 when support was not
+///   computed; we treat any negative as "absent" since SH-like support
+///   is bounded `[0, 1]`).
 unsafe fn soa_to_record_batch(tree: &FastTreeSoa) -> Result<RecordBatch, String> {
     let n = tree.n_nodes as usize;
 
-    let ids: Vec<i32> = (0..n as i32).collect();
     let parent = std::slice::from_raw_parts(tree.parent, n);
     let branch_length = std::slice::from_raw_parts(tree.branch_length, n);
     let support = std::slice::from_raw_parts(tree.support, n);
     let n_children = std::slice::from_raw_parts(tree.n_children, n);
     let is_leaf_raw = std::slice::from_raw_parts(tree.is_leaf, n);
     let name_ptrs = std::slice::from_raw_parts(tree.name, n);
+
+    let node_index: Vec<i64> = (0..n as i64).collect();
+
+    let mut parent_index = Int64Builder::with_capacity(n);
+    let mut edge_id = Int64Builder::with_capacity(n);
+    for (i, &p) in parent.iter().enumerate() {
+        if p < 0 {
+            parent_index.append_null();
+            edge_id.append_null();
+        } else {
+            parent_index.append_value(p as i64);
+            edge_id.append_value(i as i64);
+        }
+    }
+
+    // Asymmetric NULL handling between branch_length and support is
+    // deliberate. The C header (ext/fasttree/fasttree.h) documents an
+    // explicit `-1` "not computed" sentinel for support, and SH-like
+    // support is bounded `[0, 1]` by construction — so negative values
+    // (any of them, not just -1) plus NaN map to NULL. branch_length
+    // has no documented sentinel; FastTree can produce negative branch
+    // lengths in pathological cases (NJ degenerate inputs) and those
+    // are real data, not "absent" — only NaN maps to NULL.
+    let mut bl = Float64Builder::with_capacity(n);
+    for &v in branch_length {
+        if v.is_nan() {
+            bl.append_null();
+        } else {
+            bl.append_value(v);
+        }
+    }
+
+    let mut sup = Float64Builder::with_capacity(n);
+    for &v in support {
+        if v < 0.0 || v.is_nan() {
+            sup.append_null();
+        } else {
+            sup.append_value(v);
+        }
+    }
 
     let names: Vec<Option<String>> = name_ptrs
         .iter()
@@ -507,10 +584,11 @@ unsafe fn soa_to_record_batch(tree: &FastTreeSoa) -> Result<RecordBatch, String>
     RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(Int32Array::from(ids)),
-            Arc::new(Int32Array::from(parent.to_vec())),
-            Arc::new(Float64Array::from(branch_length.to_vec())),
-            Arc::new(Float64Array::from(support.to_vec())),
+            Arc::new(Int64Array::from(node_index)),
+            Arc::new(parent_index.finish()),
+            Arc::new(edge_id.finish()),
+            Arc::new(bl.finish()),
+            Arc::new(sup.finish()),
             Arc::new(Int32Array::from(n_children.to_vec())),
             Arc::new(BooleanArray::from(
                 is_leaf_raw.iter().map(|&v| v != 0).collect::<Vec<bool>>(),
@@ -531,6 +609,7 @@ mod tests {
     use super::*;
     use crate::shm::SharedMemory;
     use crate::test_util::{read_arrow_from_shm, unique_shm_name, write_arrow_to_shm};
+    use arrow::array::{Array, Float64Array};
 
     fn make_input_batch(names: &[&str], sequences: &[&str]) -> RecordBatch {
         let schema = Arc::new(input_schema());
@@ -591,24 +670,102 @@ mod tests {
 
         let n_nodes = result["n_nodes"].as_i64().unwrap() as usize;
         assert_eq!(out.num_rows(), n_nodes);
-        assert_eq!(out.num_columns(), 7);
+        assert_eq!(
+            out.num_columns(),
+            8,
+            "schema v2 has 8 columns including edge_id"
+        );
 
-        // Check column names
-        assert_eq!(out.schema().field(0).name(), "id");
-        assert_eq!(out.schema().field(1).name(), "parent");
-        assert_eq!(out.schema().field(2).name(), "branch_length");
-        assert_eq!(out.schema().field(5).name(), "is_leaf");
-        assert_eq!(out.schema().field(6).name(), "name");
+        // Check column names + types match schema v2.
+        let schema = out.schema();
+        assert_eq!(schema.field(0).name(), "node_index");
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(1).name(), "parent_index");
+        assert_eq!(schema.field(1).data_type(), &DataType::Int64);
+        assert!(schema.field(1).is_nullable());
+        assert_eq!(schema.field(2).name(), "edge_id");
+        assert!(schema.field(2).is_nullable());
+        assert_eq!(schema.field(3).name(), "branch_length");
+        assert!(schema.field(3).is_nullable());
+        assert_eq!(schema.field(4).name(), "support");
+        assert!(schema.field(4).is_nullable());
+        assert_eq!(schema.field(6).name(), "is_tip");
+        assert_eq!(schema.field(7).name(), "name");
 
-        // Count leaves in output
-        let is_leaf = out
-            .column_by_name("is_leaf")
+        // Count tips in output
+        let is_tip = out
+            .column_by_name("is_tip")
             .unwrap()
             .as_any()
             .downcast_ref::<BooleanArray>()
             .unwrap();
-        let leaf_count = (0..is_leaf.len()).filter(|&i| is_leaf.value(i)).count();
-        assert_eq!(leaf_count, 4);
+        let tip_count = (0..is_tip.len()).filter(|&i| is_tip.value(i)).count();
+        assert_eq!(tip_count, 4);
+
+        // Verify column 5 (`n_children`) is at the right offset and has
+        // tree-shape consistency: every tip has 0 children; the sum of
+        // child counts equals `n_nodes - 1` (every non-root node is
+        // someone's child exactly once).
+        assert_eq!(out.schema().field(5).name(), "n_children");
+        assert_eq!(out.schema().field(5).data_type(), &DataType::Int32);
+        let n_children = out
+            .column_by_name("n_children")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let mut total_children: i64 = 0;
+        for i in 0..n_nodes {
+            let c = n_children.value(i);
+            if is_tip.value(i) {
+                assert_eq!(c, 0, "tip {i} should have 0 children, got {c}");
+            }
+            total_children += c as i64;
+        }
+        assert_eq!(
+            total_children,
+            (n_nodes - 1) as i64,
+            "sum of n_children should equal n_nodes - 1 in any rooted tree"
+        );
+
+        // Root must have NULL parent_index and NULL edge_id; every
+        // other node must have non-null values in both columns.
+        let root = result["root"].as_i64().unwrap() as usize;
+        let parent_index = out
+            .column_by_name("parent_index")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let edge_id = out
+            .column_by_name("edge_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(
+            parent_index.is_null(root),
+            "Root's parent_index must be NULL (no -1 sentinel)"
+        );
+        assert!(edge_id.is_null(root), "Root's edge_id must be NULL");
+        for i in 0..n_nodes {
+            if i == root {
+                continue;
+            }
+            assert!(
+                !parent_index.is_null(i),
+                "Non-root node {i} parent_index must not be NULL"
+            );
+            assert!(
+                !edge_id.is_null(i),
+                "Non-root node {i} edge_id must not be NULL"
+            );
+            assert_eq!(
+                edge_id.value(i),
+                i as i64,
+                "edge_id convention: == node_index for non-root nodes"
+            );
+        }
 
         // Caller cleans up output shm (simulating what miint does)
         let _ = SharedMemory::unlink(output_name);
@@ -661,6 +818,106 @@ mod tests {
         let response = tool.execute(&config, "/nonexistent-shm-name");
         assert!(!response.success);
         assert!(response.error.unwrap().contains("Failed to open shm"));
+    }
+
+    /// Unit test for the schema-v2 sentinel→NULL emission path. Builds a
+    /// minimal FastTreeSoa fixture with NaN/negative sentinels and feeds
+    /// it through `soa_to_record_batch`. This is the only way to verify
+    /// the conversion without invoking real fasttree (which never emits
+    /// NaN in our current test sequences). No real C state is touched.
+    #[test]
+    fn test_soa_to_record_batch_sentinel_translation() {
+        // 4-node fixture exercising every NULL-emission path:
+        //   Leaf 0 (parent=root): NaN branch_length → NULL; support 0.95 (real).
+        //   Leaf 1 (parent=root): 0.5 branch_length; support -1 → NULL (negative sentinel).
+        //   Leaf 2 (parent=root): 0.7 branch_length; support NaN → NULL.
+        //   Root  (idx 3, parent=-1): branch_length 0.0; support -1 → NULL.
+        let parent: [c_int; 4] = [3, 3, 3, -1];
+        let branch_length: [f64; 4] = [f64::NAN, 0.5, 0.7, 0.0];
+        let support: [f64; 4] = [0.95, -1.0, f64::NAN, -1.0];
+        let n_children: [c_int; 4] = [0, 0, 0, 3];
+        let is_leaf: [c_int; 4] = [1, 1, 1, 0];
+        let name_a = CString::new("leaf_a").unwrap();
+        let name_b = CString::new("leaf_b").unwrap();
+        let name_c = CString::new("leaf_c").unwrap();
+        let name_ptrs: [*const c_char; 4] = [
+            name_a.as_ptr(),
+            name_b.as_ptr(),
+            name_c.as_ptr(),
+            ptr::null(),
+        ];
+
+        let tree = FastTreeSoa {
+            n_nodes: 4,
+            n_leaves: 3,
+            root: 3,
+            parent: parent.as_ptr(),
+            branch_length: branch_length.as_ptr(),
+            support: support.as_ptr(),
+            n_children: n_children.as_ptr(),
+            is_leaf: is_leaf.as_ptr(),
+            children_offset: ptr::null(),
+            name: name_ptrs.as_ptr(),
+            _children_buf: ptr::null(),
+            _name_buf: ptr::null(),
+            _base: ptr::null_mut(),
+        };
+
+        let batch = unsafe { soa_to_record_batch(&tree) }.unwrap();
+        assert_eq!(batch.num_rows(), 4);
+
+        let parent_index = batch
+            .column_by_name("parent_index")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let edge_id = batch
+            .column_by_name("edge_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let bl = batch
+            .column_by_name("branch_length")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let sup = batch
+            .column_by_name("support")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        // Root (idx 3): parent_index NULL, edge_id NULL, support NULL.
+        assert!(parent_index.is_null(3));
+        assert!(edge_id.is_null(3));
+        assert!(sup.is_null(3));
+        assert!(!bl.is_null(3));
+        assert_eq!(bl.value(3), 0.0);
+
+        // Leaf 0: NaN branch_length → NULL; support 0.95 → 0.95.
+        assert_eq!(parent_index.value(0), 3);
+        assert_eq!(edge_id.value(0), 0);
+        assert!(bl.is_null(0), "NaN branch_length must become NULL");
+        assert!(!sup.is_null(0));
+        assert_eq!(sup.value(0), 0.95);
+
+        // Leaf 1: branch_length 0.5; support -1 → NULL.
+        assert_eq!(parent_index.value(1), 3);
+        assert_eq!(edge_id.value(1), 1);
+        assert!(!bl.is_null(1));
+        assert_eq!(bl.value(1), 0.5);
+        assert!(sup.is_null(1), "negative support must become NULL");
+
+        // Leaf 2: branch_length 0.7; support NaN → NULL.
+        assert_eq!(parent_index.value(2), 3);
+        assert_eq!(edge_id.value(2), 2);
+        assert!(!bl.is_null(2));
+        assert_eq!(bl.value(2), 0.7);
+        assert!(sup.is_null(2), "NaN support must become NULL");
     }
 
     /// Verify that the Rust #[repr(C)] FastTreeConfig has the same size as the
