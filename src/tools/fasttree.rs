@@ -608,8 +608,41 @@ unsafe fn soa_to_record_batch(tree: &FastTreeSoa) -> Result<RecordBatch, String>
 mod tests {
     use super::*;
     use crate::shm::SharedMemory;
-    use crate::test_util::{read_arrow_from_shm, unique_shm_name, write_arrow_to_shm};
+    use crate::test_util::{
+        extracted_16s_phylip, parse_interleaved_phylip, read_arrow_from_shm, subset_alignment,
+        unique_shm_name, write_arrow_to_shm,
+    };
     use arrow::array::{Array, Float64Array};
+
+    // Test-only FFI binding for `fasttree_tree_soa_to_newick`.
+    // Used by parity tests to serialize a library-built SOA tree into the
+    // canonical FastTree Newick string for byte-equal comparison against a
+    // hardcoded native-FastTree expected output.
+    extern "C" {
+        fn fasttree_tree_soa_to_newick(
+            tree: *const FastTreeSoa,
+            show_support: c_int,
+        ) -> *mut c_char;
+    }
+
+    /// Serialize a SOA tree to the FastTree-canonical Newick string.
+    ///
+    /// Safety: `libc::free` here is sound only because our adapter never
+    /// wires `FastTreeConfig.alloc_fn` (see `execute()` — the config
+    /// struct is zeroed + `fasttree_config_init`'d, never modified to
+    /// install a custom allocator). The non-SOA `fasttree_tree_to_newick`
+    /// at `ext/fasttree/fasttree.h:288` documents "Returns malloc'd string
+    /// (caller frees with free())"; the SOA variant at line 305 omits the
+    /// guarantee but observably matches. If a future change ever wires
+    /// `alloc_fn`, this free becomes UB.
+    unsafe fn soa_to_newick_via_c(tree: &FastTreeSoa, show_support: bool) -> String {
+        let flag: c_int = if show_support { 1 } else { 0 };
+        let p = fasttree_tree_soa_to_newick(tree as *const _, flag);
+        assert!(!p.is_null(), "fasttree_tree_soa_to_newick returned NULL");
+        let s = CStr::from_ptr(p).to_string_lossy().into_owned();
+        libc::free(p as *mut c_void);
+        s
+    }
 
     fn make_input_batch(names: &[&str], sequences: &[&str]) -> RecordBatch {
         let schema = Arc::new(input_schema());
@@ -618,6 +651,20 @@ mod tests {
             vec![
                 Arc::new(StringArray::from(names.to_vec())),
                 Arc::new(StringArray::from(sequences.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn make_input_batch_owned(alignment: &[(String, String)]) -> RecordBatch {
+        let schema = Arc::new(input_schema());
+        let names: Vec<&str> = alignment.iter().map(|(n, _)| n.as_str()).collect();
+        let seqs: Vec<&str> = alignment.iter().map(|(_, s)| s.as_str()).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(names)),
+                Arc::new(StringArray::from(seqs)),
             ],
         )
         .unwrap()
@@ -941,5 +988,116 @@ mod tests {
             std::mem::size_of::<FastTreeConfig>(),
             config.struct_size,
         );
+    }
+
+    /// Phase 0 smoke test: build a tree from the first 50 sequences of
+    /// `ext/fasttree/16S_500.tar.gz`'s `16S.1.p` PHYLIP file under the
+    /// current 6-param adapter surface. No native-FastTree parity yet —
+    /// that arrives in Phase 1 alongside each new wired knob.
+    ///
+    /// Validates: extraction works, the PHYLIP parser feeds clean input
+    /// to the adapter, the tree-shape invariants hold, and the test-only
+    /// `fasttree_tree_soa_to_newick` FFI returns a non-empty Newick.
+    #[test]
+    fn test_fasttree_16s_50seq_smoke() {
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        assert_eq!(alignment.len(), 50);
+
+        let input_name = unique_shm_name("ft-16s-50");
+        let batch = make_input_batch_owned(&alignment);
+        let _input_shm = write_arrow_to_shm(&input_name, &batch);
+
+        let tool = FastTreeTool;
+        let config = serde_json::json!({
+            "seq_type": "nucleotide",
+            "seed": 12345,
+        });
+
+        let response = tool.execute(&config, &input_name);
+        assert!(
+            response.success,
+            "16S smoke: FastTree failed: {:?}",
+            response.error
+        );
+
+        let result = response.result.expect("result metadata");
+        let n_leaves = result["n_leaves"].as_i64().expect("n_leaves") as usize;
+        let n_nodes = result["n_nodes"].as_i64().expect("n_nodes") as usize;
+        // FastTree dedups identical sequences; in practice the 16S.1.p
+        // subset is unique, but allow the equality slack just in case.
+        assert!(
+            n_leaves > 0 && n_leaves <= 50,
+            "n_leaves out of range: {n_leaves}"
+        );
+        assert!(n_nodes >= n_leaves);
+
+        // Tree-shape invariant: sum of n_children == n_nodes - 1
+        // (every non-root node is someone's child exactly once).
+        let output_name = &response.shm_outputs[0].name;
+        let out_batches = read_arrow_from_shm(output_name);
+        let out = &out_batches[0];
+        let n_children = out
+            .column_by_name("n_children")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let total: i64 = (0..n_nodes).map(|i| n_children.value(i) as i64).sum();
+        assert_eq!(total, (n_nodes - 1) as i64);
+
+        let _ = SharedMemory::unlink(output_name);
+    }
+
+    /// Phase 0 sanity: `fasttree_tree_soa_to_newick` round-trips the
+    /// in-process tree to a Newick string. Establishes that the
+    /// test-only FFI binding works end-to-end before Phase 1 starts
+    /// using it for parity comparisons.
+    #[test]
+    fn test_soa_to_newick_via_c_smoke() {
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 20);
+        let names: Vec<CString> = alignment
+            .iter()
+            .map(|(n, _)| CString::new(n.as_str()).unwrap())
+            .collect();
+        let seqs: Vec<CString> = alignment
+            .iter()
+            .map(|(_, s)| CString::new(s.as_str()).unwrap())
+            .collect();
+        let name_ptrs: Vec<*const c_char> = names.iter().map(|n| n.as_ptr()).collect();
+        let seq_ptrs: Vec<*const c_char> = seqs.iter().map(|s| s.as_ptr()).collect();
+
+        unsafe {
+            let mut cfg: FastTreeConfig = std::mem::zeroed();
+            fasttree_config_init(&mut cfg);
+            cfg.seq_type = 2; // nucleotide
+            cfg.seed = 12345;
+            let ctx = fasttree_create(&cfg);
+            assert!(!ctx.is_null());
+
+            let mut tree: *mut FastTreeSoa = ptr::null_mut();
+            let mut stats: FastTreeStats = std::mem::zeroed();
+            let rc = fasttree_build_soa(
+                ctx,
+                name_ptrs.as_ptr(),
+                seq_ptrs.as_ptr(),
+                alignment.len() as c_int,
+                alignment[0].1.len() as c_int,
+                &mut tree,
+                &mut stats,
+            );
+            assert_eq!(rc, FASTTREE_OK);
+
+            let newick = soa_to_newick_via_c(&*tree, false);
+            assert!(newick.starts_with('('), "Newick should start with '('");
+            assert!(newick.ends_with(";\n") || newick.ends_with(';'));
+            // Every input name should appear (FastTree dedupes but the
+            // 20-seq subset is unique in practice).
+            for (n, _) in &alignment {
+                assert!(newick.contains(n), "Newick missing leaf {n}");
+            }
+
+            fasttree_tree_soa_free(tree);
+            fasttree_destroy(ctx);
+        }
     }
 }
