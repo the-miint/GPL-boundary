@@ -1100,4 +1100,74 @@ mod tests {
             fasttree_destroy(ctx);
         }
     }
+
+    /// Build a tree from `alignment` by driving the C library directly
+    /// (skipping the JSON decoder + Arrow IPC layers) and serialize the
+    /// SOA to a Newick string via `fasttree_tree_soa_to_newick`. The
+    /// `configure` closure runs after `fasttree_config_init`, allowing
+    /// per-test knob overrides on top of the C library's defaults.
+    ///
+    /// Used by parity tests to compare bit-for-bit against native
+    /// FastTree (conda 2.2.0) output captured offline. See
+    /// `GUIDANCE_PARITY_TESTS.md` for the regen workflow.
+    #[allow(dead_code)] // wired in by Phase 1 parity tests; see REPORT-fasttree-library-cli-divergence.md
+    unsafe fn build_newick_via_c(
+        alignment: &[(String, String)],
+        seq_type: c_int,
+        configure: impl FnOnce(&mut FastTreeConfig),
+        show_support: bool,
+    ) -> String {
+        let names: Vec<CString> = alignment
+            .iter()
+            .map(|(n, _)| CString::new(n.as_str()).unwrap())
+            .collect();
+        let seqs: Vec<CString> = alignment
+            .iter()
+            .map(|(_, s)| CString::new(s.as_str()).unwrap())
+            .collect();
+        let name_ptrs: Vec<*const c_char> = names.iter().map(|n| n.as_ptr()).collect();
+        let seq_ptrs: Vec<*const c_char> = seqs.iter().map(|s| s.as_ptr()).collect();
+
+        let mut cfg: FastTreeConfig = std::mem::zeroed();
+        fasttree_config_init(&mut cfg);
+        cfg.seq_type = seq_type;
+        configure(&mut cfg);
+
+        let ctx = fasttree_create(&cfg);
+        assert!(!ctx.is_null(), "fasttree_create returned NULL");
+
+        let mut tree: *mut FastTreeSoa = ptr::null_mut();
+        let mut stats: FastTreeStats = std::mem::zeroed();
+        let rc = fasttree_build_soa(
+            ctx,
+            name_ptrs.as_ptr(),
+            seq_ptrs.as_ptr(),
+            alignment.len() as c_int,
+            alignment[0].1.len() as c_int,
+            &mut tree,
+            &mut stats,
+        );
+        assert_eq!(rc, FASTTREE_OK, "fasttree_build_soa failed");
+
+        let newick = soa_to_newick_via_c(&*tree, show_support);
+
+        fasttree_tree_soa_free(tree);
+        fasttree_destroy(ctx);
+        newick
+    }
+
+    // NOTE: native-FastTree-vs-library parity tests are blocked pending
+    // an `ext/fasttree` submodule fix. The library code path
+    // (`fasttree_api.c` + `fasttree_core.c`) produces a different tree
+    // than the upstream `FastTree.c` CLI given identical input,
+    // identical compile flags, and identical defaults. See
+    // `REPORT-fasttree-library-cli-divergence.md` at the project root for
+    // the full reproduction and hypothesis. Phase 1 of the FastTree
+    // config-surface expansion (`/home/dtmcdonald/.claude/plans/sorted-meandering-lerdorf.md`)
+    // is paused on the per-knob parity tests until that report is
+    // resolved upstream.
+    //
+    // The `build_newick_via_c` helper above is the infrastructure those
+    // parity tests will use once the divergence is fixed (or once the
+    // user authorizes a library-self-ground-truth fallback).
 }
