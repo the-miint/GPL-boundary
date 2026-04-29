@@ -1110,7 +1110,6 @@ mod tests {
     /// Used by parity tests to compare bit-for-bit against native
     /// FastTree (conda 2.2.0) output captured offline. See
     /// `GUIDANCE_PARITY_TESTS.md` for the regen workflow.
-    #[allow(dead_code)] // wired in by Phase 1 parity tests; see REPORT-fasttree-library-cli-divergence.md
     unsafe fn build_newick_via_c(
         alignment: &[(String, String)],
         seq_type: c_int,
@@ -1156,18 +1155,36 @@ mod tests {
         newick
     }
 
-    // NOTE: native-FastTree-vs-library parity tests are blocked pending
-    // an `ext/fasttree` submodule fix. The library code path
-    // (`fasttree_api.c` + `fasttree_core.c`) produces a different tree
-    // than the upstream `FastTree.c` CLI given identical input,
-    // identical compile flags, and identical defaults. See
-    // `REPORT-fasttree-library-cli-divergence.md` at the project root for
-    // the full reproduction and hypothesis. Phase 1 of the FastTree
-    // config-surface expansion (`/home/dtmcdonald/.claude/plans/sorted-meandering-lerdorf.md`)
-    // is paused on the per-knob parity tests until that report is
-    // resolved upstream.
-    //
-    // The `build_newick_via_c` helper above is the infrastructure those
-    // parity tests will use once the divergence is fixed (or once the
-    // user authorizes a library-self-ground-truth fallback).
+    /// Native-FastTree parity baseline: 50-sequence subset of
+    /// `ext/fasttree/16S_500.tar.gz`'s `16S.1.p`, default config + fixed
+    /// seed, support values included.
+    ///
+    /// Regenerated with conda's `fasttree=2.2.0`:
+    ///   conda run -n fasttree FastTree -nt -seed 12345 \
+    ///       /tmp/16S.1.50seq.fasta
+    /// where `/tmp/16S.1.50seq.fasta` was produced by
+    ///   python3 scripts/subset-phylip-to-fasta.py 50 \
+    ///       < target/fasttree-testdata/16S.1.p
+    ///
+    /// If this test ever drifts, our linked `ext/fasttree` library has
+    /// diverged from upstream behavior — investigate before regenerating.
+    /// (See `REPORT-fasttree-library-cli-divergence.md` and
+    /// `REPORT-fasttree-cfcfd94-thread-safety-regression.md` for the
+    /// 2026-04-28 round-trip with the FastTree submodule team that
+    /// established this parity in the first place.)
+    #[test]
+    fn test_fasttree_50seq_parity_baseline() {
+        const EXPECTED: &str = "((10607:0.108728183,1828:0.122617756)0.968:0.029784172,((((112138:0.033883874,11326:0.060069834)1.000:0.139823276,(72728:0.469274735,(2181:0.170590261,(77434:0.082689947,(99565:0.092547907,101540:0.104777748)0.801:0.027296752)0.978:0.045947821)0.997:0.073100991)0.890:0.044420886)0.922:0.017371404,((105325:0.067027677,11179:0.058740204)1.000:0.135281789,(((109612:0.038444192,(52575:0.041602501,19103:0.029245209)0.825:0.010775536)1.000:0.071852375,((69848:0.052322287,(8071:0.038960071,((102957:0.036993227,(37204:0.032886181,(9944:0.010841675,9669:0.016835590)0.944:0.009614309)1.000:0.031400631)0.969:0.017801804,(75690:0.052930806,114738:0.048955244)0.188:0.004986093)1.000:0.051618818)0.926:0.026253833)0.890:0.016831614,72638:0.036015850)0.501:0.012705519)0.999:0.048395482,(111880:0.082925522,(29930:0.067479705,((100639:0.061363527,(54630:0.028632074,65474:0.058988375)0.981:0.023574978)0.063:0.007656523,(89315:0.034813563,(5903:0.034324338,101793:0.046061462)1.000:0.116234675)0.461:0.010309408)0.995:0.029255734)0.611:0.023606761)1.000:0.038934525)0.293:0.011670275)0.322:0.015313215)0.916:0.013617425,38854:0.119745452)0.925:0.012283122,(((109556:0.094712097,(83619:0.093304494,(40531:0.116098375,104854:0.036481237)0.988:0.026154190)0.861:0.013688556)0.964:0.022623573,(16077:0.122036067,(92528:0.125166108,(102607:0.120186435,(84810:0.012379015,3353:0.009442461)1.000:0.064244782)1.000:0.061086276)0.614:0.021412930)0.841:0.024118426)0.688:0.017162443,((103543:0.090887321,(78515:0.081205030,114176:0.179495854)0.994:0.040873948)0.997:0.048795167,(114317:0.128771221,((100492:0.037183916,104661:0.039529991)0.251:0.007801462,((25310:0.014386300,100957:0.035791254)0.877:0.005488228,22197:0.059582638)0.602:0.005619043)1.000:0.080180535)0.091:0.017948287)0.500:0.017997704)0.921:0.015062351);\n";
+
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let actual = unsafe {
+            build_newick_via_c(
+                &alignment,
+                2, // nucleotide
+                |cfg| cfg.seed = 12345,
+                true,
+            )
+        };
+        assert_eq!(actual, EXPECTED);
+    }
 }
