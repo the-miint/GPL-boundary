@@ -171,6 +171,11 @@ fn output_schema() -> Schema {
 /// - `bootstrap`: i64 ≥ 0 → `n_bootstrap`. Absent = C default (1000).
 /// - `nosupport`: bool. true → `n_bootstrap = 0`. Mutually exclusive with
 ///   `bootstrap > 0`.
+/// - `pseudo`: bool. Gates the `pseudo_weight` knob. true → enable
+///   pseudocounts (default weight 1.0 if `pseudo_weight` is absent).
+///   false → disable (`pseudo_weight = 0.0`, the C default).
+/// - `pseudo_weight`: f64 ≥ 0. Only meaningful with `pseudo = true`;
+///   setting it without explicitly enabling pseudo is an error.
 fn apply_json_to_config(
     config: &serde_json::Value,
     ft_config: &mut FastTreeConfig,
@@ -215,6 +220,30 @@ fn apply_json_to_config(
     }
     if nosupport {
         ft_config.n_bootstrap = 0;
+    }
+
+    // pseudo + pseudo_weight
+    let pseudo = config.get("pseudo").and_then(|v| v.as_bool());
+    let pseudo_weight = config.get("pseudo_weight").and_then(|v| v.as_f64());
+    if let Some(w) = pseudo_weight {
+        if pseudo != Some(true) {
+            return Err(format!(
+                "config conflict: pseudo_weight={w} requires pseudo=true \
+                 (set pseudo=true to enable, or omit pseudo_weight)"
+            ));
+        }
+        if w < 0.0 {
+            return Err(format!("pseudo_weight must be >= 0 (got {w})"));
+        }
+    }
+    match pseudo {
+        Some(true) => {
+            ft_config.pseudo_weight = pseudo_weight.unwrap_or(1.0);
+        }
+        Some(false) => {
+            ft_config.pseudo_weight = 0.0;
+        }
+        None => {} // leave at C default (0.0)
     }
 
     Ok(())
@@ -345,6 +374,20 @@ impl GplTool for FastTreeTool {
                     param_type: "boolean",
                     default: serde_json::json!(false),
                     description: "Disable SH-like local-support computation (synthesizes bootstrap=0). Mutually exclusive with bootstrap > 0.",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "pseudo",
+                    param_type: "boolean",
+                    default: serde_json::json!(false),
+                    description: "Enable pseudocounts to dampen long-branch artifacts on highly gapped alignments. Gates pseudo_weight.",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "pseudo_weight",
+                    param_type: "number",
+                    default: serde_json::json!(1.0),
+                    description: "Pseudocount weight (>= 0). Only meaningful when pseudo=true; default is 1.0 in that case.",
                     allowed_values: vec![],
                 },
             ],
@@ -1373,6 +1416,93 @@ mod tests {
         assert!(
             err.contains("bootstrap"),
             "expected 'bootstrap' in error, got: {err}"
+        );
+    }
+
+    // === Phase 1, knob 2: pseudo + pseudo_weight ===
+
+    /// `pseudo=true` with no explicit weight uses the default of 1.0.
+    /// Verifies bit-equality against:
+    ///   conda run -n fasttree FastTree -nt -seed 12345 -pseudo \
+    ///       /tmp/16S.1.50seq.fasta
+    #[test]
+    fn test_pseudo_default_weight_parity() {
+        const EXPECTED: &str = "((10607:0.108728183,1828:0.122617756)0.968:0.029784172,((((112138:0.033883874,11326:0.060069834)1.000:0.139823276,(72728:0.469274735,(2181:0.170590261,(77434:0.082689947,(99565:0.092547907,101540:0.104777748)0.801:0.027296752)0.978:0.045947821)0.997:0.073100990)0.890:0.044420886)0.922:0.017371404,((105325:0.067027677,11179:0.058740204)1.000:0.135281789,(((109612:0.038444192,(52575:0.041602501,19103:0.029245209)0.825:0.010775536)1.000:0.071852374,((69848:0.052322286,(8071:0.038960072,((102957:0.036993231,(37204:0.032886181,(9944:0.010841675,9669:0.016835590)0.944:0.009614309)1.000:0.031400629)0.969:0.017801805,(75690:0.052930804,114738:0.048955243)0.188:0.004986094)1.000:0.051618817)0.926:0.026253832)0.890:0.016831614,72638:0.036015850)0.501:0.012705519)0.999:0.048395482,(111880:0.082925522,(29930:0.067479705,((100639:0.061363528,(54630:0.028632074,65474:0.058988375)0.981:0.023574978)0.063:0.007656523,(89315:0.034813563,(5903:0.034324338,101793:0.046061462)1.000:0.116234675)0.461:0.010309408)0.995:0.029255734)0.611:0.023606761)1.000:0.038934525)0.293:0.011670275)0.322:0.015313215)0.916:0.013617426,38854:0.119745450)0.925:0.012283122,(((109556:0.094712097,(83619:0.093304494,(40531:0.116098375,104854:0.036481237)0.988:0.026154190)0.861:0.013688556)0.964:0.022623573,(16077:0.122036067,(92528:0.125166108,(102607:0.120186435,(84810:0.012379015,3353:0.009442461)1.000:0.064244782)1.000:0.061086276)0.614:0.021412929)0.841:0.024118427)0.688:0.017162443,((103543:0.090887321,(78515:0.081205030,114176:0.179495854)0.994:0.040873947)0.997:0.048795167,(114317:0.128771221,((100492:0.037183915,104661:0.039529991)0.251:0.007801462,((25310:0.014386300,100957:0.035791255)0.877:0.005488228,22197:0.059582639)0.602:0.005619043)1.000:0.080180535)0.091:0.017948287)0.500:0.017997704)0.921:0.015062351);\n";
+
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let actual = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "pseudo": true}),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(actual, EXPECTED);
+    }
+
+    /// `pseudo=true, pseudo_weight=2.5` overrides the default weight.
+    /// Verifies bit-equality against:
+    ///   conda run -n fasttree FastTree -nt -seed 12345 -pseudo 2.5 \
+    ///       /tmp/16S.1.50seq.fasta
+    #[test]
+    fn test_pseudo_weight_2_5_parity() {
+        const EXPECTED: &str = "((10607:0.108728183,1828:0.122617756)0.968:0.029784172,((((112138:0.033883874,11326:0.060069834)1.000:0.139823275,(72728:0.469274735,(2181:0.170590261,(77434:0.082689947,(99565:0.092547907,101540:0.104777748)0.801:0.027296752)0.978:0.045947822)0.997:0.073100989)0.890:0.044420887)0.922:0.017371404,((105325:0.067027676,11179:0.058740204)1.000:0.135281789,(((109612:0.038444192,(52575:0.041602501,19103:0.029245209)0.825:0.010775535)1.000:0.071852374,((69848:0.052322284,(8071:0.038960075,((102957:0.036993238,(37204:0.032886181,(9944:0.010841674,9669:0.016835590)0.944:0.009614310)1.000:0.031400627)0.969:0.017801806,(75690:0.052930802,114738:0.048955243)0.188:0.004986095)1.000:0.051618816)0.926:0.026253832)0.890:0.016831614,72638:0.036015851)0.501:0.012705519)0.999:0.048395482,(111880:0.082925522,(29930:0.067479705,((100639:0.061363531,(54630:0.028632074,65474:0.058988375)0.981:0.023574978)0.063:0.007656523,(89315:0.034813563,(5903:0.034324338,101793:0.046061463)1.000:0.116234674)0.461:0.010309408)0.995:0.029255734)0.611:0.023606761)1.000:0.038934525)0.293:0.011670274)0.322:0.015313215)0.916:0.013617426,38854:0.119745448)0.925:0.012283122,(((109556:0.094712096,(83619:0.093304495,(40531:0.116098375,104854:0.036481237)0.988:0.026154190)0.861:0.013688556)0.964:0.022623572,(16077:0.122036068,(92528:0.125166108,(102607:0.120186434,(84810:0.012379015,3353:0.009442461)1.000:0.064244781)1.000:0.061086277)0.614:0.021412928)0.841:0.024118428)0.688:0.017162443,((103543:0.090887321,(78515:0.081205031,114176:0.179495854)0.994:0.040873947)0.997:0.048795167,(114317:0.128771221,((100492:0.037183915,104661:0.039529991)0.251:0.007801462,((25310:0.014386300,100957:0.035791255)0.877:0.005488228,22197:0.059582640)0.602:0.005619044)1.000:0.080180535)0.091:0.017948287)0.500:0.017997704)0.921:0.015062351);\n";
+
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let actual = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "pseudo": true, "pseudo_weight": 2.5}),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(actual, EXPECTED);
+    }
+
+    /// `pseudo_weight` without `pseudo=true` is rejected.
+    #[test]
+    fn test_pseudo_weight_without_enable_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err =
+            apply_json_to_config(&serde_json::json!({"pseudo_weight": 2.5}), &mut cfg).unwrap_err();
+        assert!(
+            err.contains("pseudo_weight") && err.contains("pseudo=true"),
+            "expected error mentioning pseudo_weight + pseudo=true, got: {err}"
+        );
+    }
+
+    /// `pseudo: false, pseudo_weight: ...` is also rejected (same conflict).
+    #[test]
+    fn test_pseudo_false_with_weight_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err = apply_json_to_config(
+            &serde_json::json!({"pseudo": false, "pseudo_weight": 1.0}),
+            &mut cfg,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("pseudo_weight") && err.contains("pseudo=true"),
+            "expected error mentioning pseudo_weight + pseudo=true, got: {err}"
+        );
+    }
+
+    /// Negative `pseudo_weight` is a hard error.
+    #[test]
+    fn test_pseudo_weight_negative_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err = apply_json_to_config(
+            &serde_json::json!({"pseudo": true, "pseudo_weight": -0.5}),
+            &mut cfg,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("pseudo_weight"),
+            "expected 'pseudo_weight' in error, got: {err}"
         );
     }
 }
