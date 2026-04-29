@@ -153,6 +153,73 @@ fn output_schema() -> Schema {
     ])
 }
 
+// --- JSON config decoder ---
+
+/// Apply gpl-boundary's JSON config knobs onto an already-`fasttree_config_init`'d
+/// `FastTreeConfig`. Validates mutually-exclusive combinations at the
+/// JSON→C-config boundary so the same error message reaches every consumer
+/// regardless of how the boundary is invoked.
+///
+/// Caller MUST have called `fasttree_config_init(ft_config)` immediately
+/// before this function so unsupplied knobs sit at their C-library defaults
+/// (e.g., `n_bootstrap = 1000`, `nni_rounds = -1` (auto), etc.).
+///
+/// Wired-up knobs (Phase 1 onward):
+/// - `seq_type`: "auto" (default) | "nucleotide" | "protein"
+/// - `seed`: i64, default 314159
+/// - `verbose`: bool, default false (routes stderr log if true)
+/// - `bootstrap`: i64 ≥ 0 → `n_bootstrap`. Absent = C default (1000).
+/// - `nosupport`: bool. true → `n_bootstrap = 0`. Mutually exclusive with
+///   `bootstrap > 0`.
+fn apply_json_to_config(
+    config: &serde_json::Value,
+    ft_config: &mut FastTreeConfig,
+) -> Result<(), String> {
+    // seq_type
+    ft_config.seq_type = match config.get("seq_type").and_then(|v| v.as_str()) {
+        Some("nucleotide") => 2,
+        Some("protein") => 1,
+        Some("auto") | None => 0,
+        Some(other) => return Err(format!("invalid seq_type: {other:?}")),
+    };
+
+    if let Some(seed) = config.get("seed").and_then(|v| v.as_i64()) {
+        ft_config.seed = seed;
+    }
+
+    if config
+        .get("verbose")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        ft_config.log_callback = Some(stderr_log_callback);
+    }
+
+    // bootstrap + nosupport
+    let bootstrap = config.get("bootstrap").and_then(|v| v.as_i64());
+    let nosupport = config
+        .get("nosupport")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if let Some(b) = bootstrap {
+        if nosupport && b > 0 {
+            return Err(format!(
+                "config conflict: bootstrap={b} cannot be combined with nosupport=true \
+                 (use bootstrap=0 or omit nosupport)"
+            ));
+        }
+        if b < 0 {
+            return Err(format!("bootstrap must be >= 0 (got {b})"));
+        }
+        ft_config.n_bootstrap = b as c_int;
+    }
+    if nosupport {
+        ft_config.n_bootstrap = 0;
+    }
+
+    Ok(())
+}
+
 // --- Tool implementation ---
 
 pub struct FastTreeTool;
@@ -264,6 +331,20 @@ impl GplTool for FastTreeTool {
                     param_type: "boolean",
                     default: serde_json::json!(false),
                     description: "Write tool log output to stderr for diagnostics",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "bootstrap",
+                    param_type: "integer",
+                    default: serde_json::json!(1000),
+                    description: "SH-like local-support resamples (>= 0). 0 disables support computation; equivalent to nosupport=true.",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "nosupport",
+                    param_type: "boolean",
+                    default: serde_json::json!(false),
+                    description: "Disable SH-like local-support computation (synthesizes bootstrap=0). Mutually exclusive with bootstrap > 0.",
                     allowed_values: vec![],
                 },
             ],
@@ -421,28 +502,11 @@ impl GplTool for FastTreeTool {
         let c_name_ptrs: Vec<*const c_char> = c_names.iter().map(|n| n.as_ptr()).collect();
         let c_seq_ptrs: Vec<*const c_char> = c_seqs.iter().map(|s| s.as_ptr()).collect();
 
-        let seq_type = match config.get("seq_type").and_then(|v| v.as_str()) {
-            Some("nucleotide") => 2,
-            Some("protein") => 1,
-            _ => 0,
-        };
-        let seed = config
-            .get("seed")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(314159);
-        let verbose = config
-            .get("verbose")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
         unsafe {
             let mut ft_config: FastTreeConfig = std::mem::zeroed();
             fasttree_config_init(&mut ft_config);
-            ft_config.seq_type = seq_type;
-            ft_config.seed = seed;
-
-            if verbose {
-                ft_config.log_callback = Some(stderr_log_callback);
+            if let Err(e) = apply_json_to_config(config, &mut ft_config) {
+                return Response::error(e);
             }
 
             let ctx = fasttree_create(&ft_config);
@@ -1105,17 +1169,17 @@ mod tests {
     /// (skipping the JSON decoder + Arrow IPC layers) and serialize the
     /// SOA to a Newick string via `fasttree_tree_soa_to_newick`. The
     /// `configure` closure runs after `fasttree_config_init`, allowing
-    /// per-test knob overrides on top of the C library's defaults.
+    /// per-test knob overrides on top of the C library's defaults. The
+    /// closure may return `Err` to abort before `fasttree_create`.
     ///
     /// Used by parity tests to compare bit-for-bit against native
     /// FastTree (conda 2.2.0) output captured offline. See
     /// `GUIDANCE_PARITY_TESTS.md` for the regen workflow.
     unsafe fn build_newick_via_c(
         alignment: &[(String, String)],
-        seq_type: c_int,
-        configure: impl FnOnce(&mut FastTreeConfig),
+        configure: impl FnOnce(&mut FastTreeConfig) -> Result<(), String>,
         show_support: bool,
-    ) -> String {
+    ) -> Result<String, String> {
         let names: Vec<CString> = alignment
             .iter()
             .map(|(n, _)| CString::new(n.as_str()).unwrap())
@@ -1129,11 +1193,12 @@ mod tests {
 
         let mut cfg: FastTreeConfig = std::mem::zeroed();
         fasttree_config_init(&mut cfg);
-        cfg.seq_type = seq_type;
-        configure(&mut cfg);
+        configure(&mut cfg)?;
 
         let ctx = fasttree_create(&cfg);
-        assert!(!ctx.is_null(), "fasttree_create returned NULL");
+        if ctx.is_null() {
+            return Err("fasttree_create returned NULL".into());
+        }
 
         let mut tree: *mut FastTreeSoa = ptr::null_mut();
         let mut stats: FastTreeStats = std::mem::zeroed();
@@ -1146,13 +1211,35 @@ mod tests {
             &mut tree,
             &mut stats,
         );
-        assert_eq!(rc, FASTTREE_OK, "fasttree_build_soa failed");
+        if rc != FASTTREE_OK {
+            let err = CStr::from_ptr(fasttree_last_error(ctx))
+                .to_string_lossy()
+                .into_owned();
+            fasttree_destroy(ctx);
+            return Err(format!("fasttree_build_soa failed: {err}"));
+        }
 
         let newick = soa_to_newick_via_c(&*tree, show_support);
 
         fasttree_tree_soa_free(tree);
         fasttree_destroy(ctx);
-        newick
+        Ok(newick)
+    }
+
+    /// Drive the production JSON decoder + the C library + the test-only
+    /// Newick serializer. Per-knob parity tests use this to validate that
+    /// `apply_json_to_config` correctly maps JSON knobs onto the
+    /// `FastTreeConfig` fields the C library acts on.
+    unsafe fn build_newick_via_json(
+        alignment: &[(String, String)],
+        config_json: &serde_json::Value,
+        show_support: bool,
+    ) -> Result<String, String> {
+        build_newick_via_c(
+            alignment,
+            |cfg| apply_json_to_config(config_json, cfg),
+            show_support,
+        )
     }
 
     /// Native-FastTree parity baseline: 50-sequence subset of
@@ -1178,13 +1265,114 @@ mod tests {
 
         let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
         let actual = unsafe {
-            build_newick_via_c(
+            build_newick_via_json(
                 &alignment,
-                2, // nucleotide
-                |cfg| cfg.seed = 12345,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345}),
                 true,
             )
-        };
+        }
+        .unwrap();
         assert_eq!(actual, EXPECTED);
+    }
+
+    // === Phase 1, knob 1: bootstrap + nosupport ===
+
+    /// `bootstrap=100` overrides the C default of 1000. Smaller resample
+    /// count → different SH-like support values; topology + branch lengths
+    /// are unchanged because bootstrap only affects support computation.
+    ///
+    /// Regenerated with:
+    ///   conda run -n fasttree FastTree -nt -seed 12345 -boot 100 \
+    ///       /tmp/16S.1.50seq.fasta
+    #[test]
+    fn test_bootstrap_100_parity() {
+        const EXPECTED: &str = "((10607:0.108728183,1828:0.122617756)0.940:0.029784172,((((112138:0.033883874,11326:0.060069834)1.000:0.139823276,(72728:0.469274735,(2181:0.170590261,(77434:0.082689947,(99565:0.092547907,101540:0.104777748)0.880:0.027296752)0.980:0.045947821)1.000:0.073100991)0.910:0.044420886)0.930:0.017371404,((105325:0.067027677,11179:0.058740204)1.000:0.135281789,(((109612:0.038444192,(52575:0.041602501,19103:0.029245209)0.830:0.010775536)1.000:0.071852375,((69848:0.052322287,(8071:0.038960071,((102957:0.036993227,(37204:0.032886181,(9944:0.010841675,9669:0.016835590)0.940:0.009614309)1.000:0.031400631)0.980:0.017801804,(75690:0.052930806,114738:0.048955244)0.160:0.004986093)1.000:0.051618818)0.910:0.026253833)0.940:0.016831614,72638:0.036015850)0.520:0.012705519)1.000:0.048395482,(111880:0.082925522,(29930:0.067479705,((100639:0.061363527,(54630:0.028632074,65474:0.058988375)0.990:0.023574978)0.100:0.007656523,(89315:0.034813563,(5903:0.034324338,101793:0.046061462)1.000:0.116234675)0.440:0.010309408)0.990:0.029255734)0.560:0.023606761)1.000:0.038934525)0.290:0.011670275)0.350:0.015313215)0.920:0.013617425,38854:0.119745452)0.930:0.012283122,(((109556:0.094712097,(83619:0.093304494,(40531:0.116098375,104854:0.036481237)0.990:0.026154190)0.830:0.013688556)0.950:0.022623573,(16077:0.122036067,(92528:0.125166108,(102607:0.120186435,(84810:0.012379015,3353:0.009442461)1.000:0.064244782)1.000:0.061086276)0.620:0.021412930)0.800:0.024118426)0.680:0.017162443,((103543:0.090887321,(78515:0.081205030,114176:0.179495854)0.990:0.040873948)0.990:0.048795167,(114317:0.128771221,((100492:0.037183916,104661:0.039529991)0.330:0.007801462,((25310:0.014386300,100957:0.035791254)0.910:0.005488228,22197:0.059582638)0.590:0.005619043)1.000:0.080180535)0.110:0.017948287)0.480:0.017997704)0.940:0.015062351);\n";
+
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let actual = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "bootstrap": 100}),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(actual, EXPECTED);
+    }
+
+    /// `nosupport=true` synthesizes `n_bootstrap = 0` → output Newick has
+    /// no support annotations.
+    ///
+    /// Regenerated with:
+    ///   conda run -n fasttree FastTree -nt -seed 12345 -nosupport \
+    ///       /tmp/16S.1.50seq.fasta
+    #[test]
+    fn test_nosupport_parity() {
+        const EXPECTED: &str = "((10607:0.108728183,1828:0.122617756):0.029784172,((((112138:0.033883874,11326:0.060069834):0.139823276,(72728:0.469274735,(2181:0.170590261,(77434:0.082689947,(99565:0.092547907,101540:0.104777748):0.027296752):0.045947821):0.073100991):0.044420886):0.017371404,((105325:0.067027677,11179:0.058740204):0.135281789,(((109612:0.038444192,(52575:0.041602501,19103:0.029245209):0.010775536):0.071852375,((69848:0.052322287,(8071:0.038960071,((102957:0.036993227,(37204:0.032886181,(9944:0.010841675,9669:0.016835590):0.009614309):0.031400631):0.017801804,(75690:0.052930806,114738:0.048955244):0.004986093):0.051618818):0.026253833):0.016831614,72638:0.036015850):0.012705519):0.048395482,(111880:0.082925522,(29930:0.067479705,((100639:0.061363527,(54630:0.028632074,65474:0.058988375):0.023574978):0.007656523,(89315:0.034813563,(5903:0.034324338,101793:0.046061462):0.116234675):0.010309408):0.029255734):0.023606761):0.038934525):0.011670275):0.015313215):0.013617425,38854:0.119745452):0.012283122,(((109556:0.094712097,(83619:0.093304494,(40531:0.116098375,104854:0.036481237):0.026154190):0.013688556):0.022623573,(16077:0.122036067,(92528:0.125166108,(102607:0.120186435,(84810:0.012379015,3353:0.009442461):0.064244782):0.061086276):0.021412930):0.024118426):0.017162443,((103543:0.090887321,(78515:0.081205030,114176:0.179495854):0.040873948):0.048795167,(114317:0.128771221,((100492:0.037183916,104661:0.039529991):0.007801462,((25310:0.014386300,100957:0.035791254):0.005488228,22197:0.059582638):0.005619043):0.080180535):0.017948287):0.017997704):0.015062351);\n";
+
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let actual = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "nosupport": true}),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(actual, EXPECTED);
+    }
+
+    /// `bootstrap=0` is exactly equivalent to `nosupport=true` — same C
+    /// field set to 0, same Newick output.
+    #[test]
+    fn test_bootstrap_zero_eq_nosupport() {
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let nosupport = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "nosupport": true}),
+                true,
+            )
+        }
+        .unwrap();
+        let bootstrap_zero = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "bootstrap": 0}),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(nosupport, bootstrap_zero);
+    }
+
+    /// `bootstrap > 0 && nosupport == true` is a config conflict; the
+    /// adapter rejects with a clear error before invoking FastTree.
+    #[test]
+    fn test_bootstrap_nosupport_conflict_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err = apply_json_to_config(
+            &serde_json::json!({"bootstrap": 100, "nosupport": true}),
+            &mut cfg,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("conflict") && err.contains("bootstrap") && err.contains("nosupport"),
+            "expected a clear conflict error mentioning bootstrap and nosupport, got: {err}"
+        );
+    }
+
+    /// Negative `bootstrap` is a hard error.
+    #[test]
+    fn test_bootstrap_negative_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err =
+            apply_json_to_config(&serde_json::json!({"bootstrap": -1}), &mut cfg).unwrap_err();
+        assert!(
+            err.contains("bootstrap"),
+            "expected 'bootstrap' in error, got: {err}"
+        );
     }
 }
