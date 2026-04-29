@@ -155,6 +155,23 @@ fn output_schema() -> Schema {
 
 // --- JSON config decoder ---
 
+/// Convert a JSON-decoded `i64` into the `c_int` width the C library
+/// expects, with a positive overflow guard. Negative-value range checks
+/// remain per-knob (some knobs accept 0 as "auto sentinel", others
+/// require strictly positive).
+fn checked_cint(name: &str, v: i64) -> Result<c_int, String> {
+    if v > c_int::MAX as i64 {
+        return Err(format!(
+            "{name}={v} exceeds C int range (max {})",
+            c_int::MAX
+        ));
+    }
+    if v < c_int::MIN as i64 {
+        return Err(format!("{name}={v} below C int range (min {})", c_int::MIN));
+    }
+    Ok(v as c_int)
+}
+
 /// Apply gpl-boundary's JSON config knobs onto an already-`fasttree_config_init`'d
 /// `FastTreeConfig`. Validates mutually-exclusive combinations at the
 /// JSON→C-config boundary so the same error message reaches every consumer
@@ -215,13 +232,16 @@ fn apply_json_to_config(
     }
 
     // bootstrap + nosupport
+    // Conflict check runs first so users hitting both errors at once see
+    // the more useful message. (`{nosupport: true, bootstrap: -1}` would
+    // otherwise mask the conflict behind a range error.)
     let bootstrap = config.get("bootstrap").and_then(|v| v.as_i64());
     let nosupport = config
         .get("nosupport")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     if let Some(b) = bootstrap {
-        if nosupport && b > 0 {
+        if nosupport && b != 0 {
             return Err(format!(
                 "config conflict: bootstrap={b} cannot be combined with nosupport=true \
                  (use bootstrap=0 or omit nosupport)"
@@ -230,7 +250,7 @@ fn apply_json_to_config(
         if b < 0 {
             return Err(format!("bootstrap must be >= 0 (got {b})"));
         }
-        ft_config.n_bootstrap = b as c_int;
+        ft_config.n_bootstrap = checked_cint("bootstrap", b)?;
     }
     if nosupport {
         ft_config.n_bootstrap = 0;
@@ -261,13 +281,17 @@ fn apply_json_to_config(
     }
 
     // nni
+    // TODO(Phase 3 — fastest): when `fastest` lands, the upstream CLI's
+    // `-fastest` clamps `nni_rounds = min(nni_rounds, 2)`. Decide whether
+    // to replicate that or reject `{fastest: true, nni > 2}` explicitly
+    // so users don't get silently downgraded.
     if let Some(v) = config.get("nni").and_then(|v| v.as_i64()) {
         if v < 0 {
             return Err(format!(
                 "nni must be >= 0 (got {v}); omit the field to use the C library's auto default"
             ));
         }
-        ft_config.nni_rounds = v as c_int;
+        ft_config.nni_rounds = checked_cint("nni", v)?;
     }
 
     // spr
@@ -275,7 +299,7 @@ fn apply_json_to_config(
         if v < 0 {
             return Err(format!("spr must be >= 0 (got {v})"));
         }
-        ft_config.spr_rounds = v as c_int;
+        ft_config.spr_rounds = checked_cint("spr", v)?;
     }
 
     // mlnni + noml
@@ -296,7 +320,7 @@ fn apply_json_to_config(
                  (use mlnni=0 or omit noml)"
             ));
         }
-        ft_config.ml_nni_rounds = v as c_int;
+        ft_config.ml_nni_rounds = checked_cint("mlnni", v)?;
     }
     if noml {
         ft_config.ml_nni_rounds = 0;
@@ -307,7 +331,7 @@ fn apply_json_to_config(
         if v < 1 {
             return Err(format!("mlacc must be >= 1 (got {v})"));
         }
-        ft_config.ml_accuracy = v as c_int;
+        ft_config.ml_accuracy = checked_cint("mlacc", v)?;
     }
 
     // cat
@@ -315,7 +339,7 @@ fn apply_json_to_config(
         if v < 1 {
             return Err(format!("cat must be >= 1 (got {v})"));
         }
-        ft_config.n_rate_cats = v as c_int;
+        ft_config.n_rate_cats = checked_cint("cat", v)?;
     }
 
     Ok(())
@@ -406,27 +430,13 @@ impl GplTool for FastTreeTool {
                     description: "Random seed for reproducibility",
                     allowed_values: vec![],
                 },
-                ConfigParam {
-                    name: "model",
-                    param_type: "string",
-                    default: serde_json::json!("auto"),
-                    description: "Substitution model (auto=JTT for protein, JC for nucleotide)",
-                    allowed_values: vec!["auto", "jtt", "lg", "wag", "jc", "gtr"],
-                },
-                ConfigParam {
-                    name: "fastest",
-                    param_type: "boolean",
-                    default: serde_json::json!(false),
-                    description: "Use fastest heuristics (less accurate)",
-                    allowed_values: vec![],
-                },
-                ConfigParam {
-                    name: "gamma",
-                    param_type: "boolean",
-                    default: serde_json::json!(false),
-                    description: "Compute gamma log-likelihood",
-                    allowed_values: vec![],
-                },
+                // NOTE: `model`, `fastest`, `gamma` were advertised here in the
+                // initial 6-param describe() surface but their JSON paths were
+                // never wired into the decoder. They are intentionally absent
+                // until Phase 3 wires them with proper validation (model needs
+                // gtrrates/gtrfreq companions; fastest interacts with nni —
+                // see TODO in apply_json_to_config; gamma is observable only in
+                // the response stats, not the tree).
                 ConfigParam {
                     name: "verbose",
                     param_type: "boolean",
@@ -1337,6 +1347,11 @@ mod tests {
         configure: impl FnOnce(&mut FastTreeConfig) -> Result<(), String>,
         show_support: bool,
     ) -> Result<String, String> {
+        // alignment[0].1.len() below would panic on an empty slice;
+        // surface that as an error instead.
+        if alignment.is_empty() {
+            return Err("build_newick_via_c: alignment is empty".into());
+        }
         let names: Vec<CString> = alignment
             .iter()
             .map(|(n, _)| CString::new(n.as_str()).unwrap())
@@ -1918,5 +1933,48 @@ mod tests {
         apply_json_to_config(&serde_json::json!({"noml": true, "mlnni": 0}), &mut cfg)
             .expect("noml + mlnni=0 must be accepted");
         assert_eq!(cfg.ml_nni_rounds, 0);
+    }
+
+    // === Range-check + UX hygiene (Linus review followups) ===
+
+    /// Numeric knobs reject values that would silently truncate when
+    /// cast to `c_int`. Spot-check `bootstrap` (any of the 5 numeric
+    /// knobs would do — they all funnel through `checked_cint`).
+    #[test]
+    fn test_numeric_knob_rejects_overflow() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let big = c_int::MAX as i64 + 1;
+        let err =
+            apply_json_to_config(&serde_json::json!({"bootstrap": big}), &mut cfg).unwrap_err();
+        assert!(
+            err.contains("bootstrap") && err.contains("range"),
+            "expected overflow error mentioning bootstrap and range, got: {err}"
+        );
+    }
+
+    /// `bootstrap=0 + nosupport=true` is allowed (both express the same
+    /// intent). The conflict guard fires only on `bootstrap != 0`.
+    #[test]
+    fn test_bootstrap_zero_with_nosupport_ok() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        apply_json_to_config(
+            &serde_json::json!({"bootstrap": 0, "nosupport": true}),
+            &mut cfg,
+        )
+        .expect("bootstrap=0 + nosupport=true must be accepted");
+        assert_eq!(cfg.n_bootstrap, 0);
+    }
+
+    /// Empty-alignment guard in `build_newick_via_c` returns an error
+    /// instead of panicking inside unsafe code on `alignment[0]`.
+    #[test]
+    fn test_build_newick_via_c_rejects_empty_alignment() {
+        let err = unsafe { build_newick_via_c(&[], |_| Ok(()), false) }.unwrap_err();
+        assert!(
+            err.contains("empty"),
+            "expected empty-alignment error, got: {err}"
+        );
     }
 }
