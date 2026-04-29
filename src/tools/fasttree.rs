@@ -181,6 +181,15 @@ fn output_schema() -> Schema {
 ///   values are rejected — use absent for "auto" instead of `-1`.
 /// - `spr`: i64 ≥ 0 → `spr_rounds`. Absent = C default (2). Negative
 ///   values rejected.
+/// - `mlnni`: i64 ≥ 0 → `ml_nni_rounds`. Absent/null = auto (C default
+///   -1, which the C library expands to `2*log2(N)`). 0 = disable ML
+///   NNI. Negative explicit values are rejected.
+/// - `mlacc`: i64 ≥ 1 → `ml_accuracy`. Absent = C default (1).
+///   Higher values request more rounds of ML branch-length
+///   optimization.
+/// - `cat`: i64 ≥ 1 → `n_rate_cats`. Absent = C default (20).
+/// - `noml`: bool. true → `ml_nni_rounds = 0` (synthesizes
+///   "disable ML NNI"). Mutually exclusive with explicit `mlnni > 0`.
 fn apply_json_to_config(
     config: &serde_json::Value,
     ft_config: &mut FastTreeConfig,
@@ -267,6 +276,46 @@ fn apply_json_to_config(
             return Err(format!("spr must be >= 0 (got {v})"));
         }
         ft_config.spr_rounds = v as c_int;
+    }
+
+    // mlnni + noml
+    let mlnni = config.get("mlnni").and_then(|v| v.as_i64());
+    let noml = config
+        .get("noml")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if let Some(v) = mlnni {
+        if v < 0 {
+            return Err(format!(
+                "mlnni must be >= 0 (got {v}); omit the field to use the C library's auto default"
+            ));
+        }
+        if noml && v > 0 {
+            return Err(format!(
+                "config conflict: mlnni={v} cannot be combined with noml=true \
+                 (use mlnni=0 or omit noml)"
+            ));
+        }
+        ft_config.ml_nni_rounds = v as c_int;
+    }
+    if noml {
+        ft_config.ml_nni_rounds = 0;
+    }
+
+    // mlacc
+    if let Some(v) = config.get("mlacc").and_then(|v| v.as_i64()) {
+        if v < 1 {
+            return Err(format!("mlacc must be >= 1 (got {v})"));
+        }
+        ft_config.ml_accuracy = v as c_int;
+    }
+
+    // cat
+    if let Some(v) = config.get("cat").and_then(|v| v.as_i64()) {
+        if v < 1 {
+            return Err(format!("cat must be >= 1 (got {v})"));
+        }
+        ft_config.n_rate_cats = v as c_int;
     }
 
     Ok(())
@@ -425,6 +474,34 @@ impl GplTool for FastTreeTool {
                     param_type: "integer",
                     default: serde_json::json!(2),
                     description: "SPR rounds (>= 0). The CLI's nni=0 side effect (which forces spr=0) is NOT replicated by the JSON adapter; set both knobs explicitly if both should be 0.",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "mlnni",
+                    param_type: "integer",
+                    default: serde_json::json!(null),
+                    description: "ML-NNI rounds (>= 0). Omit (or null) to use the C library's auto default of 2*log2(N). 0 disables ML NNI entirely; equivalent to noml=true.",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "mlacc",
+                    param_type: "integer",
+                    default: serde_json::json!(1),
+                    description: "ML branch-length optimization rounds (>= 1). Higher = more accurate.",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "cat",
+                    param_type: "integer",
+                    default: serde_json::json!(20),
+                    description: "Number of CAT rate categories (>= 1).",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "noml",
+                    param_type: "boolean",
+                    default: serde_json::json!(false),
+                    description: "Disable ML phase entirely (synthesizes mlnni=0). Mutually exclusive with explicit mlnni > 0.",
                     allowed_values: vec![],
                 },
             ],
@@ -1663,5 +1740,183 @@ mod tests {
         unsafe { fasttree_config_init(&mut cfg) };
         let err = apply_json_to_config(&serde_json::json!({"spr": -1}), &mut cfg).unwrap_err();
         assert!(err.contains("spr"), "expected 'spr' in error, got: {err}");
+    }
+
+    // === Phase 1, knob 5: mlnni ===
+
+    /// `mlnni=0` disables ML NNI rounds. Output differs from the auto
+    /// default (2*log2(N)).
+    ///
+    /// Regenerated with:
+    ///   conda run -n fasttree FastTree -nt -seed 12345 -mlnni 0 \
+    ///       /tmp/16S.1.50seq.fasta
+    #[test]
+    fn test_mlnni_0_parity() {
+        const EXPECTED: &str = "(38854:0.091866101,((((112138:0.039407849,11326:0.048308824)1.000:0.083629760,(72728:0.308479269,(2181:0.132299068,(101540:0.087109640,(99565:0.085719743,77434:0.079725592)0.544:0.005832008)1.000:0.031173659)0.986:0.033300897)0.961:0.025580749)0.885:0.008768864,((105325:0.060329245,11179:0.053191714)1.000:0.074592945,(((109612:0.038565717,(52575:0.034810581,19103:0.032449435)0.622:0.003244465)1.000:0.046565175,((69848:0.047339032,72638:0.039197524)0.531:0.002377636,(8071:0.046177733,((102957:0.036364918,(37204:0.028163797,(9944:0.011007269,9669:0.016608194)1.000:0.010342798)1.000:0.021892005)0.908:0.008299244,(75690:0.047682512,114738:0.045980231)0.735:0.003915193)1.000:0.024586091)0.938:0.010568359)0.941:0.006653102)1.000:0.025689231,(111880:0.074384748,((5903:0.032723016,101793:0.043634915)1.000:0.076402129,(29930:0.062971243,(100639:0.047631761,(89315:0.035520219,(54630:0.028073226,65474:0.051564698)0.994:0.014667269)0.856:0.005287703)0.740:0.004539755)0.865:0.010094708)0.851:0.006541180)0.996:0.015766025)0.829:0.005455146)0.891:0.006603149)0.607:0.001954413,((92528:0.100743143,(102607:0.096355640,(84810:0.011142681,3353:0.010650620)1.000:0.062782819)1.000:0.035728211)0.532:0.002626386,(16077:0.095105069,(109556:0.074376173,(83619:0.083248369,(40531:0.090805257,104854:0.044133747)0.965:0.012933693)0.878:0.009537401)0.991:0.012807140)0.510:0.005586587)0.960:0.006021667)0.829:0.005485252,((10607:0.087422868,1828:0.103943661)0.701:0.006258181,((103543:0.093938450,(78515:0.087981307,114176:0.136000693)0.544:0.007342228)0.999:0.019657600,(114317:0.095678851,(22197:0.044583919,(100492:0.034651795,((25310:0.015693410,100957:0.034186463)0.995:0.009075633,104661:0.035944631)0.675:0.002732751)0.774:0.007328904)1.000:0.054293970)0.792:0.007128480)0.629:0.002779007)0.468:0.001319398);\n";
+
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let actual = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "mlnni": 0}),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(actual, EXPECTED);
+    }
+
+    /// `mlnni` absent ≡ baseline (the C library auto-default).
+    #[test]
+    fn test_mlnni_absent_is_auto() {
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let baseline = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345}),
+                true,
+            )
+        }
+        .unwrap();
+        let mlnni_null = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "mlnni": null}),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(baseline, mlnni_null);
+    }
+
+    /// Negative explicit `mlnni` is rejected (use absent for auto).
+    #[test]
+    fn test_mlnni_negative_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err = apply_json_to_config(&serde_json::json!({"mlnni": -2}), &mut cfg).unwrap_err();
+        assert!(
+            err.contains("mlnni"),
+            "expected 'mlnni' in error, got: {err}"
+        );
+    }
+
+    // === Phase 1, knob 6: mlacc ===
+
+    /// `mlacc=3` (vs C default 1) changes branch-length numerics.
+    ///
+    /// Regenerated with:
+    ///   conda run -n fasttree FastTree -nt -seed 12345 -mlacc 3 \
+    ///       /tmp/16S.1.50seq.fasta
+    #[test]
+    fn test_mlacc_3_parity() {
+        const EXPECTED: &str = "((10607:0.108751017,1828:0.122720017)0.967:0.029764589,((((112138:0.033649393,11326:0.060187704)1.000:0.139853640,(72728:0.469222666,(2181:0.170647720,(77434:0.082702186,(99565:0.092547008,101540:0.104777573)0.805:0.027238602)0.977:0.045914230)0.997:0.073318264)0.886:0.044298153)0.919:0.017379019,((105325:0.067029334,11179:0.058705424)1.000:0.135294335,(((109612:0.038435606,(52575:0.041628587,19103:0.029238186)0.819:0.010772757)1.000:0.071847160,((69848:0.052298014,(8071:0.038990325,((102957:0.037013229,(37204:0.032886057,(9944:0.010847631,9669:0.016836826)0.944:0.009621600)1.000:0.031395935)0.969:0.017793009,(75690:0.052945106,114738:0.048951109)0.187:0.004988583)1.000:0.051602433)0.928:0.026236397)0.892:0.016844911,72638:0.036007120)0.501:0.012706856)0.999:0.048415676,(111880:0.082869901,(29930:0.067458914,((100639:0.061387972,(54630:0.028641290,65474:0.058987824)0.981:0.023559193)0.063:0.007651424,(89315:0.034815054,(5903:0.034325821,101793:0.046091181)1.000:0.116235840)0.461:0.010312788)0.994:0.029263562)0.611:0.023652163)1.000:0.038955511)0.292:0.011661220)0.323:0.015309706)0.912:0.013618830,38854:0.119762045)0.923:0.012282447,(((109556:0.094698151,(83619:0.093362875,(40531:0.116017265,104854:0.036462405)0.987:0.026151852)0.870:0.013682755)0.960:0.022637467,(16077:0.121982506,(92528:0.125099277,(102607:0.120222180,(84810:0.012364323,3353:0.009445078)1.000:0.064291790)1.000:0.061011629)0.614:0.021443779)0.835:0.024124954)0.694:0.017166037,((103543:0.090894609,(78515:0.081138708,114176:0.179387037)0.993:0.040913748)0.996:0.048772654,(114317:0.128769624,((100492:0.037179414,104661:0.039513494)0.252:0.007798778,((25310:0.014381626,100957:0.035803074)0.877:0.005488709,22197:0.059606012)0.602:0.005615630)1.000:0.080241493)0.089:0.017941138)0.500:0.017991027)0.920:0.015064205);\n";
+
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let actual = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "mlacc": 3}),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(actual, EXPECTED);
+    }
+
+    /// `mlacc < 1` is rejected.
+    #[test]
+    fn test_mlacc_zero_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err = apply_json_to_config(&serde_json::json!({"mlacc": 0}), &mut cfg).unwrap_err();
+        assert!(
+            err.contains("mlacc"),
+            "expected 'mlacc' in error, got: {err}"
+        );
+    }
+
+    // === Phase 1, knob 7: cat ===
+
+    /// `cat=5` (vs C default 20) changes ML rate-categorization.
+    ///
+    /// Regenerated with:
+    ///   conda run -n fasttree FastTree -nt -seed 12345 -cat 5 \
+    ///       /tmp/16S.1.50seq.fasta
+    #[test]
+    fn test_cat_5_parity() {
+        const EXPECTED: &str = "((10607:0.110822829,1828:0.124880820)0.972:0.029700310,((((112138:0.035014039,11326:0.059534929)1.000:0.142807918,(72728:0.488346397,(2181:0.174518373,(77434:0.083090752,(99565:0.094410303,101540:0.106033033)0.716:0.027011159)0.983:0.047334957)0.996:0.071259023)0.938:0.048979680)0.902:0.015631453,((105325:0.068229294,11179:0.058898454)1.000:0.138868794,(((109612:0.038747606,(52575:0.041915241,19103:0.029378762)0.732:0.010481334)1.000:0.072667665,((69848:0.052728065,(8071:0.038815686,((102957:0.037137564,(37204:0.033007542,(9944:0.010910693,9669:0.016777213)0.928:0.009577950)1.000:0.031666005)0.969:0.017381178,(75690:0.053210402,114738:0.048920567)0.435:0.005583687)1.000:0.051872661)0.949:0.026401072)0.919:0.016946861,72638:0.035928670)0.662:0.012902654)0.998:0.047777724,(111880:0.083665738,(29930:0.067982258,((89315:0.042458713,(54630:0.027526951,65474:0.060946624)0.986:0.025330958)0.639:0.010724829,(100639:0.050716131,(5903:0.034465767,101793:0.046453324)1.000:0.116261040)0.421:0.012246706)0.974:0.026907188)0.713:0.024173990)1.000:0.039623965)0.086:0.011346465)0.637:0.016888732)0.916:0.012445916,38854:0.121715265)0.904:0.011560471,(((109556:0.095088001,(83619:0.094093818,(40531:0.117018280,104854:0.036454146)0.984:0.026338430)0.842:0.014138373)0.970:0.022170477,(16077:0.123788831,(92528:0.127847725,(102607:0.120078923,(84810:0.012084286,3353:0.009791907)1.000:0.066145614)1.000:0.060949527)0.799:0.022206872)0.572:0.023522439)0.850:0.019912603,(114317:0.138869365,((103543:0.093971338,(78515:0.080975889,114176:0.182642039)0.991:0.041758154)0.996:0.047266735,((100492:0.037402409,104661:0.040115599)0.000:0.006983809,((25310:0.014442218,100957:0.035723850)0.885:0.005731463,22197:0.059777548)0.875:0.006214584)1.000:0.086547030)0.151:0.010858164)0.389:0.016827831)0.878:0.013183583);\n";
+
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let actual = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "cat": 5}),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(actual, EXPECTED);
+    }
+
+    /// `cat < 1` is rejected.
+    #[test]
+    fn test_cat_zero_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err = apply_json_to_config(&serde_json::json!({"cat": 0}), &mut cfg).unwrap_err();
+        assert!(err.contains("cat"), "expected 'cat' in error, got: {err}");
+    }
+
+    // === Phase 1, knob 8: noml ===
+
+    /// `noml=true` is exactly equivalent to `mlnni=0` (same C field set
+    /// to 0, same Newick output). The dedicated parity reference is the
+    /// same file as `mlnni 0`:
+    ///   conda run -n fasttree FastTree -nt -seed 12345 -noml \
+    ///       /tmp/16S.1.50seq.fasta
+    #[test]
+    fn test_noml_eq_mlnni_zero() {
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let mlnni_zero = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "mlnni": 0}),
+                true,
+            )
+        }
+        .unwrap();
+        let noml_true = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "noml": true}),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(noml_true, mlnni_zero);
+    }
+
+    /// `noml=true && mlnni > 0` is a config conflict.
+    #[test]
+    fn test_noml_with_mlnni_positive_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err = apply_json_to_config(&serde_json::json!({"noml": true, "mlnni": 5}), &mut cfg)
+            .unwrap_err();
+        assert!(
+            err.contains("conflict") && err.contains("mlnni") && err.contains("noml"),
+            "expected conflict error mentioning mlnni and noml, got: {err}"
+        );
+    }
+
+    /// `noml=true && mlnni=0` is fine (both express the same intent).
+    #[test]
+    fn test_noml_with_mlnni_zero_ok() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        apply_json_to_config(&serde_json::json!({"noml": true, "mlnni": 0}), &mut cfg)
+            .expect("noml + mlnni=0 must be accepted");
+        assert_eq!(cfg.ml_nni_rounds, 0);
     }
 }
