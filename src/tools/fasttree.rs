@@ -176,6 +176,9 @@ fn output_schema() -> Schema {
 ///   false → disable (`pseudo_weight = 0.0`, the C default).
 /// - `pseudo_weight`: f64 ≥ 0. Only meaningful with `pseudo = true`;
 ///   setting it without explicitly enabling pseudo is an error.
+/// - `nni`: i64 ≥ 0 → `nni_rounds`. Absent/null = auto (C default -1,
+///   which the C library expands to `4*log2(N)`). Negative explicit
+///   values are rejected — use absent for "auto" instead of `-1`.
 fn apply_json_to_config(
     config: &serde_json::Value,
     ft_config: &mut FastTreeConfig,
@@ -244,6 +247,16 @@ fn apply_json_to_config(
             ft_config.pseudo_weight = 0.0;
         }
         None => {} // leave at C default (0.0)
+    }
+
+    // nni
+    if let Some(v) = config.get("nni").and_then(|v| v.as_i64()) {
+        if v < 0 {
+            return Err(format!(
+                "nni must be >= 0 (got {v}); omit the field to use the C library's auto default"
+            ));
+        }
+        ft_config.nni_rounds = v as c_int;
     }
 
     Ok(())
@@ -388,6 +401,13 @@ impl GplTool for FastTreeTool {
                     param_type: "number",
                     default: serde_json::json!(1.0),
                     description: "Pseudocount weight (>= 0). Only meaningful when pseudo=true; default is 1.0 in that case.",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "nni",
+                    param_type: "integer",
+                    default: serde_json::json!(null),
+                    description: "ME-NNI rounds (>= 0). Omit (or set to JSON null) to use the C library's auto default of 4*log2(N).",
                     allowed_values: vec![],
                 },
             ],
@@ -1504,5 +1524,66 @@ mod tests {
             err.contains("pseudo_weight"),
             "expected 'pseudo_weight' in error, got: {err}"
         );
+    }
+
+    // === Phase 1, knob 3: nni ===
+
+    /// `nni=0` disables ME-NNI rounds. The JSON `nni` knob is **literal**:
+    /// it sets only `nni_rounds`. The upstream `FastTree` CLI's `-nni 0`
+    /// has a side effect (`if (nni == 0) spr = 0;` at FastTree.c:1793-1794)
+    /// that our JSON does NOT replicate — users who want both 0 must set
+    /// both knobs explicitly.
+    ///
+    /// Regenerated with the matching explicit-spr CLI command:
+    ///   conda run -n fasttree FastTree -nt -seed 12345 -nni 0 -spr 2 \
+    ///       /tmp/16S.1.50seq.fasta
+    /// (`-spr 2` is the C default, exposed explicitly to bypass the CLI's
+    /// nni=0-implies-spr=0 ergonomic shortcut.)
+    #[test]
+    fn test_nni_0_parity() {
+        const EXPECTED: &str = "((10607:0.108727492,1828:0.122617398)0.968:0.029784799,((((112138:0.033885106,11326:0.060068663)1.000:0.139823967,(72728:0.469273144,(2181:0.170588596,(77434:0.082690265,(99565:0.092547454,101540:0.104778159)0.801:0.027297039)0.978:0.045948800)0.997:0.073101317)0.890:0.044420449)0.922:0.017370695,((105325:0.067029726,11179:0.058741248)1.000:0.135246333,(((109612:0.038445420,(52575:0.041635714,19103:0.029247013)0.825:0.010774281)1.000:0.071841341,(72638:0.036019104,(69848:0.052301378,(8071:0.038996215,((102957:0.037011804,(37204:0.032885573,(9944:0.010843985,9669:0.016841290)0.944:0.009616043)1.000:0.031377331)0.969:0.017795156,(75690:0.052939225,114738:0.048955598)0.188:0.004987029)1.000:0.051601455)0.926:0.026254638)0.889:0.016843267)0.499:0.012701688)0.999:0.048408226,(111880:0.082925256,(29930:0.067479603,((100639:0.061375677,(54630:0.028631254,65474:0.058989976)0.981:0.023574419)0.063:0.007656000,(89315:0.034812762,(5903:0.034323537,101793:0.046064524)1.000:0.116236342)0.461:0.010309296)0.995:0.029258136)0.610:0.023606872)1.000:0.038932815)0.293:0.011675856)0.322:0.015311587)0.916:0.013617207,38854:0.119745068)0.925:0.012283886,(((109556:0.094711935,(83619:0.093304769,(40531:0.116098457,104854:0.036481199)0.988:0.026154301)0.861:0.013688555)0.964:0.022624288,(16077:0.122036648,(92528:0.125166401,(102607:0.120186758,(84810:0.012379073,3353:0.009442396)1.000:0.064244762)1.000:0.061086316)0.614:0.021412278)0.841:0.024117056)0.688:0.017161374,((103543:0.090887103,(78515:0.081205045,114176:0.179495837)0.994:0.040873850)0.997:0.048794839,(114317:0.128770684,((100492:0.037183535,104661:0.039529320)0.251:0.007801598,((25310:0.014386283,100957:0.035791539)0.877:0.005488249,22197:0.059582329)0.601:0.005618889)1.000:0.080181655)0.091:0.017948449)0.500:0.017998326)0.921:0.015063043);\n";
+
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let actual = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "nni": 0}),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(actual, EXPECTED);
+    }
+
+    /// `nni` absent ≡ baseline (the C library auto-default).
+    #[test]
+    fn test_nni_absent_is_auto() {
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let baseline = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345}),
+                true,
+            )
+        }
+        .unwrap();
+        let nni_null = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "nni": null}),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(baseline, nni_null);
+    }
+
+    /// Negative explicit `nni` is rejected (use absent for auto).
+    #[test]
+    fn test_nni_negative_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err = apply_json_to_config(&serde_json::json!({"nni": -2}), &mut cfg).unwrap_err();
+        assert!(err.contains("nni"), "expected 'nni' in error, got: {err}");
     }
 }
