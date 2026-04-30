@@ -197,6 +197,58 @@ The binary supports introspection flags (no stdin required):
 
 These let miint programmatically discover capabilities without hardcoding.
 
+### Tool config introspection — three independent versions
+
+`--describe <tool>` returns three integer version fields. They have
+distinct bump policies and are NOT substitutes for each other:
+
+- `schema_version` — output Arrow schema only. Bumped when a column
+  is added/renamed/removed, a column type changes, or null-translation
+  semantics shift. A caller decoding a batch response checks this to
+  fail fast on a schema mismatch.
+- `describe_version` — `--describe` introspection surface. Bumped on
+  any change to `config_params` (add/rename/remove, type/default/
+  allowed-values edit) or `response_metadata` (documentation-only,
+  does not affect Arrow). `input_schema` / `output_schema` edits also
+  bump this, but those always co-bump `schema_version`. A caller
+  doing capability detection ("does this tool advertise knob X?")
+  checks this.
+- `protocol_version` — wire envelope (init/batch/shutdown shape).
+  Lives on the init reply, not in `--describe`. Bumped on any
+  breaking change to the JSON envelope. A caller speaking the wire
+  protocol checks this.
+
+Current landmark values (see `src/tools/mod.rs::tests::test_describe_version_landmarks`):
+fasttree=3, prodigal/sortmerna/bowtie2-align/bowtie2-build=1.
+fasttree's history is documented in a CHANGELOG block above its
+`describe()` method. When you intentionally edit a `--describe`
+surface, bump the version in that tool's `describe()` AND update
+the landmark assertion in the same commit.
+
+### FastTree threads
+
+`build.rs` defines `-DOPENMP -fopenmp` for fasttree's `cc::Build` and
+links the appropriate OpenMP runtime at link time:
+- Linux: probes `-fopenmp` via `cc::Build::is_flag_supported` (panics
+  with a remediation message if absent), then picks `gomp` (gcc) or
+  `omp` (clang) based on `cc::Compiler::is_like_clang()`.
+- macOS: locates Homebrew libomp via `brew --prefix libomp` with
+  `/opt/homebrew/opt/libomp` and `/usr/local/opt/libomp` fallbacks;
+  requires both `<omp.h>` and the actual `libomp.dylib`/`.a`.
+  Fails fast (`brew install libomp`) if missing.
+
+The `threads` JSON knob defaults to `1` regardless of the C library's
+default (which would be `0`, meaning "consult `OMP_NUM_THREADS`").
+Reproducibility-by-default; users explicitly opt in to parallelism.
+At `threads=1`, OpenMP and non-OpenMP builds produce bit-equal trees
+(the submodule team's fix at `2a6c14b` added a runtime
+`omp_get_max_threads() == 1` gate on the `MLQuartetNNI` star-topology
+override). At `threads > 1`, FastTree's parallel sections produce
+floating-point non-determinism — same seed, same inputs, different
+trees across thread counts. **Submodule pin must stay ≥ `2a6c14b`**
+or the OpenMP build will diverge from the non-OpenMP build at one
+thread.
+
 ## Key conventions
 
 - **Rust edition 2021**, standard cargo project
@@ -317,6 +369,55 @@ clean exit code 0; in-flight batches complete before exit.
 - `n_children: Int32` -- 0 for tips
 - `is_tip: Boolean` -- whether node is a tip (renamed from `is_leaf`)
 - `name: Utf8` (nullable) -- tip name, NULL for internal nodes
+
+**FastTree config knobs** (`describe_version=3`; full surface in
+`gpl-boundary --describe fasttree`):
+
+| Knob | Type | Default | Notes |
+|---|---|---|---|
+| `seq_type` | string | `"auto"` | `auto` / `nucleotide` / `protein` |
+| `seed` | i64 | `314159` | RNG seed |
+| `verbose` | bool | `false` | Routes the C log callback to stderr |
+| `bootstrap` | i64 ≥ 0 | `1000` | SH-like local-support resamples; 0 disables |
+| `nosupport` | bool | `false` | Synthesizes `bootstrap=0`; conflicts with `bootstrap > 0` |
+| `pseudo` | bool | `false` | Gates `pseudo_weight` |
+| `pseudo_weight` | f64 ≥ 0 | `1.0` (when `pseudo=true`) | Requires `pseudo=true` |
+| `nni` | i64 ≥ 0 / null | auto (`4*log2(N)`) | ME-NNI rounds; null = library default |
+| `spr` | i64 ≥ 0 | `2` | SPR rounds. `nni=0` does NOT auto-imply `spr=0` (literal-not-CLI) |
+| `mlnni` | i64 ≥ 0 / null | auto (`2*log2(N)`) | ML-NNI rounds; 0 disables ML NNI |
+| `mlacc` | i64 ≥ 1 | `1` | ML branch-length optimization rounds |
+| `cat` | i64 ≥ 1 | `20` | CAT rate categories |
+| `noml` | bool | `false` | Synthesizes `mlnni=0`; conflicts with `mlnni > 0` |
+| `threads` | i64 ≥ 1 | `1` | OpenMP threads. See `FastTree threads` below |
+| `model` | string | `"auto"` | `auto`/`jtt`/`lg`/`wag`/`jc`/`gtr`. Cross-type rejection vs `seq_type` |
+| `gtrrates` | [f64;6] ≥ 0 | (estimated) | `[ac, ag, at, cg, ct, gt]`; only with `model="gtr"` |
+| `gtrfreq` | [f64;4] ≥ 0 | (estimated) | `[A, C, G, T]`; only with `model="gtr"`. FastTree normalizes |
+| `slow` | bool | `false` | Exhaustive NJ. Synthesizes `use_top_hits=0` to dodge the C library's `slow + tophits` assert. Mutually exclusive with `top=true` and explicit `topm` (the JSON adapter rejects, doesn't silently override). |
+| `bionj` | bool | `false` | Weighted joins; conflicts with `nj=true` |
+| `nj` | bool | `false` | Synthesizes `use_bionj=0`; conflicts with `bionj=true` |
+| `top` | bool | `true` | Top-hits heuristic; conflicts with `notop=true` and `slow=true` |
+| `notop` | bool | `false` | Synthesizes `use_top_hits=0`; conflicts with explicit `topm` |
+| `topm` | f64 > 0 | `1.0` | sqrt(N) top-hits multiplier; conflicts with `slow=true`/`notop=true` |
+| `quote` | bool | `false` | Sets `quote_names`. Not observable via the SOA→Arrow path; for future Newick-emitting clients |
+| `fastest` | bool | `false` | **Rejected when `true`** (returns a JSON error response, not a tree). Library API exposes only a subset of CLI's `-fastest` (missing `tophitsRefresh`/`useTopHits2nd`); revisit when upstream catches up. |
+| `gamma` | bool | `false` | Reports `gamma_log_lk` AND rescales every branch length by the fitted gamma factor. Topology (clade structure) unchanged; downstream consumers mixing gamma and non-gamma output will see different branch length numerics on the same tree. |
+
+The JSON adapter is **literal**: it does not replicate CLI auto-derivations (e.g. CLI's `-nni 0` setting `spr=0`, or `-fastest` clamping `nni` to 2). Cross-knob conflicts are surfaced as JSON errors, not silently downgraded. `fasttree_config_init` is called immediately before `apply_json_to_config`, so any knob the user omits sits at its C-library default.
+
+**Not exposed** (require upstream `ext/fasttree` API additions; out
+of scope for this engagement). Listed with the load-bearing
+omission first:
+
+- **`intree`** — the most consequential cut. miint's
+  `phylogeny_fasttree` integration cannot ship a "refine an
+  existing tree" workflow without it. The C API has no in-memory
+  tree input; a Rust-side SOA→Newick translation was rejected as
+  the wrong layer.
+- The rest, alphabetically: `close`, `constraints`, `intree1`,
+  `matrix`, `mllen`, `nocat`, `nomatrix`, `nome`, `rawdist`,
+  `refresh`, `slownni`, `sprlength`, `trans`. None of these blocks
+  miint's MVP scope on its own; revisit when upstream API support
+  lands.
 
 **Prodigal input** (written by miint to shm_input):
 - `name: Utf8` -- contig identifier

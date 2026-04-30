@@ -55,18 +55,28 @@ FastTree 2>&1 | head -1  # should print "Double precision" (no "OpenMP")
 
 ### Extract the canonical fixture
 
-The 50-sequence prefix of `ext/fasttree/16S_500.tar.gz`'s `16S.1.p` is the
-default fixture. Tests extract this lazily under `target/`:
+The 50-sequence prefix of `ext/fasttree/16S_500.tar.gz`'s `16S.1.p`
+is the default fixture. The Rust test harness extracts the PHYLIP
+file lazily under `target/fasttree-testdata/` once per process via
+`OnceLock` (see `src/test_util.rs::extracted_16s_phylip`). For
+manual regen, you also need a FASTA copy under `target/scratch/`:
 
 ```bash
-mkdir -p target/fasttree-testdata
+mkdir -p target/fasttree-testdata target/scratch
 tar -xzf ext/fasttree/16S_500.tar.gz -C target/fasttree-testdata \
     --strip-components=1 16S500/16S.1.p
+python3 scripts/subset-phylip-to-fasta.py 50 \
+    < target/fasttree-testdata/16S.1.p \
+    > target/scratch/16S.1.50seq.fasta
+python3 scripts/subset-phylip-to-fasta.py 100 \
+    < target/fasttree-testdata/16S.1.p \
+    > target/scratch/16S.1.100seq.fasta
 ```
 
-To produce a 50-sequence subset for native FastTree (which expects PHYLIP
-input), use the helper script (TODO Phase 1: add `scripts/subset-phylip.py`)
-or extract programmatically with the parser in `src/test_util.rs`.
+`target/scratch/` is local-only scratch space and never committed.
+50-seq is the default for parity tests (~1.8 KB Newicks, sub-second
+runs); use 100-seq when the knob's effect doesn't show on 50 (`spr`
+and `notop` are the precedents).
 
 ### Per-knob regeneration
 
@@ -74,9 +84,10 @@ For each parity test, the workflow is:
 
 1. Compute the `seed`, knob values, and fixture used by the test.
 2. Run `FastTree` with the equivalent CLI flags on the same input.
-   Per-test regen commands live in the doc comment above each `_parity`
-   test (the canonical, executable form).
+   The doc comment above each `_parity` test is the canonical,
+   executable form — copy and run.
 3. Replace the test's `EXPECTED` constant with the fresh output.
+4. Run the test; commit if it passes.
 
 Common shape:
 
@@ -85,8 +96,34 @@ conda run -n fasttree FastTree -nt -seed 12345 \
     [knob-flags] target/scratch/16S.1.50seq.fasta > target/scratch/expected.nwk
 ```
 
-When in doubt, check the test's surrounding doc comment — it names the
-exact invocation used to generate its expected output.
+### All wired parity tests (as of Phase 3)
+
+Each line below is the canonical regen invocation for one
+`_parity`-suffixed test. The fixture column shows which fasta the
+test feeds. Tests not listed here (e.g. `_sets_field`, `_rejected`)
+are struct-level or conflict-rejection tests — they do not embed a
+hardcoded Newick and therefore have no regen command.
+
+| Test | Fixture | Regen flags |
+|---|---|---|
+| `test_fasttree_50seq_parity_baseline` | 50 | (none) |
+| `test_fasttree_100seq_parity_baseline` | 100 | (none) |
+| `test_bootstrap_100_parity` | 50 | `-boot 100` |
+| `test_nosupport_parity` | 50 | `-nosupport` |
+| `test_pseudo_default_weight_parity` | 50 | `-pseudo` |
+| `test_pseudo_weight_2_5_parity` | 50 | `-pseudo 2.5` |
+| `test_nni_0_parity` | 50 | `-nni 0 -spr 2` (literal-not-CLI) |
+| `test_spr_0_parity_100seq` | 100 | `-spr 0` |
+| `test_mlnni_0_parity` | 50 | `-mlnni 0` |
+| `test_mlacc_3_parity` | 50 | `-mlacc 3` |
+| `test_cat_5_parity` | 50 | `-cat 5` |
+| `test_threads_1_parity` | 50 | (none — threads=1 = baseline) |
+| `test_model_gtr_parity` | 50 | `-gtr` |
+| `test_bionj_parity` | 50 | `-bionj` |
+| `test_notop_parity_100seq` | 100 | `-notop` |
+| `test_gamma_parity` | 50 | `-gamma` |
+
+The CLI invocation is always `conda run -n fasttree FastTree -nt -seed 12345 [flags] target/scratch/16S.1.<size>seq.fasta`.
 
 ## When to regenerate
 
