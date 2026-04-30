@@ -551,6 +551,7 @@ impl GplTool for ProdigalTool {
             name: "prodigal",
             version: self.version(),
             schema_version: self.schema_version(),
+            describe_version: 1,
             description: "Prokaryotic gene prediction for metagenomic and single-genome sequences",
             config_params: vec![
                 ConfigParam {

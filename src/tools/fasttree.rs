@@ -671,11 +671,19 @@ impl GplTool for FastTreeTool {
         2
     }
 
+    /// CHANGELOG: `describe_version`
+    /// - 1: Phase 1 — bootstrap, nosupport, pseudo, pseudo_weight,
+    ///   nni, spr, mlnni, mlacc, cat, noml.
+    /// - 2: Phase 2 — threads.
+    /// - 3: Phase 3 — model, gtrrates, gtrfreq, slow, bionj, nj,
+    ///   top, notop, topm, quote, fastest (rejected when true),
+    ///   gamma.
     fn describe(&self) -> ToolDescription {
         ToolDescription {
             name: "fasttree",
             version: self.version(),
             schema_version: self.schema_version(),
+            describe_version: 3,
             description:
                 "Approximately-maximum-likelihood phylogenetic trees from sequence alignments",
             config_params: vec![

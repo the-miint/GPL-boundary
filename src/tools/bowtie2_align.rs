@@ -888,6 +888,7 @@ impl GplTool for Bowtie2AlignTool {
             name: "bowtie2-align",
             version: self.version(),
             schema_version: self.schema_version(),
+            describe_version: 1,
             description: "Short read alignment against a bowtie2 index",
             config_params: vec![
                 // Core

@@ -29,11 +29,44 @@ pub struct ConfigParam {
 }
 
 /// Full tool description for programmatic introspection.
+///
+/// Three independent versions live on this surface; they govern
+/// different things and must be bumped independently:
+///
+/// - **`schema_version`** — output Arrow schema only. Bump when
+///   columns change name/type/nullability or when null-translation
+///   semantics change. Lets a caller's columnar reader fail fast
+///   on mismatched expectations. Adding/removing/renaming entries
+///   in `input_schema` or `output_schema` always implies an Arrow
+///   schema change, so those changes bump `schema_version` (and
+///   `describe_version` — they're not mutually exclusive).
+/// - **`describe_version`** — `--describe` introspection surface.
+///   Bump on any change to `config_params` (add/rename/remove,
+///   type/default/allowed-values edit) OR to `response_metadata`
+///   (which is documentation-only — it does not affect the Arrow
+///   output schema). `input_schema` / `output_schema` changes also
+///   bump this, but they always co-bump `schema_version`.
+/// - **`protocol_version`** — wire envelope (init/batch/shutdown
+///   shape). Lives on the init reply, not here. Bump on any
+///   breaking change to the JSON envelope.
+///
+/// A caller polling `--describe` for capability detection should
+/// use `describe_version` to gate "does this tool advertise
+/// knob X?". A caller decoding a batch response should check
+/// `schema_version`. A caller speaking the wire protocol should
+/// check `protocol_version`. None of the three is a substitute
+/// for another.
 #[derive(serde::Serialize)]
 pub struct ToolDescription {
     pub name: &'static str,
     pub version: String,
     pub schema_version: u32,
+    /// Bumped on any `--describe` surface change: `config_params`
+    /// edits, `response_metadata` edits, or `input_schema` /
+    /// `output_schema` edits (the last two also co-bump
+    /// `schema_version`, since they imply Arrow schema changes).
+    /// See the struct doc-comment for the full bump policy.
+    pub describe_version: u32,
     pub description: &'static str,
     pub config_params: Vec<ConfigParam>,
     pub input_schema: Vec<FieldDescription>,
@@ -279,6 +312,66 @@ mod tests {
         assert!(!desc.config_params.is_empty());
         assert!(!desc.input_schema.is_empty());
         assert!(!desc.output_schema.is_empty());
+    }
+
+    /// Every registered tool must advertise a non-zero `describe_version`
+    /// and a non-zero `schema_version`. The two are independent (each
+    /// has its own bump policy — see the `ToolDescription` doc-comment).
+    #[test]
+    fn test_every_tool_describe_version_set() {
+        let names = list_tools();
+        assert!(!names.is_empty(), "tool registry must not be empty");
+        for name in &names {
+            let desc = describe_tool(name).expect("registered tool must describe");
+            assert!(
+                desc.describe_version >= 1,
+                "{name} describe_version must be >= 1, got {}",
+                desc.describe_version
+            );
+            assert!(
+                desc.schema_version >= 1,
+                "{name} schema_version must be >= 1, got {}",
+                desc.schema_version
+            );
+        }
+    }
+
+    /// Describe-version landmarks. `fasttree` is at 3 (Phase 1 + 2 + 3
+    /// bumps); the other four tools start at 1 and will be bumped only
+    /// when their `--describe` surfaces actually change. Asserting the
+    /// exact values guards against accidental unbumped-on-change drift
+    /// and accidental bumped-on-no-change drift in equal measure.
+    #[test]
+    fn test_describe_version_landmarks() {
+        let cases: &[(&str, u32)] = &[
+            ("fasttree", 3),
+            ("prodigal", 1),
+            ("sortmerna", 1),
+            ("bowtie2-align", 1),
+            ("bowtie2-build", 1),
+        ];
+        for (name, expected) in cases {
+            let desc = describe_tool(name).expect("registered tool must describe");
+            assert_eq!(
+                desc.describe_version, *expected,
+                "{name} describe_version drifted from documented landmark {expected}: \
+                 if you intentionally added/renamed/removed a config_param or schema field, \
+                 bump describe_version in {name}.rs's describe() and update this assertion"
+            );
+        }
+    }
+
+    /// The serialized JSON form actually contains `describe_version`
+    /// (this is what miint sees over the wire). Catches any future
+    /// `#[serde(skip)]` accident.
+    #[test]
+    fn test_describe_version_serializes() {
+        let desc = describe_tool("fasttree").unwrap();
+        let json = serde_json::to_value(&desc).unwrap();
+        assert_eq!(
+            json["describe_version"].as_u64(),
+            Some(desc.describe_version as u64)
+        );
     }
 
     // -- StreamingContext and streaming_setup tests --

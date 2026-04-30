@@ -542,6 +542,7 @@ impl GplTool for SortMeRnaTool {
             name: "sortmerna",
             version: self.version(),
             schema_version: self.schema_version(),
+            describe_version: 1,
             description: "rRNA filtering and sequence alignment against reference databases",
             config_params: vec![
                 ConfigParam {

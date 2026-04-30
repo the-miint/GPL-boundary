@@ -213,6 +213,7 @@ impl GplTool for Bowtie2BuildTool {
             name: "bowtie2-build",
             version: self.version(),
             schema_version: self.schema_version(),
+            describe_version: 1,
             description: "Build a bowtie2 index from in-memory FASTA-style sequences",
             config_params: vec![
                 ConfigParam {
