@@ -33,6 +33,16 @@ Single-threaded FastTree is deterministic given a fixed seed. All parity
 tests in this repo run with `threads=1`. Multi-thread tests assert
 statistical/topology invariants only.
 
+**Use the non-OpenMP `FastTree` binary.** Phase 2 enabled OpenMP in
+`build.rs` (`-DOPENMP -fopenmp`); the FastTree submodule at SHA
+`2a6c14b` gates the `MLQuartetNNI` star-topology override on
+`omp_get_max_threads() == 1` at runtime, so OpenMP and non-OpenMP
+builds produce bit-equal trees at one thread. Bioconda's
+`fasttree=2.2.0` `FastTree` (no OpenMP) is the canonical reference.
+Bioconda's `FastTreeMP` is **not** suitable as ground truth: it
+predates the `2a6c14b` fix and still produces divergent trees at
+`OMP_NUM_THREADS=1`.
+
 ## Regenerating expected Newicks
 
 ### One-time setup
@@ -40,7 +50,7 @@ statistical/topology invariants only.
 ```bash
 conda activate fasttree
 which FastTree   # confirm bioconda's FastTree is on $PATH
-FastTree -expert 2>&1 | head -5  # confirm version matches ext/fasttree
+FastTree 2>&1 | head -1  # should print "Double precision" (no "OpenMP")
 ```
 
 ### Extract the canonical fixture
@@ -64,18 +74,19 @@ For each parity test, the workflow is:
 
 1. Compute the `seed`, knob values, and fixture used by the test.
 2. Run `FastTree` with the equivalent CLI flags on the same input.
-3. Replace the test's `EXPECTED_NEWICK` constant with the fresh output.
+   Per-test regen commands live in the doc comment above each `_parity`
+   test (the canonical, executable form).
+3. Replace the test's `EXPECTED` constant with the fresh output.
 
-The flag mapping per Phase-1/Phase-3 knob is documented in the test that
-introduces it. As of this writing the expected-output blocks are:
+Common shape:
 
-| Test | Conda command (TODO populate during Phase 1) |
-|---|---|
-| `test_fasttree_16s_50seq_default_threads1` | `FastTree -nt -seed 12345 -nosupport <fixture>` |
-| (more entries land per Phase 1 / Phase 3 commit) | |
+```bash
+conda run -n fasttree FastTree -nt -seed 12345 \
+    [knob-flags] target/scratch/16S.1.50seq.fasta > target/scratch/expected.nwk
+```
 
 When in doubt, check the test's surrounding doc comment — it names the
-exact `FastTree` invocation used to generate its expected output.
+exact invocation used to generate its expected output.
 
 ## When to regenerate
 

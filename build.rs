@@ -12,26 +12,124 @@ fn main() {
 /// Compile FastTree C sources into a static library.
 /// Each submodule gets its own build function and separate .a output
 /// to prevent symbol collisions between C libraries.
+///
+/// OpenMP: `-DOPENMP` activates the parallel pragmas + omp_lock_t fields
+/// in `fasttree_internal.h`. Without it, `#pragma omp parallel for` is
+/// dropped and `n_threads` from `FastTreeConfig` has no effect. The
+/// submodule's `MLQuartetNNI` (since `2a6c14b`) gates its single-thread
+/// override on `omp_get_max_threads() == 1` at runtime, so OpenMP and
+/// non-OpenMP builds produce bit-equal trees at `n_threads=1`; parity
+/// baselines are regenerated against the non-OpenMP `FastTree` binary.
+/// See `GUIDANCE_PARITY_TESTS.md`.
 fn build_fasttree() {
     let dir = PathBuf::from("ext/fasttree");
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
-    cc::Build::new()
+    let mut build = cc::Build::new();
+    build
         .file(dir.join("fasttree_core.c"))
         .file(dir.join("fasttree_api.c"))
         .include(&dir)
         .define("FASTTREE_NO_MAIN", None)
         .define("USE_DOUBLE", None)
+        .define("OPENMP", None)
         .flag("-fvisibility=hidden")
         .opt_level(3)
         .flag_if_supported("-finline-functions")
         .flag_if_supported("-funroll-loops")
-        .warnings(false)
-        .compile("fasttree_c");
+        .warnings(false);
+
+    if target_os == "macos" {
+        // Apple's clang ships without libomp. Probe Homebrew's libomp and
+        // fail-fast if missing — `-fopenmp` would otherwise be silently
+        // accepted by the preprocessor while the runtime symbols never
+        // resolve, leaving `n_threads` a no-op without any error.
+        let libomp = locate_macos_libomp();
+        build
+            .flag("-Xpreprocessor")
+            .flag("-fopenmp")
+            .include(libomp.join("include"));
+        println!(
+            "cargo:rustc-link-search=native={}",
+            libomp.join("lib").display()
+        );
+        println!("cargo:rustc-link-lib=omp");
+    } else {
+        // Linux + other Unix: GCC and Clang both accept `-fopenmp` for
+        // the *compiler* (it enables the pragmas + sets the omp_* macros),
+        // but they ship different runtime libraries — GCC needs `gomp`,
+        // Clang needs `omp`. Refusing `-fopenmp` outright is rare on
+        // Linux but possible on minimal toolchains; treat it as
+        // configuration error rather than letting the link fail with a
+        // cryptic `__kmpc_*` undefined-symbol message.
+        if !build.is_flag_supported("-fopenmp").unwrap_or(false) {
+            panic!(
+                "Compiler does not accept `-fopenmp`. FastTree's `threads` knob \
+                 requires an OpenMP-capable C compiler. Install GCC, or a Clang \
+                 with libomp headers, and re-run."
+            );
+        }
+        build.flag("-fopenmp");
+        let compiler = build.get_compiler();
+        let runtime = if compiler.is_like_clang() {
+            "omp"
+        } else {
+            "gomp"
+        };
+        println!("cargo:rustc-link-lib={runtime}");
+    }
+
+    build.compile("fasttree_c");
 
     println!("cargo:rerun-if-changed=ext/fasttree/fasttree_core.c");
     println!("cargo:rerun-if-changed=ext/fasttree/fasttree_api.c");
     println!("cargo:rerun-if-changed=ext/fasttree/fasttree.h");
     println!("cargo:rerun-if-changed=ext/fasttree/fasttree_internal.h");
+}
+
+/// Find a usable Homebrew libomp installation on macOS, or panic with a
+/// clear remediation message. Apple's clang does not ship libomp; without
+/// this guard the build would either fail at link time with cryptic
+/// `__kmpc_*` symbol errors, or — worse — succeed but leave OpenMP
+/// pragmas as no-ops because `<omp.h>` isn't on the include path.
+fn locate_macos_libomp() -> PathBuf {
+    // `brew --prefix libomp` is the source of truth; fall back to the
+    // standard Apple-Silicon and Intel-mac install prefixes if `brew`
+    // isn't on PATH (e.g., a CI image with libomp installed manually).
+    let candidates = [
+        std::process::Command::new("brew")
+            .args(["--prefix", "libomp"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    String::from_utf8(o.stdout)
+                        .ok()
+                        .map(|s| PathBuf::from(s.trim()))
+                } else {
+                    None
+                }
+            }),
+        Some(PathBuf::from("/opt/homebrew/opt/libomp")),
+        Some(PathBuf::from("/usr/local/opt/libomp")),
+    ];
+    // Require both the header AND the actual dylib (or static lib) — a
+    // half-installed prefix where `lib/` exists but `libomp.dylib` is
+    // missing would otherwise pass the `is_dir()` check and the link
+    // would fail later with cryptic `__kmpc_*` errors.
+    for p in candidates.into_iter().flatten() {
+        let has_dylib = p.join("lib/libomp.dylib").is_file();
+        let has_static = p.join("lib/libomp.a").is_file();
+        if p.join("include/omp.h").is_file() && (has_dylib || has_static) {
+            return p;
+        }
+    }
+    panic!(
+        "OpenMP runtime (libomp) not found on macOS. Install with:\n\
+         \n    brew install libomp\n\n\
+         FastTree needs OpenMP to honor the `threads` config knob. \
+         Checked: `brew --prefix libomp`, /opt/homebrew/opt/libomp, /usr/local/opt/libomp."
+    );
 }
 
 /// Compile Prodigal C sources into a static library.

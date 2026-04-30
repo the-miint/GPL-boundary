@@ -207,6 +207,12 @@ fn checked_cint(name: &str, v: i64) -> Result<c_int, String> {
 /// - `cat`: i64 ≥ 1 → `n_rate_cats`. Absent = C default (20).
 /// - `noml`: bool. true → `ml_nni_rounds = 0` (synthesizes
 ///   "disable ML NNI"). Mutually exclusive with explicit `mlnni > 0`.
+/// - `threads`: i64 ≥ 1 → `n_threads`. Absent = 1 (the adapter
+///   overrides the C library's default of 0, which would otherwise
+///   consult `OMP_NUM_THREADS`). Reproducibility-by-default;
+///   parallelism is opt-in. Values >1 trade topology determinism
+///   for speed (FastTree's NNI/SPR phases produce floating-point
+///   non-determinism across thread counts).
 fn apply_json_to_config(
     config: &serde_json::Value,
     ft_config: &mut FastTreeConfig,
@@ -341,6 +347,19 @@ fn apply_json_to_config(
         }
         ft_config.n_rate_cats = checked_cint("cat", v)?;
     }
+
+    // threads
+    // The C library's default `n_threads = 0` consults `OMP_NUM_THREADS`,
+    // which would make adapter behavior depend on the daemon's
+    // environment. We override to 1 unless the caller explicitly opts
+    // in — single-thread is deterministic, multi-thread is not.
+    let threads = config.get("threads").and_then(|v| v.as_i64()).unwrap_or(1);
+    if threads < 1 {
+        return Err(format!(
+            "threads must be >= 1 (got {threads}); set explicitly or omit for default 1"
+        ));
+    }
+    ft_config.n_threads = checked_cint("threads", threads)?;
 
     Ok(())
 }
@@ -512,6 +531,13 @@ impl GplTool for FastTreeTool {
                     param_type: "boolean",
                     default: serde_json::json!(false),
                     description: "Disable ML phase entirely (synthesizes mlnni=0). Mutually exclusive with explicit mlnni > 0.",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "threads",
+                    param_type: "integer",
+                    default: serde_json::json!(1),
+                    description: "OpenMP thread count (>= 1). The adapter defaults to 1 for reproducibility — the C library's default of 0 (which consults OMP_NUM_THREADS) is intentionally not exposed. Values >1 parallelize NJ/NNI/SPR phases at the cost of topology determinism: FastTree's parallel sections produce floating-point non-determinism across thread counts, so identical seeds + identical inputs may yield different trees at threads > 1.",
                     allowed_values: vec![],
                 },
             ],
@@ -1933,6 +1959,156 @@ mod tests {
         apply_json_to_config(&serde_json::json!({"noml": true, "mlnni": 0}), &mut cfg)
             .expect("noml + mlnni=0 must be accepted");
         assert_eq!(cfg.ml_nni_rounds, 0);
+    }
+
+    // === Phase 2: threads ===
+
+    /// `threads=1` reproduces the existing 50-seq parity baseline, proving
+    /// the JSON knob plumbs through to `n_threads` and that single-thread
+    /// execution under OpenMP is deterministic.
+    ///
+    /// Unlike the higher-thread sanity test below, this one *can* assert
+    /// byte-equality on the Newick because OpenMP at one thread runs the
+    /// `#pragma omp parallel for` loops sequentially, in the same order
+    /// the non-parallel build would.
+    #[test]
+    fn test_threads_1_parity() {
+        // Same expected Newick as `test_fasttree_50seq_parity_baseline`.
+        // Inlined rather than referenced to keep each parity test
+        // self-contained (the const naming convention assumes one EXPECTED
+        // per fn).
+        const EXPECTED: &str = "((10607:0.108728183,1828:0.122617756)0.968:0.029784172,((((112138:0.033883874,11326:0.060069834)1.000:0.139823276,(72728:0.469274735,(2181:0.170590261,(77434:0.082689947,(99565:0.092547907,101540:0.104777748)0.801:0.027296752)0.978:0.045947821)0.997:0.073100991)0.890:0.044420886)0.922:0.017371404,((105325:0.067027677,11179:0.058740204)1.000:0.135281789,(((109612:0.038444192,(52575:0.041602501,19103:0.029245209)0.825:0.010775536)1.000:0.071852375,((69848:0.052322287,(8071:0.038960071,((102957:0.036993227,(37204:0.032886181,(9944:0.010841675,9669:0.016835590)0.944:0.009614309)1.000:0.031400631)0.969:0.017801804,(75690:0.052930806,114738:0.048955244)0.188:0.004986093)1.000:0.051618818)0.926:0.026253833)0.890:0.016831614,72638:0.036015850)0.501:0.012705519)0.999:0.048395482,(111880:0.082925522,(29930:0.067479705,((100639:0.061363527,(54630:0.028632074,65474:0.058988375)0.981:0.023574978)0.063:0.007656523,(89315:0.034813563,(5903:0.034324338,101793:0.046061462)1.000:0.116234675)0.461:0.010309408)0.995:0.029255734)0.611:0.023606761)1.000:0.038934525)0.293:0.011670275)0.322:0.015313215)0.916:0.013617425,38854:0.119745452)0.925:0.012283122,(((109556:0.094712097,(83619:0.093304494,(40531:0.116098375,104854:0.036481237)0.988:0.026154190)0.861:0.013688556)0.964:0.022623573,(16077:0.122036067,(92528:0.125166108,(102607:0.120186435,(84810:0.012379015,3353:0.009442461)1.000:0.064244782)1.000:0.061086276)0.614:0.021412930)0.841:0.024118426)0.688:0.017162443,((103543:0.090887321,(78515:0.081205030,114176:0.179495854)0.994:0.040873948)0.997:0.048795167,(114317:0.128771221,((100492:0.037183916,104661:0.039529991)0.251:0.007801462,((25310:0.014386300,100957:0.035791254)0.877:0.005488228,22197:0.059582638)0.602:0.005619043)1.000:0.080180535)0.091:0.017948287)0.500:0.017997704)0.921:0.015062351);\n";
+
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let actual = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "threads": 1}),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(actual, EXPECTED);
+    }
+
+    /// `threads=4` produces a structurally valid tree, but FastTree's
+    /// parallel NJ/NNI/SPR phases are non-deterministic across thread
+    /// counts (top-hit selection order, floating-point reductions —
+    /// see the OpenMP comment block in `ext/fasttree/fasttree_core.c`),
+    /// so we deliberately do NOT assert byte-equal Newick. Instead:
+    ///
+    /// - The leaf set must equal the input set (no sequences lost).
+    /// - The rooted-tree invariant `sum(n_children) == n_nodes - 1`
+    ///   must hold.
+    /// - Final log-likelihood must be finite and negative — what this
+    ///   test can actually guarantee. A tighter numeric bound would be
+    ///   theatre: for a 50-seq 16S alignment the log-likelihood lives
+    ///   near -75k nats, so even a 1% relative tolerance ≈ 750 nats of
+    ///   slack — wide enough to mask a serious topology regression.
+    ///   Topology errors are detected upstream by the leaf-set and
+    ///   tree-shape checks; the log-likelihood assertion only catches
+    ///   the *kind* of regression numerics can produce (NaN/Inf).
+    #[test]
+    fn test_threads_4_sanity() {
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+
+        let input_name = unique_shm_name("ft-threads-4");
+        let batch = make_input_batch_owned(&alignment);
+        let _shm = write_arrow_to_shm(&input_name, &batch);
+        let resp = FastTreeTool.execute(
+            &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "threads": 4}),
+            &input_name,
+        );
+        assert!(resp.success, "threads=4 failed: {:?}", resp.error);
+
+        let result = resp.result.as_ref().unwrap();
+        let n_nodes = result["n_nodes"].as_i64().unwrap() as usize;
+        let n_leaves = result["n_leaves"].as_i64().unwrap() as usize;
+        assert_eq!(n_leaves, alignment.len(), "no leaves lost at threads=4");
+
+        let out_batches = read_arrow_from_shm(&resp.shm_outputs[0].name);
+        let out = &out_batches[0];
+
+        // Every input name appears as a tip exactly once.
+        let names_col = out
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let is_tip = out
+            .column_by_name("is_tip")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let mut leaf_names: Vec<&str> = (0..out.num_rows())
+            .filter(|&i| is_tip.value(i))
+            .map(|i| names_col.value(i))
+            .collect();
+        leaf_names.sort();
+        let mut expected_names: Vec<&str> = alignment.iter().map(|(n, _)| n.as_str()).collect();
+        expected_names.sort();
+        assert_eq!(leaf_names, expected_names, "leaf set must match input");
+
+        // Tree-shape invariant.
+        let n_children = out
+            .column_by_name("n_children")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let total: i64 = (0..n_nodes).map(|i| n_children.value(i) as i64).sum();
+        assert_eq!(total, (n_nodes - 1) as i64);
+
+        // Log-likelihood is finite and negative (the only numeric
+        // assertion we can make without re-deriving FastTree's expected
+        // output for this specific 4-thread interleaving).
+        let lk = result["stats"]["log_likelihood"].as_f64().unwrap();
+        assert!(
+            lk.is_finite() && lk < 0.0,
+            "log_likelihood not finite-negative: {lk}"
+        );
+
+        let _ = SharedMemory::unlink(&resp.shm_outputs[0].name);
+    }
+
+    /// `threads=0` is rejected — the C library treats 0 as "consult
+    /// OMP_NUM_THREADS", which we deliberately do not expose.
+    #[test]
+    fn test_threads_zero_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err = apply_json_to_config(&serde_json::json!({"threads": 0}), &mut cfg).unwrap_err();
+        assert!(
+            err.contains("threads"),
+            "expected 'threads' in error, got: {err}"
+        );
+    }
+
+    /// Negative `threads` is rejected.
+    #[test]
+    fn test_threads_negative_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err = apply_json_to_config(&serde_json::json!({"threads": -3}), &mut cfg).unwrap_err();
+        assert!(
+            err.contains("threads"),
+            "expected 'threads' in error, got: {err}"
+        );
+    }
+
+    /// Absent `threads` defaults to 1, NOT to the C library's 0
+    /// (which would consult OMP_NUM_THREADS).
+    #[test]
+    fn test_threads_absent_defaults_to_one() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        apply_json_to_config(&serde_json::json!({}), &mut cfg).unwrap();
+        assert_eq!(
+            cfg.n_threads, 1,
+            "default must override the C library's 0 (which consults OMP_NUM_THREADS)"
+        );
     }
 
     // === Range-check + UX hygiene (Linus review followups) ===
