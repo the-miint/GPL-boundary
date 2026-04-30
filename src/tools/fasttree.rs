@@ -213,6 +213,54 @@ fn checked_cint(name: &str, v: i64) -> Result<c_int, String> {
 ///   parallelism is opt-in. Values >1 trade topology determinism
 ///   for speed (FastTree's NNI/SPR phases produce floating-point
 ///   non-determinism across thread counts).
+/// - `model`: "auto" (default) | "jtt" | "lg" | "wag" | "jc" | "gtr".
+///   Maps to `fasttree_model_t` enum (0..5). Mutually exclusive with
+///   conflicting `seq_type`: `jtt`/`lg`/`wag` require protein,
+///   `jc`/`gtr` require nucleotide. `auto` is always accepted.
+/// - `gtrrates`: [f64; 6] — `[ac, ag, at, cg, ct, gt]`. Only valid
+///   when `model="gtr"`. All values must be `>= 0`. Setting this
+///   array clears `gtr_from_alignment` (so the supplied rates are
+///   used instead of being estimated).
+/// - `gtrfreq`: [f64; 4] — `[A, C, G, T]`. Same rules as `gtrrates`.
+///   FastTree normalizes the frequencies internally — they need
+///   not sum to exactly 1.0 — but a near-1.0 sum makes intent
+///   self-evident. We deliberately do not enforce the sum.
+/// - `slow`: bool → `slow`. Enables exhaustive (non-heuristic) NJ
+///   search. On well-separated alignments (16S) the heuristic and
+///   exhaustive paths converge to identical output; the knob is
+///   exposed for cases where they don't.
+/// - `bionj`: bool → `use_bionj`. Weighted (BIONJ) joins. Absent =
+///   C default (0 = plain NJ). Mutually exclusive with `nj`.
+/// - `nj`: bool. true → synthesizes `use_bionj = 0` (the C default,
+///   but useful as an explicit assertion). Mutually exclusive with
+///   `bionj=true`.
+/// - `top`: bool → `use_top_hits`. Default 1 (top-hits heuristic
+///   on). Mutually exclusive with `notop=true` and with `slow=true`.
+/// - `notop`: bool. true → synthesizes `use_top_hits = 0`. Mutually
+///   exclusive with `top=true` and with explicit `topm`.
+/// - `topm`: f64 > 0 → `top_hits_mult`. Multiplier on the
+///   `sqrt(N)` top-hits-list size (default 1.0). Rejected when top
+///   hits are disabled (`notop=true` or `slow=true`).
+/// - `quote`: bool → `quote_names`. Enables single-quoting of names
+///   in FastTree's CLI Newick output. Not observable via the SOA →
+///   Arrow path today (the test-only FFI emits raw names), but the C
+///   field is still set so future Newick-emitting clients can honor
+///   it.
+/// - `fastest`: bool. `false` accepted as a no-op (matches C
+///   default). `true` is **rejected** — the C library API's
+///   `fastest` field is a strict subset of the CLI's `-fastest`
+///   flag (the CLI additionally sets `tophitsRefresh = 0.5` and
+///   `useTopHits2nd = true`, both unexposed by the library and on
+///   the user-approved cut list). Setting just `fastest = 1` would
+///   produce a tree distinct from `FastTree -fastest`. Reject
+///   loudly rather than silently mislead the caller; revisit when
+///   the upstream API catches up.
+/// - `gamma`: bool → `gamma_log_lk`. Reports the gamma-rescaled
+///   log-likelihood in `result.stats.gamma_log_lk` AND rescales all
+///   branch lengths by the fitted gamma factor (the C library does
+///   the rescale unconditionally when this is set; see
+///   `fasttree_api.c:373-374`). Tree clade structure is unchanged;
+///   branch length numerics differ from a non-gamma run.
 fn apply_json_to_config(
     config: &serde_json::Value,
     ft_config: &mut FastTreeConfig,
@@ -287,10 +335,9 @@ fn apply_json_to_config(
     }
 
     // nni
-    // TODO(Phase 3 — fastest): when `fastest` lands, the upstream CLI's
-    // `-fastest` clamps `nni_rounds = min(nni_rounds, 2)`. Decide whether
-    // to replicate that or reject `{fastest: true, nni > 2}` explicitly
-    // so users don't get silently downgraded.
+    // The CLI's `-fastest` clamps `nni_rounds = min(nni_rounds, 2)`;
+    // see the `fastest` block below for the explicit conflict the JSON
+    // adapter rejects in lieu of replicating that clamp.
     if let Some(v) = config.get("nni").and_then(|v| v.as_i64()) {
         if v < 0 {
             return Err(format!(
@@ -360,6 +407,203 @@ fn apply_json_to_config(
         ));
     }
     ft_config.n_threads = checked_cint("threads", threads)?;
+
+    // model + gtrrates + gtrfreq.
+    // Resolve the model string before consulting GTR arrays so a single
+    // pass can validate cross-knob constraints. `seq_type` was set above;
+    // 1 = protein, 2 = nucleotide, 0 = auto.
+    let model_str = config.get("model").and_then(|v| v.as_str());
+    let model_value: c_int = match model_str {
+        None | Some("auto") => 0,
+        Some("jtt") => 1,
+        Some("lg") => 2,
+        Some("wag") => 3,
+        Some("jc") => 4,
+        Some("gtr") => 5,
+        Some(other) => {
+            return Err(format!(
+                "invalid model: {other:?}; expected one of \
+                 auto/jtt/lg/wag/jc/gtr"
+            ));
+        }
+    };
+    if let Some(m) = model_str {
+        let is_protein_model = matches!(m, "jtt" | "lg" | "wag");
+        let is_nucleotide_model = matches!(m, "jc" | "gtr");
+        if is_protein_model && ft_config.seq_type == 2 {
+            return Err(format!(
+                "config conflict: model={m:?} is a protein model and cannot be \
+                 combined with seq_type=\"nucleotide\""
+            ));
+        }
+        if is_nucleotide_model && ft_config.seq_type == 1 {
+            return Err(format!(
+                "config conflict: model={m:?} is a nucleotide model and cannot \
+                 be combined with seq_type=\"protein\""
+            ));
+        }
+    }
+    ft_config.model = model_value;
+
+    let gtrrates = config.get("gtrrates");
+    let gtrfreq = config.get("gtrfreq");
+    if (gtrrates.is_some() || gtrfreq.is_some()) && model_value != 5 {
+        return Err(
+            "config conflict: gtrrates/gtrfreq are only valid with model=\"gtr\"".to_string(),
+        );
+    }
+    if let Some(rates) = gtrrates {
+        let arr = rates.as_array().ok_or_else(|| {
+            "gtrrates must be a JSON array of 6 numbers [ac, ag, at, cg, ct, gt]".to_string()
+        })?;
+        if arr.len() != 6 {
+            return Err(format!(
+                "gtrrates must have exactly 6 entries (got {})",
+                arr.len()
+            ));
+        }
+        for (i, v) in arr.iter().enumerate() {
+            let f = v
+                .as_f64()
+                .ok_or_else(|| format!("gtrrates[{i}] is not a number: {v}"))?;
+            if f.is_nan() || f < 0.0 {
+                return Err(format!("gtrrates[{i}] must be >= 0 (got {f})"));
+            }
+            ft_config.gtr_rates[i] = f;
+        }
+        ft_config.gtr_from_alignment = 0;
+    }
+    if let Some(freq) = gtrfreq {
+        let arr = freq
+            .as_array()
+            .ok_or_else(|| "gtrfreq must be a JSON array of 4 numbers [A, C, G, T]".to_string())?;
+        if arr.len() != 4 {
+            return Err(format!(
+                "gtrfreq must have exactly 4 entries (got {})",
+                arr.len()
+            ));
+        }
+        for (i, v) in arr.iter().enumerate() {
+            let f = v
+                .as_f64()
+                .ok_or_else(|| format!("gtrfreq[{i}] is not a number: {v}"))?;
+            if f.is_nan() || f < 0.0 {
+                return Err(format!("gtrfreq[{i}] must be >= 0 (got {f})"));
+            }
+            ft_config.gtr_freq[i] = f;
+        }
+        ft_config.gtr_from_alignment = 0;
+    }
+
+    // slow
+    // The C library asserts on `slow=1 && top_hits_mult > 0` (the
+    // combination is incompatible — slow does exhaustive NJ, top hits
+    // is the heuristic shortcut it replaces). The upstream CLI silently
+    // forces `tophitsMult = 0.0` when `-slow` is set; we mirror that
+    // by zeroing `use_top_hits`, which the C library uses to derive
+    // `tophitsMult`. Knob 4 (top/notop/topm) will reject the explicit
+    // `slow + top` conflict at that layer.
+    if let Some(b) = config.get("slow").and_then(|v| v.as_bool()) {
+        ft_config.slow = i32::from(b);
+        if b {
+            ft_config.use_top_hits = 0;
+        }
+    }
+
+    // bionj + nj
+    let bionj = config.get("bionj").and_then(|v| v.as_bool());
+    let nj = config.get("nj").and_then(|v| v.as_bool());
+    if bionj == Some(true) && nj == Some(true) {
+        return Err(
+            "config conflict: bionj=true and nj=true are mutually exclusive \
+             (BIONJ and NJ are different join algorithms)"
+                .to_string(),
+        );
+    }
+    if let Some(true) = bionj {
+        ft_config.use_bionj = 1;
+    } else if let Some(false) = bionj {
+        ft_config.use_bionj = 0;
+    }
+    if let Some(true) = nj {
+        ft_config.use_bionj = 0;
+    }
+
+    // top + notop + topm.
+    // The C library defaults to use_top_hits=1, top_hits_mult=1.0.
+    // `slow=true` (handled above) already forced use_top_hits=0;
+    // here we surface the explicit user-level conflicts so callers
+    // get a clear error instead of either an assertion failure (the
+    // raw C library on `slow + top_hits_mult > 0`) or silent override.
+    let top = config.get("top").and_then(|v| v.as_bool());
+    let notop = config
+        .get("notop")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let topm = config.get("topm").and_then(|v| v.as_f64());
+    let slow_set = config
+        .get("slow")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if top == Some(true) && notop {
+        return Err("config conflict: top=true and notop=true are mutually exclusive".to_string());
+    }
+    if slow_set && top == Some(true) {
+        return Err(
+            "config conflict: slow=true disables top hits; cannot also set top=true".to_string(),
+        );
+    }
+    if (notop || slow_set) && topm.is_some() {
+        return Err(
+            "config conflict: topm is only meaningful when top hits are enabled \
+             (top hits are off when notop=true or slow=true)"
+                .to_string(),
+        );
+    }
+    if let Some(b) = top {
+        ft_config.use_top_hits = i32::from(b);
+    }
+    if notop {
+        ft_config.use_top_hits = 0;
+    }
+    if let Some(m) = topm {
+        if m.is_nan() || m <= 0.0 {
+            return Err(format!("topm must be > 0 (got {m})"));
+        }
+        ft_config.top_hits_mult = m;
+    }
+
+    // quote
+    if let Some(b) = config.get("quote").and_then(|v| v.as_bool()) {
+        ft_config.quote_names = i32::from(b);
+    }
+
+    // gamma
+    if let Some(b) = config.get("gamma").and_then(|v| v.as_bool()) {
+        ft_config.gamma_log_lk = i32::from(b);
+    }
+
+    // fastest
+    // Rejected when true: the C library's `fastest` config field is a
+    // strict subset of the CLI's `-fastest` flag. The CLI also flips
+    // `tophitsRefresh = 0.5` and `useTopHits2nd = true`, neither of
+    // which the library API exposes today (both are on the
+    // user-approved cut list pending an `ext/fasttree` API addition).
+    // Setting only `fastest=1` would produce a tree distinct from
+    // `FastTree -fastest`, which is not what callers expect. Reject
+    // explicitly until the upstream API catches up; `fastest=false`
+    // is accepted as a no-op (matches the C default).
+    if let Some(true) = config.get("fastest").and_then(|v| v.as_bool()) {
+        return Err(
+            "fastest=true is not yet supported: the ext/fasttree library API exposes \
+             only a subset of the CLI's -fastest flag (missing tophitsRefresh and \
+             useTopHits2nd). Wiring `fastest=1` alone would silently produce a tree \
+             distinct from FastTree -fastest. Omit this knob until the upstream API \
+             catches up."
+                .to_string(),
+        );
+    }
 
     Ok(())
 }
@@ -538,6 +782,90 @@ impl GplTool for FastTreeTool {
                     param_type: "integer",
                     default: serde_json::json!(1),
                     description: "OpenMP thread count (>= 1). The adapter defaults to 1 for reproducibility — the C library's default of 0 (which consults OMP_NUM_THREADS) is intentionally not exposed. Values >1 parallelize NJ/NNI/SPR phases at the cost of topology determinism: FastTree's parallel sections produce floating-point non-determinism across thread counts, so identical seeds + identical inputs may yield different trees at threads > 1.",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "model",
+                    param_type: "string",
+                    default: serde_json::json!("auto"),
+                    description: "Substitution model. auto = JTT for protein, JC for nucleotide. jtt/lg/wag are protein-only; jc/gtr are nucleotide-only — the JSON adapter rejects mismatched seq_type up front.",
+                    allowed_values: vec!["auto", "jtt", "lg", "wag", "jc", "gtr"],
+                },
+                ConfigParam {
+                    name: "gtrrates",
+                    param_type: "array",
+                    default: serde_json::json!(null),
+                    description: "GTR rate parameters [ac, ag, at, cg, ct, gt] (6 non-negative numbers). Only valid with model=\"gtr\". Setting this disables FastTree's data-driven rate estimation for rates (gtr_from_alignment=0).",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "gtrfreq",
+                    param_type: "array",
+                    default: serde_json::json!(null),
+                    description: "GTR base frequencies [A, C, G, T] (4 non-negative numbers). Only valid with model=\"gtr\". Setting this disables FastTree's data-driven frequency estimation (gtr_from_alignment=0). The values need NOT sum to exactly 1.0 — FastTree normalizes internally — but a near-1.0 sum makes the configuration self-explanatory.",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "slow",
+                    param_type: "boolean",
+                    default: serde_json::json!(false),
+                    description: "Enable exhaustive (non-heuristic) NJ search. Slower; rarely changes output on well-separated alignments but exposed for cases where the heuristic misses a better tree.",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "bionj",
+                    param_type: "boolean",
+                    default: serde_json::json!(false),
+                    description: "Weighted (BIONJ) neighbor-joins. Default is plain NJ; setting bionj=true uses BIONJ instead. Mutually exclusive with nj=true.",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "nj",
+                    param_type: "boolean",
+                    default: serde_json::json!(false),
+                    description: "Force plain (unweighted) neighbor-joins. Synthesizes use_bionj=0 (the C default, but useful as an explicit assertion). Mutually exclusive with bionj=true.",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "top",
+                    param_type: "boolean",
+                    default: serde_json::json!(true),
+                    description: "Enable the top-hits heuristic (default). Mutually exclusive with notop=true and slow=true.",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "notop",
+                    param_type: "boolean",
+                    default: serde_json::json!(false),
+                    description: "Disable the top-hits heuristic (synthesizes use_top_hits=0). Mutually exclusive with top=true and explicit topm.",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "topm",
+                    param_type: "number",
+                    default: serde_json::json!(1.0),
+                    description: "Multiplier on the sqrt(N) top-hits-list size (> 0). Rejected when top hits are disabled (notop=true or slow=true).",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "quote",
+                    param_type: "boolean",
+                    default: serde_json::json!(false),
+                    description: "Single-quote names in FastTree's Newick output. No observable effect via the gpl-boundary SOA→Arrow path (raw names always); included for future Newick-emitting clients.",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "fastest",
+                    param_type: "boolean",
+                    default: serde_json::json!(false),
+                    description: "REJECTED when true. The ext/fasttree library API exposes `fastest` but not the companion `tophitsRefresh`/`useTopHits2nd` knobs the CLI's `-fastest` flag also sets together; wiring `fastest=1` alone would produce a tree distinct from `FastTree -fastest`. Pending an upstream API addition. `fastest=false` is accepted as a no-op.",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "gamma",
+                    param_type: "boolean",
+                    default: serde_json::json!(false),
+                    description: "Report the gamma-rescaled log-likelihood in result.stats.gamma_log_lk AND rescale every branch length by the fitted gamma factor. Clade structure is unchanged; branch length numerics differ.",
                     allowed_values: vec![],
                 },
             ],
@@ -2109,6 +2437,629 @@ mod tests {
             cfg.n_threads, 1,
             "default must override the C library's 0 (which consults OMP_NUM_THREADS)"
         );
+    }
+
+    // === Phase 3, knob 1: model + gtrrates + gtrfreq ===
+
+    /// `model="gtr"` (with FastTree estimating rates from the alignment)
+    /// produces a tree distinct from the JC default. Verified bit-equal
+    /// against:
+    ///   conda run -n fasttree FastTree -nt -seed 12345 -gtr \
+    ///       target/scratch/16S.1.50seq.fasta
+    #[test]
+    fn test_model_gtr_parity() {
+        const EXPECTED: &str = "((((109556:0.103077368,(83619:0.104660455,(40531:0.121641575,104854:0.037640598)0.983:0.025141088)0.836:0.012645826)0.957:0.025677284,((103543:0.093766936,(78515:0.089160296,114176:0.196867508)0.999:0.052155562)0.996:0.044912984,((100492:0.039943528,((25310:0.014927214,100957:0.037777163)0.818:0.003831354,22197:0.066502780)0.747:0.011373050)0.666:0.008040996,104661:0.036821416)1.000:0.092061615)0.929:0.024109870)0.658:0.020293000,(16077:0.126961496,(92528:0.137760220,(102607:0.115923225,(84810:0.013348636,3353:0.009140723)1.000:0.071465930)0.999:0.061629463)0.617:0.020142090)0.758:0.020470557)0.931:0.022591838,((((112138:0.037129778,11326:0.059445515)1.000:0.149941682,(72728:0.516492416,(2181:0.181750952,(77434:0.085796293,(99565:0.101193325,101540:0.101245036)0.792:0.026882466)0.968:0.042692833)0.987:0.076612998)0.930:0.058596964)0.815:0.014430568,((105325:0.071687400,11179:0.058866128)1.000:0.134095978,(((69848:0.054707004,(8071:0.041806696,(114738:0.051486537,(75690:0.057151784,(102957:0.038851697,(37204:0.034475524,(9944:0.011067348,9669:0.017720848)0.944:0.010100335)0.999:0.031798740)0.961:0.017972064)0.189:0.005665060)1.000:0.051010584)0.903:0.027289773)0.930:0.014238319,((109612:0.039555150,(52575:0.043637092,19103:0.030002024)0.816:0.011800817)1.000:0.079284400,72638:0.034919328)0.254:0.011090999)1.000:0.056094080,(29930:0.067625819,((89315:0.040843573,(100639:0.062328445,(54630:0.028686883,65474:0.061730608)0.993:0.027807780)0.518:0.009124808)0.977:0.022562661,((5903:0.034299981,101793:0.046383992)1.000:0.111296627,111880:0.095603293)0.014:0.014199292)0.853:0.019286417)1.000:0.047707791)0.610:0.015121071)0.399:0.011404618)0.914:0.014702572,38854:0.126233778)0.907:0.011119590,(1828:0.144878847,(10607:0.101646738,114317:0.130344827)0.388:0.026219269)0.558:0.023734690);\n";
+
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let actual = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({
+                    "seq_type": "nucleotide", "seed": 12345, "model": "gtr"
+                }),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(actual, EXPECTED);
+    }
+
+    /// `model="auto"` (the default) on nucleotide data resolves to JC,
+    /// matching the existing 50-seq parity baseline byte-for-byte.
+    #[test]
+    fn test_model_auto_eq_baseline() {
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let baseline = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345}),
+                true,
+            )
+        }
+        .unwrap();
+        let auto = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({
+                    "seq_type": "nucleotide", "seed": 12345, "model": "auto"
+                }),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(auto, baseline);
+    }
+
+    /// `model="jc"` is the explicit form of the AUTO default for
+    /// nucleotide data; output must equal the baseline.
+    #[test]
+    fn test_model_jc_eq_baseline() {
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let baseline = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345}),
+                true,
+            )
+        }
+        .unwrap();
+        let jc = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({
+                    "seq_type": "nucleotide", "seed": 12345, "model": "jc"
+                }),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(jc, baseline);
+    }
+
+    /// Cross-type model rejection: protein-only models with nucleotide.
+    #[test]
+    fn test_model_protein_with_nucleotide_rejected() {
+        for m in ["jtt", "lg", "wag"] {
+            let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+            unsafe { fasttree_config_init(&mut cfg) };
+            let err = apply_json_to_config(
+                &serde_json::json!({"seq_type": "nucleotide", "model": m}),
+                &mut cfg,
+            )
+            .unwrap_err();
+            assert!(
+                err.contains(m) && err.contains("nucleotide"),
+                "expected conflict mentioning {m} and nucleotide, got: {err}"
+            );
+        }
+    }
+
+    /// Cross-type model rejection: nucleotide-only models with protein.
+    #[test]
+    fn test_model_nucleotide_with_protein_rejected() {
+        for m in ["jc", "gtr"] {
+            let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+            unsafe { fasttree_config_init(&mut cfg) };
+            let err = apply_json_to_config(
+                &serde_json::json!({"seq_type": "protein", "model": m}),
+                &mut cfg,
+            )
+            .unwrap_err();
+            assert!(
+                err.contains(m) && err.contains("protein"),
+                "expected conflict mentioning {m} and protein, got: {err}"
+            );
+        }
+    }
+
+    /// Unknown model strings reject with a helpful message.
+    #[test]
+    fn test_model_unknown_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err =
+            apply_json_to_config(&serde_json::json!({"model": "bogus"}), &mut cfg).unwrap_err();
+        assert!(
+            err.contains("invalid model") && err.contains("bogus"),
+            "expected invalid-model error, got: {err}"
+        );
+    }
+
+    /// Explicit `gtrrates` clears `gtr_from_alignment` and copies the
+    /// 6 rates into the config struct.
+    #[test]
+    fn test_gtrrates_sets_fields() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        apply_json_to_config(
+            &serde_json::json!({
+                "seq_type": "nucleotide",
+                "model": "gtr",
+                "gtrrates": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+            }),
+            &mut cfg,
+        )
+        .unwrap();
+        assert_eq!(cfg.gtr_rates, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(cfg.gtr_from_alignment, 0);
+    }
+
+    /// Explicit `gtrfreq` clears `gtr_from_alignment` and copies the
+    /// 4 frequencies into the config struct.
+    #[test]
+    fn test_gtrfreq_sets_fields() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        apply_json_to_config(
+            &serde_json::json!({
+                "seq_type": "nucleotide",
+                "model": "gtr",
+                "gtrfreq": [0.25, 0.25, 0.25, 0.25]
+            }),
+            &mut cfg,
+        )
+        .unwrap();
+        assert_eq!(cfg.gtr_freq, [0.25, 0.25, 0.25, 0.25]);
+        assert_eq!(cfg.gtr_from_alignment, 0);
+    }
+
+    /// `gtrrates`/`gtrfreq` without `model="gtr"` are rejected.
+    #[test]
+    fn test_gtr_arrays_without_model_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err = apply_json_to_config(
+            &serde_json::json!({"gtrrates": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]}),
+            &mut cfg,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("gtr"),
+            "expected gtr-related error, got: {err}"
+        );
+
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err = apply_json_to_config(
+            &serde_json::json!({"gtrfreq": [0.25, 0.25, 0.25, 0.25]}),
+            &mut cfg,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("gtr"),
+            "expected gtr-related error, got: {err}"
+        );
+    }
+
+    /// Wrong-length GTR arrays reject.
+    #[test]
+    fn test_gtr_arrays_wrong_length_rejected() {
+        for (key, vals) in [
+            ("gtrrates", serde_json::json!([1.0, 2.0, 3.0])),
+            ("gtrfreq", serde_json::json!([0.5, 0.5, 0.5])),
+        ] {
+            let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+            unsafe { fasttree_config_init(&mut cfg) };
+            let err =
+                apply_json_to_config(&serde_json::json!({"model": "gtr", key: vals}), &mut cfg)
+                    .unwrap_err();
+            assert!(
+                err.contains(key),
+                "expected length error mentioning {key}, got: {err}"
+            );
+        }
+    }
+
+    /// Negative GTR values reject.
+    #[test]
+    fn test_gtr_arrays_negative_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err = apply_json_to_config(
+            &serde_json::json!({
+                "model": "gtr",
+                "gtrrates": [1.0, 2.0, -3.0, 4.0, 5.0, 6.0]
+            }),
+            &mut cfg,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("gtrrates"),
+            "expected gtrrates error, got: {err}"
+        );
+    }
+
+    // === Phase 3, knob 2: slow ===
+
+    /// `slow=true` sets `cfg.slow=1`. Output on the 16S 50-seq fixture
+    /// is identical to the heuristic path; we still assert it equals
+    /// the conda `-slow` baseline so a regression in the wiring
+    /// (slow=true → cfg.slow=0, say) would catch us out.
+    ///
+    /// Regenerated with:
+    ///   conda run -n fasttree FastTree -nt -seed 12345 -slow \
+    ///       target/scratch/16S.1.50seq.fasta
+    /// On 16S 50-seq this matches the default-config baseline byte
+    /// for byte; the test still pins the value to catch regressions.
+    #[test]
+    fn test_slow_parity() {
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let baseline = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345}),
+                true,
+            )
+        }
+        .unwrap();
+        let slow = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({
+                    "seq_type": "nucleotide", "seed": 12345, "slow": true
+                }),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(slow, baseline);
+    }
+
+    /// Direct field check: `slow=true` flips `cfg.slow` to 1.
+    #[test]
+    fn test_slow_sets_field() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        apply_json_to_config(&serde_json::json!({"slow": true}), &mut cfg).unwrap();
+        assert_eq!(cfg.slow, 1);
+    }
+
+    /// `slow=false` (or absent) leaves `cfg.slow` at the C default (0).
+    #[test]
+    fn test_slow_default_is_zero() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        apply_json_to_config(&serde_json::json!({}), &mut cfg).unwrap();
+        assert_eq!(cfg.slow, 0);
+    }
+
+    // === Phase 3, knob 3: bionj + nj ===
+
+    /// `bionj=true` enables weighted neighbor-joins; output differs
+    /// from the (NJ-default) baseline.
+    ///
+    /// Regenerated with:
+    ///   conda run -n fasttree FastTree -nt -seed 12345 -bionj \
+    ///       target/scratch/16S.1.50seq.fasta
+    #[test]
+    fn test_bionj_parity() {
+        const EXPECTED: &str = "((109556:0.094524906,(83619:0.093313336,(40531:0.116052842,104854:0.036395849)0.988:0.026133000)0.881:0.013829210)0.962:0.022306491,(16077:0.122072801,(92528:0.125259236,(102607:0.120117044,(84810:0.012340872,3353:0.009478361)1.000:0.064343122)1.000:0.060889629)0.622:0.021457177)0.848:0.024367187,(((10607:0.108961479,1828:0.122795630)0.970:0.029745894,((((105325:0.067009316,11179:0.058731920)1.000:0.135129679,(((109612:0.038409061,(52575:0.041645103,19103:0.029240331)0.834:0.010769597)1.000:0.071973523,((69848:0.052355449,(8071:0.038989803,((102957:0.037005876,(37204:0.032872665,(9944:0.010842960,9669:0.016821272)0.944:0.009623416)1.000:0.031360927)0.969:0.017817772,(75690:0.052865086,114738:0.048813256)0.195:0.005041286)1.000:0.051611057)0.931:0.026182202)0.893:0.016878059,72638:0.035873847)0.501:0.012736326)0.999:0.047877699,(111880:0.082579736,(29930:0.067115593,((89315:0.042363368,(54630:0.027359194,65474:0.060314942)0.988:0.025330860)0.603:0.010034465,(100639:0.049661436,(5903:0.034617917,101793:0.045804789)1.000:0.114613709)0.635:0.013454507)0.985:0.027104438)0.804:0.024225169)1.000:0.038818627)0.253:0.011621909)0.444:0.015874561,((112138:0.033338178,11326:0.060591642)1.000:0.139779156,(72728:0.469362217,(2181:0.170495517,(77434:0.082629391,(99565:0.092501598,101540:0.104688409)0.799:0.027351640)0.977:0.045998078)0.997:0.072432663)0.900:0.045359132)0.920:0.017342401)0.919:0.013764507,38854:0.120139860)0.910:0.011678571)0.914:0.014821691,((103543:0.090918727,(78515:0.081071332,114176:0.179282600)0.994:0.040954480)0.997:0.049034870,(((100492:0.037197371,104661:0.039515092)0.247:0.007797360,((25310:0.014388727,100957:0.035798312)0.877:0.005496383,22197:0.059566215)0.609:0.005630936)1.000:0.080478774,114317:0.128738214)0.010:0.017434287)0.534:0.018099667)0.768:0.017514276);\n";
+
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let actual = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({
+                    "seq_type": "nucleotide", "seed": 12345, "bionj": true
+                }),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(actual, EXPECTED);
+    }
+
+    /// `nj=true` is the explicit form of the default; output equals
+    /// the standard 50-seq baseline.
+    #[test]
+    fn test_nj_eq_baseline() {
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let baseline = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345}),
+                true,
+            )
+        }
+        .unwrap();
+        let nj = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({
+                    "seq_type": "nucleotide", "seed": 12345, "nj": true
+                }),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(nj, baseline);
+    }
+
+    /// `bionj=true && nj=true` is a config conflict.
+    #[test]
+    fn test_bionj_nj_both_explicit_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err = apply_json_to_config(&serde_json::json!({"bionj": true, "nj": true}), &mut cfg)
+            .unwrap_err();
+        assert!(
+            err.contains("conflict") && err.contains("bionj") && err.contains("nj"),
+            "expected conflict error mentioning bionj and nj, got: {err}"
+        );
+    }
+
+    /// `bionj=false` explicitly forces NJ (same as default).
+    #[test]
+    fn test_bionj_false_is_nj() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        apply_json_to_config(&serde_json::json!({"bionj": false}), &mut cfg).unwrap();
+        assert_eq!(cfg.use_bionj, 0);
+    }
+
+    // === Phase 3, knob 4: top + notop + topm ===
+
+    /// `notop=true` disables the top-hits heuristic. On 100-seq the
+    /// resulting tree differs from the default (50-seq is too small
+    /// to expose the difference; the heuristic and exhaustive paths
+    /// converge there).
+    ///
+    /// Regenerated with:
+    ///   conda run -n fasttree FastTree -nt -seed 12345 -notop \
+    ///       target/scratch/16S.1.100seq.fasta
+    #[test]
+    fn test_notop_parity_100seq() {
+        const EXPECTED: &str = "((((105325:0.062320926,11179:0.066017065)1.000:0.124967421,(114155:0.089831389,10472:0.093685229)0.914:0.028516104)0.413:0.013872852,(121156:0.135227630,10607:0.087730207)0.967:0.025275109)0.941:0.016404624,((((84810:0.015494093,3353:0.006420104)1.000:0.072300032,(102607:0.094287482,3499:0.055913914)0.998:0.036644649)1.000:0.065973859,(((19106:0.076410873,99257:0.069262375)0.978:0.033483066,((77434:0.101896992,(99565:0.092911029,101540:0.107815925)0.387:0.019191513)0.971:0.040652503,(2181:0.161005014,109504:0.115610119)0.952:0.031410634)0.942:0.018222538)1.000:0.106032751,(102151:0.179231865,(72728:0.168700457,97471:0.074718452)1.000:0.379800650)0.794:0.037184169)0.127:0.033238951)0.809:0.019963371,((65384:0.079768622,((72638:0.034206183,(((((114738:0.047045086,(75690:0.055512070,(102957:0.038451003,((9944:0.009349344,9669:0.018314856)0.855:0.004924787,(24844:0.008968901,37204:0.035605859)0.597:0.005880277)1.000:0.033956160)0.977:0.017404466)0.486:0.007110145)1.000:0.047948535,98992:0.099522087)0.257:0.011639060,8071:0.036377440)0.992:0.019641513,7960:0.064404003)0.645:0.011920281,(40847:0.058735697,(16371:0.006808724,(69848:0.014769681,71836:0.035848188)0.306:0.001762944)1.000:0.043965459)0.951:0.016735862)0.536:0.011714102)0.952:0.016422117,((6864:0.053754124,(109612:0.023400602,93999:0.038019645)0.976:0.016789551)0.555:0.007480919,((19103:0.020186056,114568:0.011058166)0.932:0.014236015,(52575:0.017346424,108779:0.041666081)1.000:0.037233036)0.711:0.009383995)1.000:0.072540311)0.259:0.022892319)0.990:0.035660552,(111880:0.079914782,((29930:0.071183217,((100639:0.031636738,(87284:0.010153496,5163:0.035194781)0.974:0.013282077)0.997:0.023947023,(106389:0.053139158,(106525:0.040606701,(89315:0.043304086,(54630:0.025686234,65474:0.064147066)0.992:0.023446636)0.875:0.009233292)0.914:0.012199597)0.567:0.013573293)0.950:0.018695369)0.168:0.011872321,(108692:0.065562886,(5903:0.033483271,101793:0.047654822)1.000:0.106743829)0.949:0.020293268)0.948:0.029131677)1.000:0.043378330)0.868:0.019972935)0.876:0.018037281,((38854:0.119990528,(113517:0.101773816,(1828:0.065257990,84610:0.046152328)0.993:0.042038632)0.991:0.036846702)0.863:0.017345059,((104007:0.126969870,3769:0.155873118)0.999:0.056826421,((((107881:0.198957857,((103543:0.052678998,105026:0.098166023)0.996:0.042626991,(78515:0.078721396,114176:0.191862381)0.989:0.041898127)0.940:0.024969191)0.980:0.033594087,((92528:0.089671917,72749:0.070822017)0.999:0.051921952,(66261:0.192795511,(112138:0.040925123,11326:0.054605286)1.000:0.135392184)0.759:0.041747013)0.801:0.011231443)0.709:0.017990471,((83619:0.092843828,(104854:0.028070385,((14982:0.049656946,(((15167:0.052485119,(40531:0.063779362,32963:0.124696877)0.721:0.020869469)0.989:0.027616324,15053:0.043270096)0.965:0.021168452,106115:0.057842142)0.470:0.016929845)0.929:0.012878612,(102292:0.056905688,44055:0.048939900)0.855:0.007650802)0.530:0.007454357)0.999:0.040272692)0.965:0.017661638,(109556:0.098259300,(103195:0.108833893,((22352:0.081517112,(16077:0.072883141,16043:0.031036453)0.388:0.014110835)0.999:0.052603856,((44923:0.020223877,126385:0.043627866)0.830:0.012896451,(110678:0.038759387,43305:0.066297628)0.899:0.013418466)1.000:0.054895596)0.944:0.019321027)0.544:0.016962400)0.618:0.014049312)0.988:0.023683822)0.232:0.011420904,((114317:0.037943554,81111:0.068604836)1.000:0.108857796,((((100492:0.034283777,22197:0.057442271)0.682:0.013102083,(114033:0.039990882,(25310:0.018660806,100957:0.031901038)0.689:0.005622692)0.381:0.007331280)0.959:0.010462288,104661:0.037520554)0.562:0.010800181,11758:0.022762721)1.000:0.072025618)0.962:0.020617238)0.801:0.008540937)0.496:0.006738065)0.959:0.017315935);\n";
+
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 100);
+        let actual = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({
+                    "seq_type": "nucleotide", "seed": 12345, "notop": true
+                }),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(actual, EXPECTED);
+    }
+
+    /// `top=true` (the default) is a no-op: matches the standard 50-seq
+    /// baseline byte for byte.
+    #[test]
+    fn test_top_true_eq_baseline() {
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let baseline = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345}),
+                true,
+            )
+        }
+        .unwrap();
+        let top = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({
+                    "seq_type": "nucleotide", "seed": 12345, "top": true
+                }),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(top, baseline);
+    }
+
+    /// `topm` sets `top_hits_mult` and leaves `use_top_hits` alone.
+    #[test]
+    fn test_topm_sets_field() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        apply_json_to_config(&serde_json::json!({"topm": 2.5}), &mut cfg).unwrap();
+        assert_eq!(cfg.top_hits_mult, 2.5);
+        assert_eq!(cfg.use_top_hits, 1);
+    }
+
+    /// `top=true && notop=true` rejects.
+    #[test]
+    fn test_top_notop_both_explicit_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err = apply_json_to_config(&serde_json::json!({"top": true, "notop": true}), &mut cfg)
+            .unwrap_err();
+        assert!(
+            err.contains("conflict") && err.contains("top") && err.contains("notop"),
+            "expected top/notop conflict, got: {err}"
+        );
+    }
+
+    /// `notop=true` with explicit `topm` rejects.
+    #[test]
+    fn test_topm_with_notop_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err = apply_json_to_config(&serde_json::json!({"notop": true, "topm": 2.0}), &mut cfg)
+            .unwrap_err();
+        assert!(
+            err.contains("topm") && err.contains("notop"),
+            "expected topm/notop conflict, got: {err}"
+        );
+    }
+
+    /// `slow=true` with explicit `topm` rejects (slow disables top
+    /// hits, making topm meaningless).
+    #[test]
+    fn test_topm_with_slow_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err = apply_json_to_config(&serde_json::json!({"slow": true, "topm": 2.0}), &mut cfg)
+            .unwrap_err();
+        assert!(
+            err.contains("topm") && err.contains("slow"),
+            "expected topm/slow conflict, got: {err}"
+        );
+    }
+
+    /// `slow=true && top=true` rejects.
+    #[test]
+    fn test_slow_with_top_true_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err = apply_json_to_config(&serde_json::json!({"slow": true, "top": true}), &mut cfg)
+            .unwrap_err();
+        assert!(
+            err.contains("slow") && err.contains("top"),
+            "expected slow/top conflict, got: {err}"
+        );
+    }
+
+    /// `topm` non-positive rejects.
+    #[test]
+    fn test_topm_non_positive_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err = apply_json_to_config(&serde_json::json!({"topm": 0.0}), &mut cfg).unwrap_err();
+        assert!(err.contains("topm"));
+    }
+
+    // === Phase 3, knob 5: quote ===
+
+    /// `quote=true` flips `cfg.quote_names`. Has no observable effect
+    /// via the SOA → Arrow path (the test-only FFI emits raw names),
+    /// so this test only asserts the C field is set.
+    #[test]
+    fn test_quote_sets_field() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        apply_json_to_config(&serde_json::json!({"quote": true}), &mut cfg).unwrap();
+        assert_eq!(cfg.quote_names, 1);
+    }
+
+    /// `quote=false` (or absent) leaves `cfg.quote_names` at the C
+    /// default (0).
+    #[test]
+    fn test_quote_default_is_zero() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        apply_json_to_config(&serde_json::json!({}), &mut cfg).unwrap();
+        assert_eq!(cfg.quote_names, 0);
+    }
+
+    // === Phase 3, knob 6: fastest (rejected when true) ===
+
+    /// `fastest=true` is rejected. The C library API exposes a strict
+    /// subset of the CLI's `-fastest` flag (missing `tophitsRefresh`
+    /// and `useTopHits2nd`); wiring just `cfg.fastest = 1` would
+    /// silently produce a tree distinct from `FastTree -fastest`.
+    /// We surface this as an error rather than ship a knob that
+    /// quietly misbehaves. Revisit when the upstream API exposes the
+    /// missing companion fields.
+    #[test]
+    fn test_fastest_true_rejected() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        let err =
+            apply_json_to_config(&serde_json::json!({"fastest": true}), &mut cfg).unwrap_err();
+        assert!(
+            err.contains("fastest") && err.contains("not yet supported"),
+            "expected fastest-rejection error, got: {err}"
+        );
+    }
+
+    /// `fastest=false` is accepted as a no-op; `cfg.fastest` stays at
+    /// the C default (0).
+    #[test]
+    fn test_fastest_false_is_noop() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        apply_json_to_config(&serde_json::json!({"fastest": false}), &mut cfg).unwrap();
+        assert_eq!(cfg.fastest, 0);
+    }
+
+    // === Phase 3, knob 7: gamma ===
+
+    /// `gamma=true` flips `cfg.gamma_log_lk = 1`. Topology is
+    /// unchanged; observable effect is that
+    /// `result.stats.gamma_log_lk` is no longer the C library's
+    /// `-1.0` sentinel.
+    #[test]
+    fn test_gamma_sets_field() {
+        let mut cfg: FastTreeConfig = unsafe { std::mem::zeroed() };
+        unsafe { fasttree_config_init(&mut cfg) };
+        apply_json_to_config(&serde_json::json!({"gamma": true}), &mut cfg).unwrap();
+        assert_eq!(cfg.gamma_log_lk, 1);
+    }
+
+    /// End-to-end: `gamma=true` populates `result.stats.gamma_log_lk`
+    /// with a finite negative value (the actual gamma log-likelihood).
+    /// `gamma` absent leaves it at the C library's `-1.0` sentinel.
+    /// This is the first knob whose effect is observable only in the
+    /// response metadata, not the Newick.
+    #[test]
+    fn test_gamma_response_stats() {
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+
+        let input_with = unique_shm_name("ft-gamma-with");
+        let _shm_with = write_arrow_to_shm(&input_with, &make_input_batch_owned(&alignment));
+        let resp_with = FastTreeTool.execute(
+            &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "gamma": true}),
+            &input_with,
+        );
+        assert!(
+            resp_with.success,
+            "gamma=true failed: {:?}",
+            resp_with.error
+        );
+        let glk = resp_with.result.as_ref().unwrap()["stats"]["gamma_log_lk"]
+            .as_f64()
+            .expect("gamma_log_lk");
+        assert!(
+            glk.is_finite() && glk < 0.0,
+            "gamma_log_lk should be finite-negative when gamma=true, got {glk}"
+        );
+        let _ = SharedMemory::unlink(&resp_with.shm_outputs[0].name);
+
+        let input_without = unique_shm_name("ft-gamma-without");
+        let _shm_without = write_arrow_to_shm(&input_without, &make_input_batch_owned(&alignment));
+        let resp_without = FastTreeTool.execute(
+            &serde_json::json!({"seq_type": "nucleotide", "seed": 12345}),
+            &input_without,
+        );
+        assert!(resp_without.success);
+        let glk_off = resp_without.result.as_ref().unwrap()["stats"]["gamma_log_lk"]
+            .as_f64()
+            .expect("gamma_log_lk");
+        assert_eq!(
+            glk_off, -1.0,
+            "gamma absent should leave gamma_log_lk at the -1.0 sentinel, got {glk_off}"
+        );
+        let _ = SharedMemory::unlink(&resp_without.shm_outputs[0].name);
+    }
+
+    /// `gamma=true` rescales branch lengths by the fitted gamma
+    /// factor (see `fasttree_api.c:373-374`); the resulting Newick
+    /// is byte-equal to native FastTree's `-gamma` output.
+    ///
+    /// Regenerated with:
+    ///   conda run -n fasttree FastTree -nt -seed 12345 -gamma \\
+    ///       target/scratch/16S.1.50seq.fasta
+    #[test]
+    fn test_gamma_parity() {
+        const EXPECTED: &str = "((10607:0.122635492,1828:0.138301666)0.968:0.033593835,((((112138:0.038217925,11326:0.067753304)1.000:0.157707925,(72728:0.529299177,(2181:0.192410284,(77434:0.093266732,(99565:0.104385613,101540:0.118179761)0.801:0.030788251)0.978:0.051824959)0.997:0.082451262)0.890:0.050102715)0.922:0.019593362,((105325:0.075601117,11179:0.066253602)1.000:0.152585542,(((109612:0.043361548,(52575:0.046923834,19103:0.032985934)0.825:0.012153823)1.000:0.081042937,((69848:0.059014777,(8071:0.043943413,((102957:0.041724992,(37204:0.037092618,(9944:0.012228422,9669:0.018989012)0.944:0.010844066)1.000:0.035417053)0.969:0.020078814,(75690:0.059701130,114738:0.055217058)0.188:0.005623859)1.000:0.058221328)0.926:0.029611933)0.890:0.018984528,72638:0.040622599)0.501:0.014330669)0.999:0.054585698,(111880:0.093532439,(29930:0.076110964,((100639:0.069212471,(54630:0.032294373,65474:0.066533516)0.981:0.026590429)0.063:0.008635861,(89315:0.039266529,(5903:0.038714728,101793:0.051953136)1.000:0.131102131)0.461:0.011628074)0.995:0.032997805)0.611:0.026626277)1.000:0.043914600)0.293:0.013163008)0.322:0.017271912)0.916:0.015359216,38854:0.135061968)0.925:0.013854244,(((109556:0.106826622,(83619:0.105238975,(40531:0.130948397,104854:0.041147513)0.988:0.029499545)0.861:0.015439445)0.964:0.025517330,(16077:0.137645573,(92528:0.141175974,(102607:0.135559356,(84810:0.013962402,3353:0.010650236)1.000:0.072462265)1.000:0.068899758)0.614:0.024151835)0.841:0.027203388)0.688:0.019357673,((103543:0.102512623,(78515:0.091591881,114176:0.202454981)0.994:0.046102092)0.997:0.055036506,(114317:0.145242213,((100492:0.041940071,104661:0.044586231)0.251:0.008799339,((25310:0.016226436,100957:0.040369276)0.877:0.006190221,22197:0.067203792)0.602:0.006337769)1.000:0.090436343)0.091:0.020244033)0.500:0.020299771)0.921:0.016988961);\n";
+
+        let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
+        let actual = unsafe {
+            build_newick_via_json(
+                &alignment,
+                &serde_json::json!({
+                    "seq_type": "nucleotide", "seed": 12345, "gamma": true
+                }),
+                true,
+            )
+        }
+        .unwrap();
+        assert_eq!(actual, EXPECTED);
     }
 
     // === Range-check + UX hygiene (Linus review followups) ===
