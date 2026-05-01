@@ -21,13 +21,14 @@ use arrow::record_batch::RecordBatch;
 // Shm helpers — RAII guard so a panicking assertion can't leak segments
 // ---------------------------------------------------------------------------
 
-fn write_test_shm(name: &str, batch: &RecordBatch) {
+fn write_test_shm(name: &str, batch: &RecordBatch) -> usize {
     let mut ipc_buf = Vec::new();
     {
         let mut writer = StreamWriter::try_new(&mut ipc_buf, &batch.schema()).unwrap();
         writer.write(batch).unwrap();
         writer.finish().unwrap();
     }
+    let len = ipc_buf.len();
     let c_name = CString::new(name).unwrap();
     unsafe {
         let fd = libc::shm_open(
@@ -36,11 +37,11 @@ fn write_test_shm(name: &str, batch: &RecordBatch) {
             0o600,
         );
         assert!(fd >= 0, "shm_open failed for {name}");
-        let rc = libc::ftruncate(fd, ipc_buf.len() as libc::off_t);
+        let rc = libc::ftruncate(fd, len as libc::off_t);
         assert_eq!(rc, 0, "ftruncate failed for {name}");
         let ptr = libc::mmap(
             std::ptr::null_mut(),
-            ipc_buf.len(),
+            len,
             libc::PROT_WRITE,
             libc::MAP_SHARED,
             fd,
@@ -48,9 +49,10 @@ fn write_test_shm(name: &str, batch: &RecordBatch) {
         );
         assert_ne!(ptr, libc::MAP_FAILED, "mmap failed for {name}");
         libc::close(fd);
-        std::ptr::copy_nonoverlapping(ipc_buf.as_ptr(), ptr as *mut u8, ipc_buf.len());
-        libc::munmap(ptr, ipc_buf.len());
+        std::ptr::copy_nonoverlapping(ipc_buf.as_ptr(), ptr as *mut u8, len);
+        libc::munmap(ptr, len);
     }
+    len
 }
 
 fn unlink_shm(name: &str) {
@@ -69,16 +71,20 @@ fn unique_test_shm_name(prefix: &str) -> String {
 
 struct ShmGuard {
     name: String,
+    size: usize,
 }
 
 impl ShmGuard {
     fn create_with_batch(prefix: &str, batch: &RecordBatch) -> Self {
         let name = unique_test_shm_name(prefix);
-        write_test_shm(&name, batch);
-        Self { name }
+        let size = write_test_shm(&name, batch);
+        Self { name, size }
     }
     fn name(&self) -> &str {
         &self.name
+    }
+    fn size(&self) -> usize {
+        self.size
     }
 }
 
@@ -155,8 +161,9 @@ fn test_shutdown_message_exits_cleanly() {
             .write_all(
                 format!(
                     "{{\"tool\":\"prodigal\",\"config\":{{\"meta_mode\":true}},\
-                     \"shm_input\":\"{}\",\"batch_id\":1}}\n",
-                    shm1.name()
+                     \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":1}}\n",
+                    shm1.name(),
+                    shm1.size()
                 )
                 .as_bytes(),
             )
@@ -177,7 +184,7 @@ fn test_shutdown_message_exits_cleanly() {
 
     // First line: init reply with protocol_version
     assert!(lines[0]["success"].as_bool().unwrap());
-    assert_eq!(lines[0]["protocol_version"].as_u64().unwrap(), 1);
+    assert_eq!(lines[0]["protocol_version"].as_u64().unwrap(), 2);
 
     // Second line: batch response with batch_id echoed
     assert!(lines[1]["success"].as_bool().unwrap());
@@ -243,8 +250,9 @@ fn test_idle_timeout_disabled_stays_alive() {
             .write_all(
                 format!(
                     "{{\"tool\":\"prodigal\",\"config\":{{\"meta_mode\":true}},\
-                     \"shm_input\":\"{}\",\"batch_id\":1}}\n",
-                    shm1.name()
+                     \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":1}}\n",
+                    shm1.name(),
+                    shm1.size()
                 )
                 .as_bytes(),
             )
@@ -263,8 +271,9 @@ fn test_idle_timeout_disabled_stays_alive() {
             .write_all(
                 format!(
                     "{{\"tool\":\"prodigal\",\"config\":{{\"meta_mode\":true}},\
-                     \"shm_input\":\"{}\",\"batch_id\":2}}\n",
-                    shm2.name()
+                     \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":2}}\n",
+                    shm2.name(),
+                    shm2.size()
                 )
                 .as_bytes(),
             )
@@ -314,8 +323,9 @@ fn test_indefinite_batch_count() {
                 .write_all(
                     format!(
                         "{{\"tool\":\"prodigal\",\"config\":{{\"meta_mode\":true}},\
-                         \"shm_input\":\"{}\",\"batch_id\":{i}}}\n",
-                        g.name()
+                         \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":{i}}}\n",
+                        g.name(),
+                        g.size()
                     )
                     .as_bytes(),
                 )
@@ -361,12 +371,15 @@ fn test_streaming_prodigal_two_batches() {
     {
         let stdin = child.stdin.as_mut().unwrap();
         stdin.write_all(init_line(None).as_bytes()).unwrap();
-        for (i, name) in [shm1.name(), shm2.name()].iter().enumerate() {
+        for (i, (name, size)) in [(shm1.name(), shm1.size()), (shm2.name(), shm2.size())]
+            .iter()
+            .enumerate()
+        {
             stdin
                 .write_all(
                     format!(
                         "{{\"tool\":\"prodigal\",\"config\":{{\"meta_mode\":true}},\
-                         \"shm_input\":\"{name}\",\"batch_id\":{i}}}\n"
+                         \"shm_input\":\"{name}\",\"shm_input_size\":{size},\"batch_id\":{i}}}\n"
                     )
                     .as_bytes(),
                 )
@@ -407,8 +420,9 @@ fn test_streaming_error_recovery() {
             .write_all(
                 format!(
                     "{{\"tool\":\"prodigal\",\"config\":{{\"meta_mode\":true}},\
-                     \"shm_input\":\"{}\",\"batch_id\":1}}\n",
-                    shm1.name()
+                     \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":1}}\n",
+                    shm1.name(),
+                    shm1.size()
                 )
                 .as_bytes(),
             )
@@ -416,7 +430,7 @@ fn test_streaming_error_recovery() {
         stdin
             .write_all(
                 b"{\"tool\":\"prodigal\",\"config\":{\"meta_mode\":true},\
-                  \"shm_input\":\"/nonexistent-shm-for-error-test\",\"batch_id\":2}\n",
+                  \"shm_input\":\"/nonexistent-shm-for-error-test\",\"shm_input_size\":1024,\"batch_id\":2}\n",
             )
             .unwrap();
         stdin.write_all(b"{\"shutdown\":true}\n").unwrap();
@@ -466,8 +480,9 @@ fn test_first_message_must_be_init() {
             .write_all(
                 format!(
                     "{{\"tool\":\"prodigal\",\"config\":{{\"meta_mode\":true}},\
-                     \"shm_input\":\"{}\"}}\n",
-                    shm.name()
+                     \"shm_input\":\"{}\",\"shm_input_size\":{}}}\n",
+                    shm.name(),
+                    shm.size()
                 )
                 .as_bytes(),
             )
@@ -542,8 +557,9 @@ fn test_fingerprint_ignores_config_key_order() {
                 format!(
                     "{{\"tool\":\"prodigal\",\
                      \"config\":{{\"meta_mode\":true,\"trans_table\":11}},\
-                     \"shm_input\":\"{}\",\"batch_id\":1}}\n",
-                    shm1.name()
+                     \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":1}}\n",
+                    shm1.name(),
+                    shm1.size()
                 )
                 .as_bytes(),
             )
@@ -554,8 +570,9 @@ fn test_fingerprint_ignores_config_key_order() {
                 format!(
                     "{{\"tool\":\"prodigal\",\
                      \"config\":{{\"trans_table\":11,\"meta_mode\":true}},\
-                     \"shm_input\":\"{}\",\"batch_id\":2}}\n",
-                    shm2.name()
+                     \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":2}}\n",
+                    shm2.name(),
+                    shm2.size()
                 )
                 .as_bytes(),
             )
@@ -611,8 +628,9 @@ fn test_two_fingerprints_in_one_session() {
                 format!(
                     "{{\"tool\":\"prodigal\",\
                      \"config\":{{\"meta_mode\":true,\"trans_table\":11}},\
-                     \"shm_input\":\"{}\",\"batch_id\":1}}\n",
-                    shm1.name()
+                     \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":1}}\n",
+                    shm1.name(),
+                    shm1.size()
                 )
                 .as_bytes(),
             )
@@ -622,8 +640,9 @@ fn test_two_fingerprints_in_one_session() {
                 format!(
                     "{{\"tool\":\"prodigal\",\
                      \"config\":{{\"meta_mode\":true,\"trans_table\":4}},\
-                     \"shm_input\":\"{}\",\"batch_id\":2}}\n",
-                    shm2.name()
+                     \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":2}}\n",
+                    shm2.name(),
+                    shm2.size()
                 )
                 .as_bytes(),
             )

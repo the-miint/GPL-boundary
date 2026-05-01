@@ -30,23 +30,31 @@ fn unlink_shm(name: &str) {
 /// runs (especially under `cargo test` with re-used PIDs).
 struct ShmGuard {
     name: String,
+    size: usize,
 }
 
 impl ShmGuard {
     fn create_with_batch(prefix: &str, batch: &RecordBatch) -> Self {
         let name = unique_test_shm_name(prefix);
-        write_test_shm(&name, batch);
-        Self { name }
+        let size = write_test_shm(&name, batch);
+        Self { name, size }
     }
 
     /// Take a name returned by gpl-boundary as an output shm and wrap it in
     /// a guard so it gets unlinked even if the assertions below panic.
     fn adopt(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+        Self {
+            name: name.into(),
+            size: 0,
+        }
     }
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn size(&self) -> usize {
+        self.size
     }
 }
 
@@ -56,13 +64,14 @@ impl Drop for ShmGuard {
     }
 }
 
-fn write_test_shm(name: &str, batch: &RecordBatch) {
+fn write_test_shm(name: &str, batch: &RecordBatch) -> usize {
     let mut ipc_buf = Vec::new();
     {
         let mut writer = StreamWriter::try_new(&mut ipc_buf, &batch.schema()).unwrap();
         writer.write(batch).unwrap();
         writer.finish().unwrap();
     }
+    let len = ipc_buf.len();
     let c_name = CString::new(name).unwrap();
     unsafe {
         let fd = libc::shm_open(
@@ -71,11 +80,11 @@ fn write_test_shm(name: &str, batch: &RecordBatch) {
             0o600,
         );
         assert!(fd >= 0, "shm_open failed for {name}");
-        let rc = libc::ftruncate(fd, ipc_buf.len() as libc::off_t);
+        let rc = libc::ftruncate(fd, len as libc::off_t);
         assert_eq!(rc, 0, "ftruncate failed for {name}");
         let ptr = libc::mmap(
             std::ptr::null_mut(),
-            ipc_buf.len(),
+            len,
             libc::PROT_WRITE,
             libc::MAP_SHARED,
             fd,
@@ -83,9 +92,10 @@ fn write_test_shm(name: &str, batch: &RecordBatch) {
         );
         assert_ne!(ptr, libc::MAP_FAILED, "mmap failed for {name}");
         libc::close(fd);
-        std::ptr::copy_nonoverlapping(ipc_buf.as_ptr(), ptr as *mut u8, ipc_buf.len());
-        libc::munmap(ptr, ipc_buf.len());
+        std::ptr::copy_nonoverlapping(ipc_buf.as_ptr(), ptr as *mut u8, len);
+        libc::munmap(ptr, len);
     }
+    len
 }
 
 fn unique_test_shm_name(prefix: &str) -> String {
@@ -174,7 +184,7 @@ fn test_bowtie2_build_creates_index() {
     let resp = run_request(serde_json::json!({
         "tool": "bowtie2-build",
         "config": { "index_path": index_path },
-        "shm_input": input.name(),
+        "shm_input": input.name(), "shm_input_size": input.size(),
     }));
 
     assert!(
@@ -216,7 +226,7 @@ fn test_bowtie2_build_missing_index_path() {
     let resp = run_request(serde_json::json!({
         "tool": "bowtie2-build",
         "config": {},
-        "shm_input": input.name(),
+        "shm_input": input.name(), "shm_input_size": input.size(),
     }));
 
     assert!(!resp["success"].as_bool().unwrap_or(true));
@@ -245,7 +255,7 @@ fn test_bowtie2_build_round_trip_with_align() {
     let build_resp = run_request(serde_json::json!({
         "tool": "bowtie2-build",
         "config": { "index_path": index_path },
-        "shm_input": build_input.name(),
+        "shm_input": build_input.name(), "shm_input_size": build_input.size(),
     }));
     assert!(
         build_resp["success"].as_bool().unwrap_or(false),
@@ -274,7 +284,7 @@ fn test_bowtie2_build_round_trip_with_align() {
     let align_resp = run_request(serde_json::json!({
         "tool": "bowtie2-align",
         "config": { "index_path": index_path, "seed": 42 },
-        "shm_input": align_input.name(),
+        "shm_input": align_input.name(), "shm_input_size": align_input.size(),
     }));
 
     // Adopt the output shm into a guard *before* the assertions below, so a

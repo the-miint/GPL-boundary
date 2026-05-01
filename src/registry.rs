@@ -575,12 +575,14 @@ mod tests {
             tool: "prodigal".to_string(),
             config: serde_json::json!({"meta_mode": true, "trans_table": 11}),
             shm_input: "/x".to_string(),
+            shm_input_size: 0,
             batch_id: None,
         };
         let b2 = BatchRequest {
             tool: "prodigal".to_string(),
             config: serde_json::json!({"trans_table": 11, "meta_mode": true}),
             shm_input: "/x".to_string(),
+            shm_input_size: 0,
             batch_id: None,
         };
         assert_eq!(Fingerprint::from_batch(&b1), Fingerprint::from_batch(&b2));
@@ -594,6 +596,7 @@ mod tests {
             tool: "fasttree".to_string(),
             config: serde_json::json!({"seq_type": "nucleotide"}),
             shm_input: shm.to_string(),
+            shm_input_size: 0,
             batch_id: Some(id),
         };
         reg.submit(b(1, "/gb-does-not-exist-1"));
@@ -613,12 +616,14 @@ mod tests {
             tool: "fasttree".to_string(),
             config: serde_json::json!({"seq_type": "nucleotide"}),
             shm_input: "/gb-does-not-exist-1".to_string(),
+            shm_input_size: 0,
             batch_id: Some(1),
         });
         reg.submit(BatchRequest {
             tool: "fasttree".to_string(),
             config: serde_json::json!({"seq_type": "protein"}),
             shm_input: "/gb-does-not-exist-2".to_string(),
+            shm_input_size: 0,
             batch_id: Some(2),
         });
         for _ in 0..2 {
@@ -636,6 +641,7 @@ mod tests {
             tool: "not-a-real-tool".to_string(),
             config: serde_json::json!({}),
             shm_input: "/x".to_string(),
+            shm_input_size: 0,
             batch_id: Some(1),
         });
         let response = rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -655,6 +661,7 @@ mod tests {
             tool: "fasttree".to_string(),
             config: serde_json::json!({"seq_type": "nucleotide"}),
             shm_input: "/gb-idle-evict-test".to_string(),
+            shm_input_size: 0,
             batch_id: Some(1),
         });
         let _ = rx.recv_timeout(Duration::from_secs(2)).unwrap();

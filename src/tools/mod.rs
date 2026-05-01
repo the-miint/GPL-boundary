@@ -97,7 +97,7 @@ pub trait StreamingContext: Send {
     /// Output shm is registered for signal-handler cleanup inside `run_batch`;
     /// deregistering transfers ownership to miint. This must happen *after*
     /// the response is on stdout to prevent leaks if a signal arrives mid-write.
-    fn run_batch(&mut self, shm_input: &str) -> Response;
+    fn run_batch(&mut self, shm_input: &str, shm_input_size: usize) -> Response;
 }
 
 /// Trait for GPL-licensed tools that can be dispatched.
@@ -108,9 +108,16 @@ pub trait GplTool {
     /// (new/removed/renamed columns, type changes) so consumers can fail fast.
     fn schema_version(&self) -> u32;
     fn describe(&self) -> ToolDescription;
-    /// Execute the tool (single-shot). The tool reads input from shm_input,
-    /// creates its own output shm, and returns a Response.
-    fn execute(&self, config: &serde_json::Value, shm_input: &str) -> Response;
+    /// Execute the tool (single-shot). The tool reads `shm_input_size`
+    /// bytes from `shm_input` (the protocol's authoritative size — `fstat`
+    /// is not reliable on Darwin), creates its own output shm, and
+    /// returns a Response.
+    fn execute(
+        &self,
+        config: &serde_json::Value,
+        shm_input: &str,
+        shm_input_size: usize,
+    ) -> Response;
 
     /// Create a streaming context for batched execution. Returns `Ok(Some(ctx))`
     /// if the tool supports streaming, `Ok(None)` if it does not (default).
@@ -149,7 +156,8 @@ pub fn dispatch(request: &BatchRequest) -> Response {
     let tool = all_tools().into_iter().find(|t| t.name() == request.tool);
     match tool {
         Some(t) => {
-            let mut response = t.execute(&request.config, &request.shm_input);
+            let mut response =
+                t.execute(&request.config, &request.shm_input, request.shm_input_size);
             if response.success {
                 response.schema_version = Some(t.schema_version());
             }
@@ -292,6 +300,7 @@ mod tests {
             tool: "nonexistent".to_string(),
             config: serde_json::json!({}),
             shm_input: "/dummy".to_string(),
+            shm_input_size: 0,
             batch_id: None,
         };
         let response = dispatch(&request);
@@ -380,12 +389,12 @@ mod tests {
     fn test_streaming_context_trait_is_object_safe() {
         struct DummyCtx;
         impl StreamingContext for DummyCtx {
-            fn run_batch(&mut self, _shm_input: &str) -> Response {
+            fn run_batch(&mut self, _shm_input: &str, _shm_input_size: usize) -> Response {
                 Response::error("stub")
             }
         }
         let mut ctx: Box<dyn StreamingContext> = Box::new(DummyCtx);
-        let resp = ctx.run_batch("/dummy");
+        let resp = ctx.run_batch("/dummy", 0);
         assert!(!resp.success);
     }
 

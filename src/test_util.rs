@@ -4,7 +4,6 @@
 //! tests exercise production read/write paths against independently-written data.
 
 use crate::shm::SharedMemory;
-use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use std::path::PathBuf;
@@ -39,12 +38,20 @@ pub fn write_arrow_to_shm(name: &str, batch: &RecordBatch) -> SharedMemory {
     shm
 }
 
-/// Read all Arrow RecordBatches from IPC stream in shared memory.
-pub fn read_arrow_from_shm(name: &str) -> Vec<RecordBatch> {
-    let shm = SharedMemory::open_readonly(name).unwrap();
-    let cursor = std::io::Cursor::new(shm.as_slice());
-    let reader = StreamReader::try_new(cursor, None).unwrap();
-    reader.into_iter().map(|b| b.unwrap()).collect()
+/// Read all Arrow RecordBatches from an IPC stream in shared memory.
+///
+/// Delegates to `arrow_ipc::read_batches_from_shm` so tests exercise the
+/// **same** decoder (`StreamDecoder::with_require_alignment(true)`) as
+/// production. Using a separate `StreamReader`-based path here would
+/// hide alignment / trailing-data bugs from the test suite — exactly
+/// the class of mismatch that masked the original macOS `fstat` bug.
+///
+/// `size` is the exact data byte count. Callers reading their own input
+/// segments can use `holder.len()` from the `SharedMemory` returned by
+/// `write_arrow_to_shm`; callers reading gpl-boundary output segments
+/// should pass `ShmOutput::size` from the response.
+pub fn read_arrow_from_shm(name: &str, size: usize) -> Vec<RecordBatch> {
+    crate::arrow_ipc::read_batches_from_shm(name, size).unwrap()
 }
 
 /// Extract `16S500/16S.1.p` from `ext/fasttree/16S_500.tar.gz` to
@@ -185,9 +192,9 @@ mod tests {
         )
         .unwrap();
 
-        let _shm = write_arrow_to_shm(&name, &batch);
+        let holder = write_arrow_to_shm(&name, &batch);
 
-        let batches = read_arrow_from_shm(&name);
+        let batches = read_arrow_from_shm(&name, holder.len());
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);
         assert_eq!(batches[0].num_columns(), 2);

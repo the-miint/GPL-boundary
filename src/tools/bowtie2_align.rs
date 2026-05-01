@@ -214,8 +214,8 @@ struct Bt2InputData {
 // ---------------------------------------------------------------------------
 
 impl Bowtie2AlignTool {
-    fn read_input(shm_input: &str) -> Result<Bt2InputData, String> {
-        let batches = crate::arrow_ipc::read_batches_from_shm(shm_input)?;
+    fn read_input(shm_input: &str, shm_input_size: usize) -> Result<Bt2InputData, String> {
+        let batches = crate::arrow_ipc::read_batches_from_shm(shm_input, shm_input_size)?;
 
         let mut read_ids = Vec::new();
         let mut seqs1 = Vec::new();
@@ -531,8 +531,8 @@ impl Drop for Bowtie2StreamingContext {
 }
 
 impl StreamingContext for Bowtie2StreamingContext {
-    fn run_batch(&mut self, shm_input: &str) -> Response {
-        let input_data = match Bowtie2AlignTool::read_input(shm_input) {
+    fn run_batch(&mut self, shm_input: &str, shm_input_size: usize) -> Response {
+        let input_data = match Bowtie2AlignTool::read_input(shm_input, shm_input_size) {
             Ok(data) => data,
             Err(e) => return Response::error(e),
         };
@@ -1322,14 +1322,19 @@ impl GplTool for Bowtie2AlignTool {
         }
     }
 
-    fn execute(&self, config: &serde_json::Value, shm_input: &str) -> Response {
+    fn execute(
+        &self,
+        config: &serde_json::Value,
+        shm_input: &str,
+        shm_input_size: usize,
+    ) -> Response {
         let verbose = config
             .get("verbose")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
         // Read input from shared memory
-        let input_data = match Self::read_input(shm_input) {
+        let input_data = match Self::read_input(shm_input, shm_input_size) {
             Ok(data) => data,
             Err(e) => return Response::error(e),
         };
@@ -1699,11 +1704,12 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
 
         let input_name = unique_shm_name("bt2-abi-out");
         let batch = make_single_end_input(&["r1"], &[read_seq], &[Some(read_qual)]);
-        let _shm = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder_size = shm_holder.len();
 
         let tool = Bowtie2AlignTool;
         let config = serde_json::json!({"index_path": index_prefix, "seed": 42});
-        let response = tool.execute(&config, &input_name);
+        let response = tool.execute(&config, &input_name, shm_holder_size);
         assert!(response.success, "Alignment failed: {:?}", response.error);
 
         // The struct_size check happens inside execute() implicitly via
@@ -1874,7 +1880,7 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
     fn test_bowtie2_align_bad_input_shm() {
         let tool = Bowtie2AlignTool;
         let config = serde_json::json!({"index_path": "/nonexistent/index"});
-        let response = tool.execute(&config, "/nonexistent-shm-name");
+        let response = tool.execute(&config, "/nonexistent-shm-name", 0);
         assert!(!response.success);
         assert!(response
             .error
@@ -1887,10 +1893,11 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
     fn test_bowtie2_align_missing_index_path() {
         let input_name = unique_shm_name("bt2-err-idx");
         let batch = make_single_end_input(&["r1"], &["ACGT"], &[Some("IIII")]);
-        let _shm = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder_size = shm_holder.len();
 
         let tool = Bowtie2AlignTool;
-        let response = tool.execute(&serde_json::json!({}), &input_name);
+        let response = tool.execute(&serde_json::json!({}), &input_name, shm_holder_size);
         assert!(!response.success);
         assert!(
             response.error.as_ref().unwrap().contains("index_path"),
@@ -1903,11 +1910,12 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
     fn test_bowtie2_align_invalid_index_path() {
         let input_name = unique_shm_name("bt2-err-bad");
         let batch = make_single_end_input(&["r1"], &["ACGT"], &[Some("IIII")]);
-        let _shm = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder_size = shm_holder.len();
 
         let tool = Bowtie2AlignTool;
         let config = serde_json::json!({"index_path": "/nonexistent/path/idx"});
-        let response = tool.execute(&config, &input_name);
+        let response = tool.execute(&config, &input_name, shm_holder_size);
         assert!(!response.success);
     }
 
@@ -1916,11 +1924,12 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
         let (_dir, index_prefix) = build_test_index();
         let input_name = unique_shm_name("bt2-empty");
         let batch = make_single_end_input(&[], &[], &[]);
-        let _shm = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder_size = shm_holder.len();
 
         let tool = Bowtie2AlignTool;
         let config = serde_json::json!({"index_path": index_prefix});
-        let response = tool.execute(&config, &input_name);
+        let response = tool.execute(&config, &input_name, shm_holder_size);
         assert!(!response.success);
         assert!(response.error.as_ref().unwrap().contains("At least 1"));
     }
@@ -1935,7 +1944,8 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
 
         let input_name = unique_shm_name("bt2-noul");
         let batch = make_single_end_input(&["garbage"], &[garbage_read], &[Some(garbage_qual)]);
-        let _shm = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder_size = shm_holder.len();
 
         let tool = Bowtie2AlignTool;
         let config = serde_json::json!({
@@ -1943,13 +1953,14 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             "no_unal": true,
             "seed": 42,
         });
-        let response = tool.execute(&config, &input_name);
+        let response = tool.execute(&config, &input_name, shm_holder_size);
         assert!(response.success, "Failed: {:?}", response.error);
         assert_eq!(response.shm_outputs.len(), 1);
 
         // Verify the zero-records path works (soa_to_record_batch handles
         // n_records==0 without UB from null pointer dereference).
-        let batches = read_arrow_from_shm(&response.shm_outputs[0].name);
+        let batches =
+            read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_columns(), 14);
 
@@ -1969,7 +1980,8 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
 
         let input_name = unique_shm_name("bt2-se");
         let batch = make_single_end_input(&["read1"], &[read_seq], &[Some(read_qual)]);
-        let _shm = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder_size = shm_holder.len();
 
         let tool = Bowtie2AlignTool;
         let config = serde_json::json!({
@@ -1977,7 +1989,7 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             "nthreads": 1,
             "seed": 42,
         });
-        let response = tool.execute(&config, &input_name);
+        let response = tool.execute(&config, &input_name, shm_holder_size);
 
         assert!(response.success, "Failed: {:?}", response.error);
         assert_eq!(response.shm_outputs.len(), 1);
@@ -1990,7 +2002,8 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
         assert_eq!(result["n_aligned"], 1);
         assert_eq!(result["n_unaligned"], 0);
 
-        let batches = read_arrow_from_shm(&response.shm_outputs[0].name);
+        let batches =
+            read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
         assert_eq!(batches.len(), 1);
         let out = &batches[0];
         assert_eq!(out.num_columns(), 14);
@@ -2058,7 +2071,8 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
 
         let input_name = unique_shm_name("bt2-fa");
         let batch = make_single_end_input(&["read1"], &[read_seq], &[None]);
-        let _shm = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder_size = shm_holder.len();
 
         let tool = Bowtie2AlignTool;
         let config = serde_json::json!({
@@ -2066,10 +2080,11 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             "nthreads": 1,
             "ignore_quals": true,
         });
-        let response = tool.execute(&config, &input_name);
+        let response = tool.execute(&config, &input_name, shm_holder_size);
         assert!(response.success, "Failed: {:?}", response.error);
 
-        let batches = read_arrow_from_shm(&response.shm_outputs[0].name);
+        let batches =
+            read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
         assert!(batches[0].num_rows() >= 1);
 
         let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
@@ -2096,7 +2111,8 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             &[Some(qual.as_str())],
             &[Some(qual.as_str())],
         );
-        let _shm = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder_size = shm_holder.len();
 
         let tool = Bowtie2AlignTool;
         let config = serde_json::json!({
@@ -2104,14 +2120,15 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             "nthreads": 1,
             "seed": 42,
         });
-        let response = tool.execute(&config, &input_name);
+        let response = tool.execute(&config, &input_name, shm_holder_size);
         assert!(response.success, "Failed: {:?}", response.error);
 
         let result = response.result.unwrap();
         // bowtie2 counts n_reads as the number of read pairs for paired-end
         assert!(result["n_reads"].as_i64().unwrap() >= 1);
 
-        let batches = read_arrow_from_shm(&response.shm_outputs[0].name);
+        let batches =
+            read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
         let out = &batches[0];
         // Paired-end produces 2 records (one per mate)
         assert!(out.num_rows() >= 1);
@@ -2215,9 +2232,10 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             &[read_seq],
             &[Some(&"I".repeat(read_seq.len()))],
         );
-        let _shm = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder_size = shm_holder.len();
 
-        let response = ctx.run_batch(&input_name);
+        let response = ctx.run_batch(&input_name, shm_holder_size);
         assert!(response.success, "run_batch failed: {:?}", response.error);
         assert_eq!(response.shm_outputs.len(), 1);
         assert_eq!(response.shm_outputs[0].label, "alignments");
@@ -2226,7 +2244,8 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
         assert_eq!(result["n_reads"], 1);
         assert_eq!(result["n_aligned"], 1);
 
-        let out_batches = read_arrow_from_shm(&response.shm_outputs[0].name);
+        let out_batches =
+            read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
         assert_eq!(out_batches.len(), 1);
         assert!(out_batches[0].num_rows() > 0);
 
@@ -2248,8 +2267,9 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
         let input1 = unique_shm_name("bt2-str-b1");
         let batch1 =
             make_single_end_input(&["read_a"], &[read1], &[Some(&"I".repeat(read1.len()))]);
-        let _shm1 = write_arrow_to_shm(&input1, &batch1);
-        let resp1 = ctx.run_batch(&input1);
+        let shm_holder1 = write_arrow_to_shm(&input1, &batch1);
+        let shm_holder1_size = shm_holder1.len();
+        let resp1 = ctx.run_batch(&input1, shm_holder1_size);
         assert!(resp1.success, "Batch 1 failed: {:?}", resp1.error);
         assert_eq!(resp1.result.as_ref().unwrap()["n_aligned"], 1);
         let _ = SharedMemory::unlink(&resp1.shm_outputs[0].name);
@@ -2259,8 +2279,9 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
         let input2 = unique_shm_name("bt2-str-b2");
         let batch2 =
             make_single_end_input(&["read_b"], &[read2], &[Some(&"I".repeat(read2.len()))]);
-        let _shm2 = write_arrow_to_shm(&input2, &batch2);
-        let resp2 = ctx.run_batch(&input2);
+        let shm_holder2 = write_arrow_to_shm(&input2, &batch2);
+        let shm_holder2_size = shm_holder2.len();
+        let resp2 = ctx.run_batch(&input2, shm_holder2_size);
         assert!(resp2.success, "Batch 2 failed: {:?}", resp2.error);
         assert_eq!(resp2.result.as_ref().unwrap()["n_aligned"], 1);
         let _ = SharedMemory::unlink(&resp2.shm_outputs[0].name);

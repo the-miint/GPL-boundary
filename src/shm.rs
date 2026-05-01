@@ -315,15 +315,18 @@ pub struct SharedMemory {
 unsafe impl Send for SharedMemory {}
 
 impl SharedMemory {
-    /// Open an existing shared memory region for reading.
+    /// Open an existing shared memory region for reading. **Test-only.**
     ///
-    /// The production read path uses `ReadOnlyShm` instead — it is
-    /// `Send + Sync` by construction and integrates with
+    /// The production read path uses `ReadOnlyShm::open(name, size)`
+    /// — it takes the data length out-of-band (the protocol is the
+    /// authoritative size source) and integrates with
     /// `arrow_ipc::read_batches_from_shm`'s zero-copy `Buffer`. This
-    /// entry point remains for `test_util` and post-create open-for-read
-    /// checks in tests.
-    #[cfg(unix)]
-    #[allow(dead_code)]
+    /// entry point uses `fstat` to size its mapping, which is
+    /// unreliable on Darwin POSIX shm; it remains only for the
+    /// existence-probe pattern in tests (`open_readonly(name).is_ok()`
+    /// after `unlink`), where the success/failure of the call matters
+    /// and the mapped bytes are not consumed.
+    #[cfg(all(unix, test))]
     pub fn open_readonly(name: &str) -> io::Result<Self> {
         let c_name = to_cstring(name)?;
 
@@ -333,7 +336,13 @@ impl SharedMemory {
                 return Err(io::Error::last_os_error());
             }
 
-            let len = fd_size(fd)?;
+            let len = match fd_size(fd) {
+                Ok(n) => n,
+                Err(e) => {
+                    libc::close(fd);
+                    return Err(e);
+                }
+            };
 
             let ptr = libc::mmap(
                 std::ptr::null_mut(),
@@ -502,7 +511,7 @@ fn to_cstring(name: &str) -> io::Result<CString> {
 /// mapped `PROT_READ`. Write attempts would be SIGBUS at the OS level, so
 /// the mapping is genuinely shareable across threads — `Send + Sync` is
 /// sound by construction. Used by `arrow_ipc::read_batches_from_shm` and
-/// `read_batches_from_shm_sized` to wrap a segment as a zero-copy
+/// `read_batches_from_shm` to wrap a segment as a zero-copy
 /// `arrow_buffer::Buffer`.
 ///
 /// The struct does NOT unlink on drop; it only munmaps. The shm name is
@@ -512,7 +521,7 @@ pub struct ReadOnlyShm {
     len: usize,
 }
 
-// SAFETY: `ReadOnlyShm` is constructed only by `open` / `open_with_size`
+// SAFETY: `ReadOnlyShm` is constructed only by `open`
 // below, both of which use `O_RDONLY` + `PROT_READ`. The OS rejects writes
 // via SIGBUS, so the mapping is immutable for its entire lifetime;
 // concurrent reads from any number of threads are race-free.
@@ -520,79 +529,72 @@ unsafe impl Send for ReadOnlyShm {}
 unsafe impl Sync for ReadOnlyShm {}
 
 impl ReadOnlyShm {
-    /// Open an **input** segment whose size is taken from `fstat`.
-    ///
-    /// Use this only for segments whose writer sized them exactly to fit
-    /// the data (e.g. miint creating a request, or `test_util` in unit
-    /// tests). Output segments produced by gpl-boundary's `ShmWriter` are
-    /// over-allocated to a sparse-mmap reservation; `fstat` does not
-    /// reflect their data length, so use `open_with_size` instead.
-    #[cfg(unix)]
-    pub fn open(name: &str) -> io::Result<Self> {
-        let c_name = to_cstring(name)?;
-        unsafe {
-            let fd = libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0);
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-
-            let len = fd_size(fd)?;
-            Self::map_fd(fd, len)
-        }
-    }
-
     /// Open a segment with an explicit `size`, mapping exactly `size`
-    /// bytes regardless of what `fstat` would report.
+    /// bytes. `fstat` is not consulted for sizing: Darwin POSIX shm has
+    /// unreliable `fstat` semantics for our pattern, so the data length
+    /// must travel out-of-band via the protocol (`BatchRequest::shm_input_size`
+    /// for inputs, `ShmOutput::size` for outputs).
     ///
-    /// This is the cross-platform-correct way to read gpl-boundary's
-    /// output segments: `ShmWriter` produces sparse-mmap reservations
-    /// whose reported file size is the reservation, not the data
-    /// length. Pass `ShmOutput::size` from the protocol response.
-    ///
-    /// In production, miint reads outputs this way; in this crate, only
-    /// the tests exercise it (hence `dead_code` allow).
+    /// `size == 0` is allowed only when the segment is genuinely empty —
+    /// a freshly-created shm whose `ftruncate` has not yet enlarged it,
+    /// or a tool whose input batch is intentionally zero-length. Passing
+    /// `size == 0` for a non-empty segment is treated as a caller bug
+    /// (forgot to plumb `shm_input_size`) and surfaced as an error
+    /// rather than silently returning an empty handle. The check uses
+    /// `fstat` solely as a sanity gate — `st_size > 0` is a reliable
+    /// signal of "non-empty" on both Linux and macOS even when its exact
+    /// value isn't trustworthy on Darwin.
     #[cfg(unix)]
-    #[allow(dead_code)]
-    pub fn open_with_size(name: &str, size: usize) -> io::Result<Self> {
+    pub fn open(name: &str, size: usize) -> io::Result<Self> {
         let c_name = to_cstring(name)?;
         unsafe {
             let fd = libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0);
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
-            Self::map_fd(fd, size)
-        }
-    }
-
-    /// Shared mmap helper. Closes `fd` before returning. `len == 0` is
-    /// special-cased because `mmap` with length 0 is undefined.
-    #[cfg(unix)]
-    unsafe fn map_fd(fd: i32, len: usize) -> io::Result<Self> {
-        if len == 0 {
+            // Special-case the empty mapping: mmap with len=0 is undefined.
+            // Reject `size == 0` against a non-empty segment as a caller
+            // bug (likely forgot to plumb shm_input_size).
+            if size == 0 {
+                let mut stat: libc::stat = std::mem::zeroed();
+                let rc = libc::fstat(fd, &mut stat);
+                libc::close(fd);
+                if rc < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if stat.st_size > 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "ReadOnlyShm::open called with size=0 against non-empty \
+                             segment '{name}' (fstat reports {} bytes); caller likely \
+                             forgot to plumb shm_input_size",
+                            stat.st_size
+                        ),
+                    ));
+                }
+                return Ok(Self {
+                    ptr: std::ptr::null(),
+                    len: 0,
+                });
+            }
+            let ptr = libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            );
             libc::close(fd);
-            return Ok(Self {
-                ptr: std::ptr::null(),
-                len: 0,
-            });
+            if ptr == libc::MAP_FAILED {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self {
+                ptr: ptr as *const u8,
+                len: size,
+            })
         }
-
-        let ptr = libc::mmap(
-            std::ptr::null_mut(),
-            len,
-            libc::PROT_READ,
-            libc::MAP_SHARED,
-            fd,
-            0,
-        );
-        libc::close(fd);
-
-        if ptr == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self {
-            ptr: ptr as *const u8,
-            len,
-        })
     }
 
     pub fn as_ptr(&self) -> *const u8 {
@@ -614,13 +616,15 @@ impl Drop for ReadOnlyShm {
     }
 }
 
-#[cfg(unix)]
+/// Size an fd via `fstat`. Test-only: the production read path takes
+/// the data length out-of-band via the protocol (`shm_input_size` /
+/// `ShmOutput::size`). Caller owns the fd in all cases — this function
+/// does not close it on either success or error.
+#[cfg(all(unix, test))]
 unsafe fn fd_size(fd: i32) -> io::Result<usize> {
     let mut stat: libc::stat = std::mem::zeroed();
     if libc::fstat(fd, &mut stat) < 0 {
-        let err = io::Error::last_os_error();
-        libc::close(fd);
-        return Err(err);
+        return Err(io::Error::last_os_error());
     }
     Ok(stat.st_size as usize)
 }

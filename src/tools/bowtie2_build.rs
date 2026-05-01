@@ -98,8 +98,8 @@ struct BuildInput {
     n_bases: i64,
 }
 
-fn read_input(shm_input: &str) -> Result<BuildInput, String> {
-    let batches = crate::arrow_ipc::read_batches_from_shm(shm_input)?;
+fn read_input(shm_input: &str, shm_input_size: usize) -> Result<BuildInput, String> {
+    let batches = crate::arrow_ipc::read_batches_from_shm(shm_input, shm_input_size)?;
     let mut names = Vec::new();
     let mut seqs = Vec::new();
     let mut n_bases: i64 = 0;
@@ -304,7 +304,12 @@ impl GplTool for Bowtie2BuildTool {
         }
     }
 
-    fn execute(&self, config: &serde_json::Value, shm_input: &str) -> Response {
+    fn execute(
+        &self,
+        config: &serde_json::Value,
+        shm_input: &str,
+        shm_input_size: usize,
+    ) -> Response {
         let index_path = match config.get("index_path").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
             None => {
@@ -317,7 +322,7 @@ impl GplTool for Bowtie2BuildTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let input = match read_input(shm_input) {
+        let input = match read_input(shm_input, shm_input_size) {
             Ok(v) => v,
             Err(e) => return Response::error(e),
         };
@@ -505,7 +510,7 @@ mod tests {
         // failing with an "open shm" error and that's a deliberate signal
         // to put validation back in front.
         let tool = Bowtie2BuildTool;
-        let resp = tool.execute(&serde_json::json!({}), "/never-created-bt2-shm");
+        let resp = tool.execute(&serde_json::json!({}), "/never-created-bt2-shm", 0);
         assert!(!resp.success);
         assert!(resp.error.unwrap().contains("index_path"));
     }
@@ -529,8 +534,8 @@ mod tests {
     fn test_rejects_name_with_newline() {
         let shm = unique_shm_name("bt2b-bad-name-nl");
         let batch = make_batch(&["bad\nname"], &["ACGT"]);
-        let _holder = write_arrow_to_shm(&shm, &batch);
-        let err = match read_input(&shm) {
+        let holder = write_arrow_to_shm(&shm, &batch);
+        let err = match read_input(&shm, holder.len()) {
             Err(e) => e,
             Ok(_) => panic!("Expected error for name containing newline"),
         };
@@ -545,8 +550,8 @@ mod tests {
         // mismatch between input names and aligned output names.
         let shm = unique_shm_name("bt2b-bad-name-sp");
         let batch = make_batch(&["chr1 dna:primary"], &["ACGT"]);
-        let _holder = write_arrow_to_shm(&shm, &batch);
-        let err = match read_input(&shm) {
+        let holder = write_arrow_to_shm(&shm, &batch);
+        let err = match read_input(&shm, holder.len()) {
             Err(e) => e,
             Ok(_) => panic!("Expected error for name containing space"),
         };
@@ -559,8 +564,8 @@ mod tests {
     fn test_rejects_empty_name() {
         let shm = unique_shm_name("bt2b-empty-name");
         let batch = make_batch(&[""], &["ACGT"]);
-        let _holder = write_arrow_to_shm(&shm, &batch);
-        let err = match read_input(&shm) {
+        let holder = write_arrow_to_shm(&shm, &batch);
+        let err = match read_input(&shm, holder.len()) {
             Err(e) => e,
             Ok(_) => panic!("Expected error for empty name"),
         };

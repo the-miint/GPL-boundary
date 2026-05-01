@@ -282,7 +282,7 @@ There is no single-shot mode.
 ```
 1. {"init": {...}}                         ← required first line
    ←  {"success": true, "protocol_version": 1}
-2. {"tool":"...","config":{...},"shm_input":"...","batch_id":N}   (≥0 times)
+2. {"tool":"...","config":{...},"shm_input":"...","shm_input_size":S,"batch_id":N}   (≥0 times)
    ←  {"success": true, "schema_version": K, "batch_id": N,
         "shm_outputs": [...], "result": {...}}
 3. {"shutdown": true}  OR  EOF  OR  idle_timeout_ms expires       ← exit 0
@@ -323,8 +323,13 @@ There is no single-shot mode.
 {"tool": "fasttree",
  "config": {"seq_type": "nucleotide", "seed": 12345},
  "shm_input": "/miint-input-uuid",
+ "shm_input_size": 8192,
  "batch_id": 42}
 ```
+- `shm_input_size` is REQUIRED. Exact byte count of the Arrow IPC stream
+  in `shm_input`. The reader uses this to size its mapping — `fstat` is
+  not consulted because Darwin POSIX shm has unreliable `fstat` semantics.
+  miint, which created the input segment, already knows this value.
 - `batch_id` is optional but recommended. Echoed verbatim on the matching
   response so out-of-order completions across distinct fingerprints can be
   correlated.
@@ -536,21 +541,22 @@ POSIX shm only allows `ftruncate` to set the size **once**; a second call
 is therefore the canonical, cross-platform source of truth — not a
 side-channel through `fstat`.
 
-**Input (`read_batches_from_shm`)** — for segments sized exactly by their
-writer (e.g. miint creating a request, or test_util in unit tests). Uses
-`fstat` to size the mapping. Zero-copy via Arrow's `Buffer::from_custom_allocation`:
-the `ReadOnlyShm` mmap is wrapped as a `Buffer` whose Arc-counted `Allocation`
-owner is the mapping itself. Arrow's `StreamDecoder` slices that buffer for
-each batch body without copying. The returned `RecordBatch`es reference the
-mmap directly; the mapping survives until the last batch (and any column
-derived from it) is dropped, even after `shm_unlink`. Verified by
-`arrow_ipc::tests::test_input_mmap_outlives_unlink`.
+**Reading (`read_batches_from_shm(name, size)`)** — single read API, used
+for both inputs and outputs. Caller supplies the data length out-of-band:
+`BatchRequest::shm_input_size` for input segments, `ShmOutput::size` for
+output segments. `fstat` is **not** consulted — Darwin POSIX shm has
+unreliable `fstat` semantics, and gpl-boundary's own outputs are
+over-allocated to a sparse-mmap reservation, so neither input nor output
+segments can rely on `fstat` for cross-platform correctness. The protocol's
+explicit byte counts are the canonical source of truth.
 
-**Output reads (`read_batches_from_shm_sized`)** — for segments produced by
-`ShmWriter`, where the segment is over-allocated to a sparse reservation.
-Caller passes the explicit `size` from the corresponding `ShmOutput`. Same
-zero-copy guarantees as `read_batches_from_shm`. This is the
-production-correct path for miint reading gpl-boundary outputs.
+Zero-copy via Arrow's `Buffer::from_custom_allocation`: the `ReadOnlyShm`
+mmap is wrapped as a `Buffer` whose Arc-counted `Allocation` owner is the
+mapping itself. Arrow's `StreamDecoder::with_require_alignment(true)`
+slices that buffer for each batch body without copying. The returned
+`RecordBatch`es reference the mmap directly; the mapping survives until
+the last batch (and any column derived from it) is dropped, even after
+`shm_unlink`. Verified by `arrow_ipc::tests::test_input_mmap_outlives_unlink`.
 
 ## C API contract for submodules
 

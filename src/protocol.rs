@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Wire form (one JSON object per line):
 /// - `{"init": {...}}` — required first message; sets session-wide knobs
-/// - `{"tool": "...", "config": {...}, "shm_input": "...", "batch_id": ...}`
+/// - `{"tool": "...", "config": {...}, "shm_input": "...", "shm_input_size": ..., "batch_id": ...}`
 ///   — a single batch request
 /// - `{"shutdown": true}` — graceful shutdown sentinel
 ///
@@ -58,6 +58,11 @@ pub struct BatchRequest {
     #[serde(default)]
     pub config: serde_json::Value,
     pub shm_input: String,
+    /// Exact byte count of the Arrow IPC stream in `shm_input`. The reader
+    /// must mmap exactly this many bytes — `fstat` is not a reliable size
+    /// source on Darwin POSIX shm. miint, which creates the input segment,
+    /// already knows this value.
+    pub shm_input_size: usize,
     /// Echoed back on the matching response so out-of-order completions
     /// can be correlated.
     #[serde(default)]
@@ -136,7 +141,8 @@ impl Response {
     }
 
     /// Reply to a successful init message — carries the protocol version
-    /// and nothing else. Phase 3 protocol_version = 1.
+    /// and nothing else. The current protocol version is defined in
+    /// `main.rs::PROTOCOL_VERSION`; bump there on any wire-envelope change.
     pub fn init_ok(protocol_version: u32) -> Self {
         Self {
             success: true,
@@ -233,12 +239,13 @@ mod tests {
 
     #[test]
     fn test_parse_batch_message() {
-        let s = r#"{"tool":"fasttree","config":{"seed":1},"shm_input":"/x","batch_id":7}"#;
+        let s = r#"{"tool":"fasttree","config":{"seed":1},"shm_input":"/x","shm_input_size":1024,"batch_id":7}"#;
         let m: ControlMessage = serde_json::from_str(s).unwrap();
         match m {
             ControlMessage::Batch(b) => {
                 assert_eq!(b.tool, "fasttree");
                 assert_eq!(b.shm_input, "/x");
+                assert_eq!(b.shm_input_size, 1024);
                 assert_eq!(b.batch_id, Some(7));
                 assert_eq!(b.config["seed"], 1);
             }
@@ -248,11 +255,12 @@ mod tests {
 
     #[test]
     fn test_parse_batch_without_batch_id() {
-        let s = r#"{"tool":"fasttree","shm_input":"/x"}"#;
+        let s = r#"{"tool":"fasttree","shm_input":"/x","shm_input_size":256}"#;
         let m: ControlMessage = serde_json::from_str(s).unwrap();
         match m {
             ControlMessage::Batch(b) => {
                 assert_eq!(b.tool, "fasttree");
+                assert_eq!(b.shm_input_size, 256);
                 assert_eq!(b.batch_id, None);
                 assert!(b.config.is_null());
             }

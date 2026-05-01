@@ -199,11 +199,12 @@ impl Drop for SortMeRnaStreamingContext {
 }
 
 impl StreamingContext for SortMeRnaStreamingContext {
-    fn run_batch(&mut self, shm_input: &str) -> Response {
-        let (read_ids, sequences, sequences2) = match SortMeRnaTool::read_input(shm_input) {
-            Ok(data) => data,
-            Err(e) => return Response::error(e),
-        };
+    fn run_batch(&mut self, shm_input: &str, shm_input_size: usize) -> Response {
+        let (read_ids, sequences, sequences2) =
+            match SortMeRnaTool::read_input(shm_input, shm_input_size) {
+                Ok(data) => data,
+                Err(e) => return Response::error(e),
+            };
 
         if read_ids.is_empty() {
             return Response::error("At least 1 read required");
@@ -355,8 +356,8 @@ type ReadInput = (Vec<String>, Vec<String>, Option<Vec<String>>);
 impl SortMeRnaTool {
     /// Read Arrow IPC from shared memory, extract read_id, sequence, and
     /// optional sequence2 columns.
-    fn read_input(shm_input: &str) -> Result<ReadInput, String> {
-        let batches = crate::arrow_ipc::read_batches_from_shm(shm_input)?;
+    fn read_input(shm_input: &str, shm_input_size: usize) -> Result<ReadInput, String> {
+        let batches = crate::arrow_ipc::read_batches_from_shm(shm_input, shm_input_size)?;
 
         let mut read_ids = Vec::new();
         let mut sequences = Vec::new();
@@ -781,7 +782,12 @@ impl GplTool for SortMeRnaTool {
         }
     }
 
-    fn execute(&self, config: &serde_json::Value, shm_input: &str) -> Response {
+    fn execute(
+        &self,
+        config: &serde_json::Value,
+        shm_input: &str,
+        shm_input_size: usize,
+    ) -> Response {
         // -- Parse ref_paths (required) --
         let ref_path_strs: Vec<String> = match config.get("ref_paths").and_then(|v| v.as_array()) {
             Some(arr) => arr
@@ -797,7 +803,7 @@ impl GplTool for SortMeRnaTool {
         }
 
         // -- Read input from shared memory --
-        let (read_ids, sequences, sequences2) = match Self::read_input(shm_input) {
+        let (read_ids, sequences, sequences2) = match Self::read_input(shm_input, shm_input_size) {
             Ok(data) => data,
             Err(e) => return Response::error(e),
         };
@@ -1410,7 +1416,7 @@ ACCATATGGGAGAGCTCCCAACGCGTTGGA";
     fn test_sortmerna_bad_input_shm() {
         let tool = SortMeRnaTool;
         let config = serde_json::json!({"ref_paths": ["ext/sortmerna/data/test_ref.fasta"]});
-        let response = tool.execute(&config, "/nonexistent-shm-name");
+        let response = tool.execute(&config, "/nonexistent-shm-name", 0);
         assert!(!response.success);
         assert!(response
             .error
@@ -1423,9 +1429,10 @@ ACCATATGGGAGAGCTCCCAACGCGTTGGA";
     fn test_sortmerna_missing_ref_paths() {
         let input_name = unique_shm_name("smr-err");
         let batch = make_input_batch(&["r1"], &["ACGT"]);
-        let _shm = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder_size = shm_holder.len();
         let tool = SortMeRnaTool;
-        let response = tool.execute(&serde_json::json!({}), &input_name);
+        let response = tool.execute(&serde_json::json!({}), &input_name, shm_holder_size);
         assert!(!response.success);
         assert!(
             response.error.as_ref().unwrap().contains("ref_paths"),
@@ -1442,14 +1449,15 @@ ACCATATGGGAGAGCTCCCAACGCGTTGGA";
     fn test_sortmerna_single_end_roundtrip() {
         let input_name = unique_shm_name("smr-se");
         let batch = make_input_batch(&["AB271211"], &[TEST_SEQ_AB271211]);
-        let _shm = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder_size = shm_holder.len();
 
         let tool = SortMeRnaTool;
         let config = serde_json::json!({
             "ref_paths": ["ext/sortmerna/data/test_ref.fasta"],
             "num_threads": 1,
         });
-        let response = tool.execute(&config, &input_name);
+        let response = tool.execute(&config, &input_name, shm_holder_size);
 
         assert!(response.success, "Failed: {:?}", response.error);
         assert_eq!(response.shm_outputs.len(), 1);
@@ -1461,7 +1469,8 @@ ACCATATGGGAGAGCTCCCAACGCGTTGGA";
         assert_eq!(result["total_reads"], 1);
         assert_eq!(result["total_aligned"], 1);
 
-        let batches = read_arrow_from_shm(&response.shm_outputs[0].name);
+        let batches =
+            read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
         assert_eq!(batches.len(), 1);
         let out = &batches[0];
         assert_eq!(out.num_rows(), 1);
@@ -1511,18 +1520,20 @@ ACCATATGGGAGAGCTCCCAACGCGTTGGA";
     fn test_sortmerna_reverse_strand() {
         let input_name = unique_shm_name("smr-rc");
         let batch = make_input_batch(&["AB271211_rc"], &[TEST_SEQ_AB271211_RC]);
-        let _shm = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder_size = shm_holder.len();
 
         let tool = SortMeRnaTool;
         let config = serde_json::json!({
             "ref_paths": ["ext/sortmerna/data/test_ref.fasta"],
             "num_threads": 1,
         });
-        let response = tool.execute(&config, &input_name);
+        let response = tool.execute(&config, &input_name, shm_holder_size);
 
         assert!(response.success, "Failed: {:?}", response.error);
 
-        let batches = read_arrow_from_shm(&response.shm_outputs[0].name);
+        let batches =
+            read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
         let out = &batches[0];
 
         let strand_col = out
@@ -1557,21 +1568,23 @@ ACCATATGGGAGAGCTCCCAACGCGTTGGA";
         // Use forward and RC of same read as a "pair"
         let batch =
             make_paired_input_batch(&["AB271211"], &[TEST_SEQ_AB271211], &[TEST_SEQ_AB271211_RC]);
-        let _shm = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder_size = shm_holder.len();
 
         let tool = SortMeRnaTool;
         let config = serde_json::json!({
             "ref_paths": ["ext/sortmerna/data/test_ref.fasta"],
             "num_threads": 1,
         });
-        let response = tool.execute(&config, &input_name);
+        let response = tool.execute(&config, &input_name, shm_holder_size);
         assert!(response.success, "Failed: {:?}", response.error);
 
         let result = response.result.unwrap();
         // Paired mode: 1 input row → 2 reads (interleaved fwd/rev)
         assert_eq!(result["total_reads"], 2);
 
-        let batches = read_arrow_from_shm(&response.shm_outputs[0].name);
+        let batches =
+            read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
         assert_eq!(batches[0].num_rows(), 2);
 
         let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
@@ -1621,9 +1634,10 @@ ACCATATGGGAGAGCTCCCAACGCGTTGGA";
 
         let input_name = unique_shm_name("smr-str-in");
         let batch = make_input_batch(&["AB271211"], &[TEST_SEQ_AB271211]);
-        let _shm = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder_size = shm_holder.len();
 
-        let response = ctx.run_batch(&input_name);
+        let response = ctx.run_batch(&input_name, shm_holder_size);
         assert!(response.success, "run_batch failed: {:?}", response.error);
         assert_eq!(response.shm_outputs.len(), 1);
         assert_eq!(response.shm_outputs[0].label, "alignments");
@@ -1631,7 +1645,8 @@ ACCATATGGGAGAGCTCCCAACGCGTTGGA";
         let result = response.result.unwrap();
         assert_eq!(result["total_aligned"], 1);
 
-        let out_batches = read_arrow_from_shm(&response.shm_outputs[0].name);
+        let out_batches =
+            read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
         assert_eq!(out_batches.len(), 1);
         let out = &out_batches[0];
         let score_col = out
@@ -1660,11 +1675,12 @@ ACCATATGGGAGAGCTCCCAACGCGTTGGA";
         // Batch 1: forward read
         let input1 = unique_shm_name("smr-str-b1");
         let batch1 = make_input_batch(&["read_fwd"], &[TEST_SEQ_AB271211]);
-        let _shm1 = write_arrow_to_shm(&input1, &batch1);
-        let resp1 = ctx.run_batch(&input1);
+        let shm_holder1 = write_arrow_to_shm(&input1, &batch1);
+        let shm_holder1_size = shm_holder1.len();
+        let resp1 = ctx.run_batch(&input1, shm_holder1_size);
         assert!(resp1.success, "Batch 1 failed: {:?}", resp1.error);
 
-        let out1 = read_arrow_from_shm(&resp1.shm_outputs[0].name);
+        let out1 = read_arrow_from_shm(&resp1.shm_outputs[0].name, resp1.shm_outputs[0].size);
         let strand1 = out1[0]
             .column_by_name("strand")
             .unwrap()
@@ -1678,11 +1694,12 @@ ACCATATGGGAGAGCTCCCAACGCGTTGGA";
         // Batch 2: reverse complement
         let input2 = unique_shm_name("smr-str-b2");
         let batch2 = make_input_batch(&["read_rc"], &[TEST_SEQ_AB271211_RC]);
-        let _shm2 = write_arrow_to_shm(&input2, &batch2);
-        let resp2 = ctx.run_batch(&input2);
+        let shm_holder2 = write_arrow_to_shm(&input2, &batch2);
+        let shm_holder2_size = shm_holder2.len();
+        let resp2 = ctx.run_batch(&input2, shm_holder2_size);
         assert!(resp2.success, "Batch 2 failed: {:?}", resp2.error);
 
-        let out2 = read_arrow_from_shm(&resp2.shm_outputs[0].name);
+        let out2 = read_arrow_from_shm(&resp2.shm_outputs[0].name, resp2.shm_outputs[0].size);
         let strand2 = out2[0]
             .column_by_name("strand")
             .unwrap()

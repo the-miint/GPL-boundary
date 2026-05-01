@@ -215,7 +215,7 @@ fn worker_thread_main(
         let mut response = if streaming_supported {
             match ctx_opt.as_mut() {
                 Some(ctx) => {
-                    let mut r = ctx.run_batch(&batch.shm_input);
+                    let mut r = ctx.run_batch(&batch.shm_input, batch.shm_input_size);
                     if r.success {
                         r.schema_version = schema_version;
                     }
@@ -802,6 +802,7 @@ mod tests {
             tool: "fasttree".to_string(),
             config: serde_json::json!({"seq_type": "nucleotide"}),
             shm_input: "/gb-does-not-exist".to_string(),
+            shm_input_size: 0,
             batch_id: Some(99),
         });
 
@@ -837,6 +838,7 @@ mod tests {
             tool: "prodigal".to_string(),
             config: serde_json::json!({"meta_mode": true}),
             shm_input: "/gb-does-not-exist".to_string(),
+            shm_input_size: 0,
             batch_id: Some(7),
         });
         let response = rx

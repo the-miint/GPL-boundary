@@ -33,19 +33,26 @@ fn unlink_shm(name: &str) {
 
 struct ShmGuard {
     name: String,
+    size: usize,
 }
 
 impl ShmGuard {
     fn create_with_batch(prefix: &str, batch: &RecordBatch) -> Self {
         let name = unique_test_shm_name(prefix);
-        write_test_shm(&name, batch);
-        Self { name }
+        let size = write_test_shm(&name, batch);
+        Self { name, size }
     }
     fn adopt(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+        Self {
+            name: name.into(),
+            size: 0,
+        }
     }
     fn name(&self) -> &str {
         &self.name
+    }
+    fn size(&self) -> usize {
+        self.size
     }
 }
 
@@ -55,13 +62,14 @@ impl Drop for ShmGuard {
     }
 }
 
-fn write_test_shm(name: &str, batch: &RecordBatch) {
+fn write_test_shm(name: &str, batch: &RecordBatch) -> usize {
     let mut ipc_buf = Vec::new();
     {
         let mut writer = StreamWriter::try_new(&mut ipc_buf, &batch.schema()).unwrap();
         writer.write(batch).unwrap();
         writer.finish().unwrap();
     }
+    let len = ipc_buf.len();
     let c_name = CString::new(name).unwrap();
     unsafe {
         let fd = libc::shm_open(
@@ -70,11 +78,11 @@ fn write_test_shm(name: &str, batch: &RecordBatch) {
             0o600,
         );
         assert!(fd >= 0, "shm_open failed for {name}");
-        let rc = libc::ftruncate(fd, ipc_buf.len() as libc::off_t);
+        let rc = libc::ftruncate(fd, len as libc::off_t);
         assert_eq!(rc, 0, "ftruncate failed for {name}");
         let ptr = libc::mmap(
             std::ptr::null_mut(),
-            ipc_buf.len(),
+            len,
             libc::PROT_WRITE,
             libc::MAP_SHARED,
             fd,
@@ -82,9 +90,10 @@ fn write_test_shm(name: &str, batch: &RecordBatch) {
         );
         assert_ne!(ptr, libc::MAP_FAILED, "mmap failed for {name}");
         libc::close(fd);
-        std::ptr::copy_nonoverlapping(ipc_buf.as_ptr(), ptr as *mut u8, ipc_buf.len());
-        libc::munmap(ptr, ipc_buf.len());
+        std::ptr::copy_nonoverlapping(ipc_buf.as_ptr(), ptr as *mut u8, len);
+        libc::munmap(ptr, len);
     }
+    len
 }
 
 fn unique_test_shm_name(prefix: &str) -> String {
@@ -146,7 +155,7 @@ fn build_index(index_path: &str, ref_name: &str, ref_seq: &str) {
     let req = serde_json::json!({
         "tool": "bowtie2-build",
         "config": { "index_path": index_path },
-        "shm_input": input.name(),
+        "shm_input": input.name(), "shm_input_size": input.size(),
     });
     session.push_str(&serde_json::to_string(&req).unwrap());
     session.push('\n');
@@ -251,13 +260,15 @@ fn test_subprocess_same_fingerprint_serializes() {
     let session = format!(
         "{}\
          {{\"tool\":\"bowtie2-align\",\"config\":{{\"index_path\":\"{idx}\",\"seed\":1}},\
-         \"shm_input\":\"{}\",\"batch_id\":1}}\n\
+         \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":1}}\n\
          {{\"tool\":\"bowtie2-align\",\"config\":{{\"index_path\":\"{idx}\",\"seed\":1}},\
-         \"shm_input\":\"{}\",\"batch_id\":2}}\n\
+         \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":2}}\n\
          {{\"shutdown\":true}}\n",
         init_line(),
         shm1.name(),
+        shm1.size(),
         shm2.name(),
+        shm2.size(),
     );
     child
         .stdin
@@ -339,13 +350,15 @@ fn test_subprocess_two_fingerprints_run_in_parallel() {
     let session = format!(
         "{}\
          {{\"tool\":\"bowtie2-align\",\"config\":{{\"index_path\":\"{idx_a}\",\"seed\":1}},\
-         \"shm_input\":\"{}\",\"batch_id\":100}}\n\
+         \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":100}}\n\
          {{\"tool\":\"bowtie2-align\",\"config\":{{\"index_path\":\"{idx_b}\",\"seed\":1}},\
-         \"shm_input\":\"{}\",\"batch_id\":200}}\n\
+         \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":200}}\n\
          {{\"shutdown\":true}}\n",
         init_line(),
         shm_a.name(),
+        shm_a.size(),
         shm_b.name(),
+        shm_b.size(),
     );
     child
         .stdin
@@ -422,10 +435,11 @@ fn test_subprocess_shutdown_reaps_workers() {
     let session = format!(
         "{}\
          {{\"tool\":\"bowtie2-align\",\"config\":{{\"index_path\":\"{idx}\",\"seed\":1}},\
-         \"shm_input\":\"{}\",\"batch_id\":1}}\n\
+         \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":1}}\n\
          {{\"shutdown\":true}}\n",
         init_line(),
         shm.name(),
+        shm.size(),
     );
     child
         .stdin
@@ -518,13 +532,15 @@ fn test_subprocess_bowtie2_responses_carry_batch_id() {
     let session = format!(
         "{}\
          {{\"tool\":\"bowtie2-align\",\"config\":{{\"index_path\":\"{idx}\",\"seed\":1}},\
-         \"shm_input\":\"{}\",\"batch_id\":1}}\n\
+         \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":1}}\n\
          {{\"tool\":\"bowtie2-align\",\"config\":{{\"index_path\":\"{idx}\",\"seed\":1}},\
-         \"shm_input\":\"{}\",\"batch_id\":{big_id}}}\n\
+         \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":{big_id}}}\n\
          {{\"shutdown\":true}}\n",
         init_line(),
         shm1.name(),
+        shm1.size(),
         shm2.name(),
+        shm2.size(),
     );
     child
         .stdin
@@ -588,8 +604,9 @@ fn test_subprocess_idle_eviction_does_not_break_reuse() {
     let session = format!(
         "{init}\
          {{\"tool\":\"bowtie2-align\",\"config\":{{\"index_path\":\"{idx}\",\"seed\":1}},\
-         \"shm_input\":\"{}\",\"batch_id\":1}}\n",
+         \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":1}}\n",
         shm1.name(),
+        shm1.size(),
     );
     {
         let stdin = child.stdin.as_mut().unwrap();
@@ -605,8 +622,9 @@ fn test_subprocess_idle_eviction_does_not_break_reuse() {
             .write_all(
                 format!(
                     "{{\"tool\":\"bowtie2-align\",\"config\":{{\"index_path\":\"{idx}\",\"seed\":1}},\
-                     \"shm_input\":\"{}\",\"batch_id\":2}}\n",
-                    shm2.name()
+                     \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":2}}\n",
+                    shm2.name(),
+                    shm2.size()
                 )
                 .as_bytes(),
             )
@@ -742,8 +760,9 @@ fn test_subprocess_worker_crash_marks_fingerprint_dead() {
             .write_all(
                 format!(
                     "{{\"tool\":\"bowtie2-align\",\"config\":{{\"index_path\":\"{idx_a}\",\"seed\":1}},\
-                     \"shm_input\":\"{}\",\"batch_id\":1}}\n",
-                    shm1.name()
+                     \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":1}}\n",
+                    shm1.name(),
+                    shm1.size()
                 )
                 .as_bytes(),
             )
@@ -784,8 +803,9 @@ fn test_subprocess_worker_crash_marks_fingerprint_dead() {
             .write_all(
                 format!(
                     "{{\"tool\":\"bowtie2-align\",\"config\":{{\"index_path\":\"{idx_a}\",\"seed\":1}},\
-                     \"shm_input\":\"{}\",\"batch_id\":2}}\n",
-                    shm2.name()
+                     \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":2}}\n",
+                    shm2.name(),
+                    shm2.size()
                 )
                 .as_bytes(),
             )
@@ -795,8 +815,9 @@ fn test_subprocess_worker_crash_marks_fingerprint_dead() {
             .write_all(
                 format!(
                     "{{\"tool\":\"bowtie2-align\",\"config\":{{\"index_path\":\"{idx_b}\",\"seed\":1}},\
-                     \"shm_input\":\"{}\",\"batch_id\":3}}\n",
-                    shm3.name()
+                     \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":3}}\n",
+                    shm3.name(),
+                    shm3.size()
                 )
                 .as_bytes(),
             )
@@ -889,8 +910,9 @@ fn test_subprocess_orphan_shm_swept_after_crash() {
             .write_all(
                 format!(
                     "{{\"tool\":\"bowtie2-align\",\"config\":{{\"index_path\":\"{idx}\",\"seed\":1}},\
-                     \"shm_input\":\"{}\",\"batch_id\":1}}\n",
-                    shm.name()
+                     \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":1}}\n",
+                    shm.name(),
+                    shm.size()
                 )
                 .as_bytes(),
             )
@@ -991,15 +1013,18 @@ fn test_subprocess_max_workers_recycles_via_lru() {
     let session = format!(
         "{init}\
          {{\"tool\":\"bowtie2-align\",\"config\":{{\"index_path\":\"{idx_a}\",\"seed\":1}},\
-         \"shm_input\":\"{}\",\"batch_id\":1}}\n\
+         \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":1}}\n\
          {{\"tool\":\"bowtie2-align\",\"config\":{{\"index_path\":\"{idx_b}\",\"seed\":1}},\
-         \"shm_input\":\"{}\",\"batch_id\":2}}\n\
+         \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":2}}\n\
          {{\"tool\":\"bowtie2-align\",\"config\":{{\"index_path\":\"{idx_c}\",\"seed\":1}},\
-         \"shm_input\":\"{}\",\"batch_id\":3}}\n\
+         \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":3}}\n\
          {{\"shutdown\":true}}\n",
         shm_a.name(),
+        shm_a.size(),
         shm_b.name(),
+        shm_b.size(),
         shm_c.name(),
+        shm_c.size(),
     );
     child
         .stdin
@@ -1073,12 +1098,14 @@ fn test_subprocess_inflight_batch_protected_from_eviction() {
     let session = format!(
         "{init}\
          {{\"tool\":\"bowtie2-align\",\"config\":{{\"index_path\":\"{idx_a}\",\"seed\":1}},\
-         \"shm_input\":\"{}\",\"batch_id\":1}}\n\
+         \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":1}}\n\
          {{\"tool\":\"bowtie2-align\",\"config\":{{\"index_path\":\"{idx_b}\",\"seed\":1}},\
-         \"shm_input\":\"{}\",\"batch_id\":2}}\n\
+         \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":2}}\n\
          {{\"shutdown\":true}}\n",
         shm_a.name(),
+        shm_a.size(),
         shm_b.name(),
+        shm_b.size(),
     );
     child
         .stdin
@@ -1194,8 +1221,9 @@ fn test_subprocess_max_workers_bounds_resident_children() {
                     format!(
                         "{{\"tool\":\"bowtie2-align\",\
                          \"config\":{{\"index_path\":\"{idx}\",\"seed\":1}},\
-                         \"shm_input\":\"{}\",\"batch_id\":{i}}}\n",
-                        shms[i].name()
+                         \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":{i}}}\n",
+                        shms[i].name(),
+                        shms[i].size()
                     )
                     .as_bytes(),
                 )

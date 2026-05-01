@@ -20,7 +20,15 @@ use registry::{EvictionConfig, Registry};
 /// stdin/stdout envelope (init/batch/shutdown shape, response field set,
 /// etc.). Reported in the init reply so miint can detect a drift before
 /// sending any batch.
-const PROTOCOL_VERSION: u32 = 1;
+///
+/// History:
+/// - v1: initial daemon protocol (init / batch / shutdown envelopes;
+///   batch carries `tool` + `config` + `shm_input` + optional `batch_id`).
+/// - v2: batch request gains required `shm_input_size` field. The reader
+///   no longer consults `fstat` to size the input mapping (Darwin POSIX
+///   shm has unreliable `fstat` semantics); the protocol's explicit byte
+///   count is now the cross-platform source of truth.
+const PROTOCOL_VERSION: u32 = 2;
 
 /// Default idle timeout (ms) when `init.idle_timeout_ms` is unset. Auto-exit
 /// after this much stdin silence so a stuck miint doesn't leave gpl-boundary
@@ -411,7 +419,7 @@ fn run_worker(tool_name: &str) -> i32 {
             }
         };
 
-        let mut response = ctx.run_batch(&batch.shm_input);
+        let mut response = ctx.run_batch(&batch.shm_input, batch.shm_input_size);
         if response.success {
             response.schema_version = Some(schema_version);
         }

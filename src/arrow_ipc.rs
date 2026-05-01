@@ -19,23 +19,24 @@
 //! `ftruncate` to set the initial size; subsequent calls return EINVAL. The
 //! protocol's `size` field is the canonical, cross-platform source of truth.
 //!
-//! ## Input: zero-copy reader via `Buffer::from_custom_allocation`
+//! ## Reading: zero-copy reader via `Buffer::from_custom_allocation`
 //!
-//! `read_batches_from_shm` opens an input segment as a `ReadOnlyShm` (a
-//! Sync-by-construction wrapper around an `O_RDONLY` + `PROT_READ` mmap)
-//! and wraps it as an `arrow::buffer::Buffer` whose Arc-counted owner is
-//! the mmap itself. `StreamDecoder::with_require_alignment(true)` enforces
-//! that buffer bodies are aligned in place — forcing the decoder to error
-//! out rather than silently fall back to allocate + memcpy on misalignment.
+//! `read_batches_from_shm` is the single read API. It takes an explicit
+//! `size`: callers must supply the data length out-of-band (from
+//! `BatchRequest::shm_input_size` for inputs, or `ShmOutput::size` for
+//! outputs). `fstat` is **not** consulted — Darwin POSIX shm has
+//! unreliable `fstat` semantics, and gpl-boundary's own outputs are
+//! over-allocated to a sparse-mmap reservation, so neither input nor
+//! output segments can rely on `fstat` for cross-platform correctness.
+//!
+//! The function opens a `ReadOnlyShm` (a Sync-by-construction wrapper
+//! around an `O_RDONLY` + `PROT_READ` mmap) and wraps it as an
+//! `arrow::buffer::Buffer` whose Arc-counted owner is the mmap itself.
+//! `StreamDecoder::with_require_alignment(true)` enforces that buffer
+//! bodies are aligned in place — forcing the decoder to error out
+//! rather than silently fall back to allocate + memcpy on misalignment.
 //! The mmap stays alive until the last batch (and any column it carries)
 //! is dropped, even after `shm_unlink`.
-//!
-//! `read_batches_from_shm` is for **input** segments (sized exactly by
-//! their writer, e.g. miint creating a request). For reading
-//! gpl-boundary's own **output** segments — which are over-allocated and
-//! whose `fstat` size does not equal the data length — use
-//! `read_batches_from_shm_sized` and pass the `size` from the
-//! corresponding `ShmOutput`.
 
 use std::ffi::CString;
 use std::io::{self, Write};
@@ -177,7 +178,7 @@ impl ShmWriter {
     /// forbids a second `ftruncate`, so the segment's reported size
     /// is not the data length on either platform. The reader must
     /// honor `ShmOutput::size` rather than `fstat` (see
-    /// `read_batches_from_shm_sized`).
+    /// `read_batches_from_shm`).
     ///
     /// The shm remains linked; the caller (typically
     /// `write_batch_to_output_shm`) passes ownership of cleanup to
@@ -300,16 +301,18 @@ pub fn write_batch_to_output_shm(batch: &RecordBatch, label: &str) -> Result<Shm
         .map_err(|e| format!("Failed to finalize output shm: {e}"))
 }
 
-/// Read all RecordBatches from an Arrow IPC stream in an **input** shared
-/// memory segment — one that was sized to fit its data exactly by its
-/// writer (e.g. miint creating a request, or `test_util` in unit tests).
-/// The mapping size is taken from `fstat`.
+/// Read all RecordBatches from an Arrow IPC stream in a shared memory
+/// segment. `size` must be the exact data byte count — for input segments
+/// it comes from `BatchRequest::shm_input_size`, for output segments from
+/// `ShmOutput::size`. Only that many bytes are mapped, regardless of what
+/// `fstat` would report for the underlying shm fd.
 ///
-/// Use `read_batches_from_shm_sized` instead when reading a segment that
-/// gpl-boundary itself produced via `ShmWriter`/`write_batch_to_output_shm`:
-/// those segments are over-allocated to a sparse-mmap reservation, so
-/// `fstat` does not reflect the data length. The protocol's
-/// `ShmOutput::size` is the authoritative size in that case.
+/// `fstat` is **not** used to size the mapping. Darwin POSIX shm has
+/// inconsistent `fstat` semantics for our usage pattern (the segment is
+/// either over-allocated by gpl-boundary's `ShmWriter`, or sized
+/// correctly by the writer but `fstat` returns more than the data length
+/// on macOS) — neither is a reliable size source. The protocol's
+/// explicit size field is the canonical, cross-platform source of truth.
 ///
 /// Zero-copy: the read-only mmap (`ReadOnlyShm`, which is `Send + Sync` by
 /// construction — `O_RDONLY` + `PROT_READ` makes writes a SIGBUS) is
@@ -323,30 +326,8 @@ pub fn write_batch_to_output_shm(batch: &RecordBatch, label: &str) -> Result<Shm
 /// path is loud, not silent. The mapping survives for as long as any
 /// returned batch (or any column it carries) is alive — including across
 /// `shm_unlink`, since unlink only removes the name.
-pub fn read_batches_from_shm(shm_name: &str) -> Result<Vec<RecordBatch>, String> {
-    let shm =
-        ReadOnlyShm::open(shm_name).map_err(|e| format!("Failed to open shm '{shm_name}': {e}"))?;
-    decode_readonly_shm(shm_name, shm)
-}
-
-/// Read all RecordBatches from an Arrow IPC stream in an **output** shared
-/// memory segment — i.e. one produced by `ShmWriter` whose underlying
-/// segment is over-allocated to a sparse-mmap reservation. `size` must be
-/// the exact byte count from the corresponding `ShmOutput::size`; only
-/// that many bytes are mapped, regardless of the segment's reported file
-/// size.
-///
-/// Same zero-copy guarantees as `read_batches_from_shm`. This is the
-/// production-correct way for any consumer (miint, gpl-boundary's own
-/// tests) to read gpl-boundary outputs across both Linux and macOS.
-/// In production miint is the consumer; within this crate only the
-/// tests exercise it (hence `dead_code` allow).
-#[allow(dead_code)]
-pub fn read_batches_from_shm_sized(
-    shm_name: &str,
-    size: usize,
-) -> Result<Vec<RecordBatch>, String> {
-    let shm = ReadOnlyShm::open_with_size(shm_name, size)
+pub fn read_batches_from_shm(shm_name: &str, size: usize) -> Result<Vec<RecordBatch>, String> {
+    let shm = ReadOnlyShm::open(shm_name, size)
         .map_err(|e| format!("Failed to open shm '{shm_name}': {e}"))?;
     decode_readonly_shm(shm_name, shm)
 }
@@ -420,7 +401,7 @@ mod tests {
         assert!(shm_out.name.contains("gb-"));
         assert!(shm_out.name.ends_with("-test"));
 
-        let batches = read_batches_from_shm_sized(&shm_out.name, shm_out.size).unwrap();
+        let batches = read_batches_from_shm(&shm_out.name, shm_out.size).unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);
 
@@ -447,9 +428,10 @@ mod tests {
         )
         .unwrap();
 
-        let _shm = write_arrow_to_shm(&name, &batch);
+        let holder = write_arrow_to_shm(&name, &batch);
+        let size = holder.len();
 
-        let result = read_batches_from_shm(&name).unwrap();
+        let result = read_batches_from_shm(&name, size).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 2);
 
@@ -467,9 +449,63 @@ mod tests {
 
     #[test]
     fn test_read_batches_nonexistent_shm() {
-        let result = read_batches_from_shm("/nonexistent-shm-12345");
+        let result = read_batches_from_shm("/nonexistent-shm-12345", 1024);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Failed to open shm"));
+    }
+
+    /// Regression test: passing a `size` larger than the actual data must
+    /// surface as a decoder error, not a silent success. This is the exact
+    /// failure mode the cross-platform `shm_input_size` plumbing was meant
+    /// to fix on Darwin (where `fstat` over-reports the segment size). If
+    /// a future change re-introduces an `fstat` fallback that produces a
+    /// too-large size, this test catches it.
+    #[test]
+    fn test_read_with_oversize_errors() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["hello", "world"]))],
+        )
+        .unwrap();
+        let shm_out = write_batch_to_output_shm(&batch, "oversize").unwrap();
+        let inflated = shm_out.size + 1024;
+        let result = read_batches_from_shm(&shm_out.name, inflated);
+        assert!(
+            result.is_err(),
+            "Expected oversize read to error, got Ok with {} batches",
+            result.as_ref().map(|v| v.len()).unwrap_or(0)
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Unexpected EOS") || err.contains("Failed to decode"),
+            "Expected decoder EOS/decode error, got: {err}"
+        );
+        crate::shm::deregister_cleanup(&shm_out.name);
+        let _ = SharedMemory::unlink(&shm_out.name);
+    }
+
+    /// Passing `size == 0` against a non-empty segment must error explicitly,
+    /// not silently return `Ok(Vec::new())`. Otherwise a caller that forgets
+    /// to plumb `shm_input_size` would lose data with no diagnostic.
+    #[test]
+    fn test_read_with_size_zero_against_nonempty_errors() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["data"]))]).unwrap();
+        let shm_out = write_batch_to_output_shm(&batch, "size-zero").unwrap();
+        let result = read_batches_from_shm(&shm_out.name, 0);
+        assert!(
+            result.is_err(),
+            "Expected size=0 against non-empty segment to error"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("size=0") && err.contains("non-empty"),
+            "Expected explanatory error about size=0 vs non-empty, got: {err}"
+        );
+        crate::shm::deregister_cleanup(&shm_out.name);
+        let _ = SharedMemory::unlink(&shm_out.name);
     }
 
     // --- Phase 2 additions: zero-copy output + zero-copy input ---
@@ -557,7 +593,7 @@ mod tests {
             shm_out.size
         );
 
-        let batches = read_batches_from_shm_sized(&shm_out.name, shm_out.size).unwrap();
+        let batches = read_batches_from_shm(&shm_out.name, shm_out.size).unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 2048);
 
@@ -621,7 +657,7 @@ mod tests {
         let batch = make_large_batch(n_rows, str_len);
         let shm_out = write_batch_to_output_shm(&batch, "zcin").unwrap();
 
-        let shm = crate::shm::ReadOnlyShm::open_with_size(&shm_out.name, shm_out.size).unwrap();
+        let shm = crate::shm::ReadOnlyShm::open(&shm_out.name, shm_out.size).unwrap();
         let mmap_start = shm.as_ptr() as usize;
         let mmap_end = mmap_start + shm.len();
         let ptr = NonNull::new(shm.as_ptr() as *mut u8).unwrap();
@@ -675,7 +711,7 @@ mod tests {
         let batch = make_large_batch(n_rows, str_len);
         let shm_out = write_batch_to_output_shm(&batch, "outlive").unwrap();
 
-        let batches = read_batches_from_shm_sized(&shm_out.name, shm_out.size).unwrap();
+        let batches = read_batches_from_shm(&shm_out.name, shm_out.size).unwrap();
 
         crate::shm::deregister_cleanup(&shm_out.name);
         SharedMemory::unlink(&shm_out.name).unwrap();

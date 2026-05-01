@@ -81,6 +81,7 @@ handshake, a batch request, or a `shutdown` sentinel.
 {"tool": "fasttree",
  "config": {"seq_type": "nucleotide", "seed": 12345},
  "shm_input": "/miint-input-uuid",
+ "shm_input_size": 8192,
  "batch_id": 42}
 // gpl-boundary replies (responses may arrive out of submission order
 // across distinct fingerprints — correlate by `batch_id`):
@@ -201,6 +202,7 @@ Closing stdin or letting `idle_timeout_ms` elapse is equivalent to sending
 | `tool` | string | yes | Must match a tool from `--list-tools` |
 | `config` | object | yes | May be `{}`; defaults are applied for missing keys. Unknown keys are silently ignored. |
 | `shm_input` | string | yes | POSIX shm name (must start with `/`) |
+| `shm_input_size` | integer | yes | Exact byte count of the Arrow IPC stream in `shm_input`. The reader uses this to size its mapping; `fstat` is not reliable on Darwin POSIX shm. miint, which created the input segment, already knows this value. |
 | `batch_id` | integer | no | Echoed on the response so out-of-order completions across fingerprints can be correlated |
 
 Config parameter types (`seed` is a JSON number, `seq_type` is a JSON string,
@@ -239,14 +241,15 @@ string on an existing knob) bump only `describe_version`.
 
 - **Format**: Arrow IPC **stream** format (not file format).
 - **Offset**: raw IPC bytes start at byte 0 of the shared memory region.
-- **Length**: `size` in `shm_outputs` is the exact byte count of IPC data
-  and is the **only** authoritative size source. The output segment is
-  sparse-mmap-reserved by gpl-boundary at a much larger ceiling (default
-  1 GiB), so `fstat` on the segment returns the reservation, not the data
-  length. Readers must mmap exactly `size` bytes from offset 0; do not call
-  `fstat` to size the mapping. This is required for cross-platform correctness:
-  Darwin POSIX shm permits `ftruncate` to set the size only once, so the
-  writer cannot legally shrink the segment after writing.
+- **Length**: the protocol's explicit byte count is the **only** authoritative
+  size source. For batch *inputs*, that's `shm_input_size` in the request;
+  for batch *outputs*, it's `size` in each `shm_outputs` entry of the response.
+  Readers must mmap exactly that many bytes from offset 0; **do not call
+  `fstat` to size the mapping**. This is required for cross-platform
+  correctness: Darwin POSIX shm has unreliable `fstat` semantics, and
+  gpl-boundary's own outputs are over-allocated to a sparse-mmap reservation
+  (default 1 GiB), so `fstat` returns the reservation rather than the data
+  length on either platform.
 - **Batches**: a single RecordBatch per stream (current convention; consumers
   should handle multiple batches for forward compatibility).
 

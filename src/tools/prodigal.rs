@@ -370,8 +370,11 @@ fn best_meta_desc_to_string(stats: &ProdigalStats) -> String {
 
 impl ProdigalTool {
     /// Read Arrow IPC stream from shared memory, extract name and sequence columns.
-    fn read_input(shm_input: &str) -> Result<(Vec<String>, Vec<String>), String> {
-        let batches = crate::arrow_ipc::read_batches_from_shm(shm_input)?;
+    fn read_input(
+        shm_input: &str,
+        shm_input_size: usize,
+    ) -> Result<(Vec<String>, Vec<String>), String> {
+        let batches = crate::arrow_ipc::read_batches_from_shm(shm_input, shm_input_size)?;
 
         let mut all_names = Vec::new();
         let mut all_seqs = Vec::new();
@@ -430,8 +433,8 @@ impl Drop for ProdigalStreamingContext {
 }
 
 impl StreamingContext for ProdigalStreamingContext {
-    fn run_batch(&mut self, shm_input: &str) -> Response {
-        let (names, sequences) = match ProdigalTool::read_input(shm_input) {
+    fn run_batch(&mut self, shm_input: &str, shm_input_size: usize) -> Response {
+        let (names, sequences) = match ProdigalTool::read_input(shm_input, shm_input_size) {
             Ok(data) => data,
             Err(e) => return Response::error(e),
         };
@@ -765,9 +768,14 @@ impl GplTool for ProdigalTool {
         }
     }
 
-    fn execute(&self, config: &serde_json::Value, shm_input: &str) -> Response {
+    fn execute(
+        &self,
+        config: &serde_json::Value,
+        shm_input: &str,
+        shm_input_size: usize,
+    ) -> Response {
         // Read input sequences from Arrow IPC in shared memory
-        let (names, sequences) = match Self::read_input(shm_input) {
+        let (names, sequences) = match Self::read_input(shm_input, shm_input_size) {
             Ok(data) => data,
             Err(e) => return Response::error(e),
         };
@@ -995,7 +1003,8 @@ mod tests {
 
         let batch = make_input_batch(&["contig_1", "contig_2"], &[TEST_SEQ_1, TEST_SEQ_2]);
 
-        let _input_shm = write_arrow_to_shm(&input_name, &batch);
+        let input_shm = write_arrow_to_shm(&input_name, &batch);
+        let input_shm_size = input_shm.len();
 
         let tool = ProdigalTool;
         let config = serde_json::json!({
@@ -1003,7 +1012,7 @@ mod tests {
             "trans_table": 11,
         });
 
-        let response = tool.execute(&config, &input_name);
+        let response = tool.execute(&config, &input_name, input_shm_size);
         assert!(
             response.success,
             "Prodigal meta failed: {:?}",
@@ -1013,9 +1022,10 @@ mod tests {
         // Verify output shm metadata
         assert_eq!(response.shm_outputs.len(), 1);
         let output_name = &response.shm_outputs[0].name;
+        let output_size = response.shm_outputs[0].size;
         assert!(output_name.starts_with("/gb-"));
         assert_eq!(response.shm_outputs[0].label, "genes");
-        assert!(response.shm_outputs[0].size > 0);
+        assert!(output_size > 0);
 
         // Verify JSON metadata
         let result = response.result.unwrap();
@@ -1028,7 +1038,7 @@ mod tests {
         assert!(result["stats"]["best_meta_bin"].as_i64().unwrap() >= 0);
 
         // Verify Arrow IPC output
-        let out_batches = read_arrow_from_shm(output_name);
+        let out_batches = read_arrow_from_shm(output_name, output_size);
         assert_eq!(out_batches.len(), 1);
         let out = &out_batches[0];
         assert_eq!(out.num_columns(), 16);
@@ -1071,7 +1081,8 @@ mod tests {
 
         // 960 bp sequences are far below the 20000 bp minimum for training
         let batch = make_input_batch(&["contig_1"], &[TEST_SEQ_1]);
-        let _input_shm = write_arrow_to_shm(&input_name, &batch);
+        let input_shm = write_arrow_to_shm(&input_name, &batch);
+        let input_shm_size = input_shm.len();
 
         let tool = ProdigalTool;
         let config = serde_json::json!({
@@ -1079,7 +1090,7 @@ mod tests {
             "trans_table": 11,
         });
 
-        let response = tool.execute(&config, &input_name);
+        let response = tool.execute(&config, &input_name, input_shm_size);
         assert!(
             !response.success,
             "Expected failure for too-short training input"
@@ -1102,7 +1113,7 @@ mod tests {
         let tool = ProdigalTool;
         let config = serde_json::json!({"meta_mode": true});
 
-        let response = tool.execute(&config, "/nonexistent-shm-name");
+        let response = tool.execute(&config, "/nonexistent-shm-name", 0);
         assert!(!response.success);
         assert!(response.error.unwrap().contains("Failed to open shm"));
     }
@@ -1149,9 +1160,10 @@ mod tests {
 
         let input_name = unique_shm_name("pd-str-in");
         let batch = make_input_batch(&["contig_1", "contig_2"], &[TEST_SEQ_1, TEST_SEQ_2]);
-        let _input_shm = write_arrow_to_shm(&input_name, &batch);
+        let input_shm = write_arrow_to_shm(&input_name, &batch);
+        let input_shm_size = input_shm.len();
 
-        let response = ctx.run_batch(&input_name);
+        let response = ctx.run_batch(&input_name, input_shm_size);
         assert!(response.success, "run_batch failed: {:?}", response.error);
         assert_eq!(response.shm_outputs.len(), 1);
         assert_eq!(response.shm_outputs[0].label, "genes");
@@ -1160,7 +1172,8 @@ mod tests {
         assert!(result["n_genes"].as_i64().unwrap() > 0);
         assert_eq!(result["n_sequences"], 2);
 
-        let out_batches = read_arrow_from_shm(&response.shm_outputs[0].name);
+        let out_batches =
+            read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
         assert_eq!(out_batches.len(), 1);
         assert!(out_batches[0].num_rows() > 0);
 
@@ -1179,8 +1192,9 @@ mod tests {
         // Batch 1: one sequence
         let input1 = unique_shm_name("pd-str-b1");
         let batch1 = make_input_batch(&["contig_1"], &[TEST_SEQ_1]);
-        let _shm1 = write_arrow_to_shm(&input1, &batch1);
-        let resp1 = ctx.run_batch(&input1);
+        let shm_holder1 = write_arrow_to_shm(&input1, &batch1);
+        let shm_holder1_size = shm_holder1.len();
+        let resp1 = ctx.run_batch(&input1, shm_holder1_size);
         assert!(resp1.success, "Batch 1 failed: {:?}", resp1.error);
         let genes1 = resp1.result.as_ref().unwrap()["n_genes"].as_i64().unwrap();
         let _ = SharedMemory::unlink(&resp1.shm_outputs[0].name);
@@ -1188,8 +1202,9 @@ mod tests {
         // Batch 2: different sequence
         let input2 = unique_shm_name("pd-str-b2");
         let batch2 = make_input_batch(&["contig_2"], &[TEST_SEQ_2]);
-        let _shm2 = write_arrow_to_shm(&input2, &batch2);
-        let resp2 = ctx.run_batch(&input2);
+        let shm_holder2 = write_arrow_to_shm(&input2, &batch2);
+        let shm_holder2_size = shm_holder2.len();
+        let resp2 = ctx.run_batch(&input2, shm_holder2_size);
         assert!(resp2.success, "Batch 2 failed: {:?}", resp2.error);
         let genes2 = resp2.result.as_ref().unwrap()["n_genes"].as_i64().unwrap();
         let _ = SharedMemory::unlink(&resp2.shm_outputs[0].name);
