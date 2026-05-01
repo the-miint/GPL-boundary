@@ -519,22 +519,38 @@ directory of `index_path` exists. Config knobs: `nthreads`, `seed`, `offrate`,
 
 **Output (`write_batch_to_output_shm`)**: zero-copy via `arrow_ipc::ShmWriter`,
 which `shm_open`s a fresh segment, sparsely reserves `GPL_BOUNDARY_MAX_SHM_BYTES`
-virtual bytes (default 1 GiB), and `mmap`s once. The Arrow `StreamWriter` writes
-directly into the mapping. On `finish()` the writer `munmap`s, `ftruncate`s the fd
-down to the exact written byte count (releasing unused pages back to the kernel),
-and closes. There is no intermediate `Vec<u8>` and no remap during writing. POSIX
-shm objects are sparse on Linux and macOS, so the 1 GiB reservation is virtually
-free for normal-sized outputs. If a tool produces an output larger than the cap,
-`Write::write` returns `WriteZero` and the writer's `Drop` unlinks the partial
-segment.
+virtual bytes (default 1 GiB) via a single `ftruncate`, and `mmap`s once. The
+Arrow `StreamWriter` writes directly into the mapping. On `finish()` the
+writer `munmap`s and closes. There is no intermediate `Vec<u8>` and no remap
+during writing. POSIX shm objects are sparse on Linux and macOS, so the 1 GiB
+reservation is virtually free for normal-sized outputs. If a tool produces an
+output larger than the cap, `Write::write` returns `WriteZero` and the
+writer's `Drop` unlinks the partial segment.
 
-**Input (`read_batches_from_shm`)**: zero-copy via Arrow's
-`Buffer::from_custom_allocation`. The `SharedMemory` mmap is wrapped as a
-`Buffer` whose Arc-counted `Allocation` owner is the mapping itself. Arrow's
-`StreamDecoder` slices that buffer for each batch body without copying. The
-returned `RecordBatch`es reference the mmap directly; the mapping survives
-until the last batch (and any column derived from it) is dropped, even after
-`shm_unlink`. Verified by `arrow_ipc::tests::test_input_mmap_outlives_unlink`.
+**The segment's reported file size stays at the reservation, not at the data
+length.** The exact byte count travels in `ShmOutput::size` (i.e. in the JSON
+response). The reader **must** use that value to size its mapping — `fstat`
+returns the reservation, not the data. This is required because Darwin's
+POSIX shm only allows `ftruncate` to set the size **once**; a second call
+(to shrink at finish) returns EINVAL on macOS. The protocol's `size` field
+is therefore the canonical, cross-platform source of truth — not a
+side-channel through `fstat`.
+
+**Input (`read_batches_from_shm`)** — for segments sized exactly by their
+writer (e.g. miint creating a request, or test_util in unit tests). Uses
+`fstat` to size the mapping. Zero-copy via Arrow's `Buffer::from_custom_allocation`:
+the `ReadOnlyShm` mmap is wrapped as a `Buffer` whose Arc-counted `Allocation`
+owner is the mapping itself. Arrow's `StreamDecoder` slices that buffer for
+each batch body without copying. The returned `RecordBatch`es reference the
+mmap directly; the mapping survives until the last batch (and any column
+derived from it) is dropped, even after `shm_unlink`. Verified by
+`arrow_ipc::tests::test_input_mmap_outlives_unlink`.
+
+**Output reads (`read_batches_from_shm_sized`)** — for segments produced by
+`ShmWriter`, where the segment is over-allocated to a sparse reservation.
+Caller passes the explicit `size` from the corresponding `ShmOutput`. Same
+zero-copy guarantees as `read_batches_from_shm`. This is the
+production-correct path for miint reading gpl-boundary outputs.
 
 ## C API contract for submodules
 

@@ -361,10 +361,13 @@ impl SharedMemory {
     /// Create a new shared memory region for writing.
     ///
     /// Production write paths use `arrow_ipc::ShmWriter` instead of this —
-    /// `ShmWriter` reserves a sparse 1 GiB region and `ftruncate`s down at
-    /// finish, avoiding any Vec-then-memcpy. This entry point is kept for
-    /// `test_util` and signal-handler-cleanup tests where a fixed-size
-    /// allocation is convenient.
+    /// `ShmWriter` reserves a large sparse region (default 1 GiB) and
+    /// hands its size out-of-band via `ShmOutput::size`, avoiding any
+    /// Vec-then-memcpy. This entry point is kept for `test_util` and
+    /// signal-handler-cleanup tests where a fixed-size allocation is
+    /// convenient. Note that POSIX shm on macOS only allows `ftruncate`
+    /// to set the size **once** — `create` does that here and never
+    /// resizes again.
     #[cfg(unix)]
     #[allow(dead_code)]
     pub fn create(name: &str, size: usize) -> io::Result<Self> {
@@ -498,24 +501,32 @@ fn to_cstring(name: &str) -> io::Result<CString> {
 /// An immutable mmap of a POSIX shm segment, opened with `O_RDONLY` and
 /// mapped `PROT_READ`. Write attempts would be SIGBUS at the OS level, so
 /// the mapping is genuinely shareable across threads — `Send + Sync` is
-/// sound by construction. Used by `arrow_ipc::read_batches_from_shm` to
-/// wrap the input as a zero-copy `arrow_buffer::Buffer`.
+/// sound by construction. Used by `arrow_ipc::read_batches_from_shm` and
+/// `read_batches_from_shm_sized` to wrap a segment as a zero-copy
+/// `arrow_buffer::Buffer`.
 ///
 /// The struct does NOT unlink on drop; it only munmaps. The shm name is
-/// owned by the caller of `read_batches_from_shm` (typically miint).
+/// owned by the caller (typically miint).
 pub struct ReadOnlyShm {
     ptr: *const u8,
     len: usize,
 }
 
-// SAFETY: `ReadOnlyShm` is constructed only by `open` below, which uses
-// `O_RDONLY` + `PROT_READ`. The OS rejects writes via SIGBUS, so the
-// mapping is immutable for its entire lifetime; concurrent reads from
-// any number of threads are race-free.
+// SAFETY: `ReadOnlyShm` is constructed only by `open` / `open_with_size`
+// below, both of which use `O_RDONLY` + `PROT_READ`. The OS rejects writes
+// via SIGBUS, so the mapping is immutable for its entire lifetime;
+// concurrent reads from any number of threads are race-free.
 unsafe impl Send for ReadOnlyShm {}
 unsafe impl Sync for ReadOnlyShm {}
 
 impl ReadOnlyShm {
+    /// Open an **input** segment whose size is taken from `fstat`.
+    ///
+    /// Use this only for segments whose writer sized them exactly to fit
+    /// the data (e.g. miint creating a request, or `test_util` in unit
+    /// tests). Output segments produced by gpl-boundary's `ShmWriter` are
+    /// over-allocated to a sparse-mmap reservation; `fstat` does not
+    /// reflect their data length, so use `open_with_size` instead.
     #[cfg(unix)]
     pub fn open(name: &str) -> io::Result<Self> {
         let c_name = to_cstring(name)?;
@@ -526,35 +537,62 @@ impl ReadOnlyShm {
             }
 
             let len = fd_size(fd)?;
+            Self::map_fd(fd, len)
+        }
+    }
 
-            // Special-case the empty mapping: mmap with len=0 is undefined.
-            // Return an empty handle that callers can treat as 0-byte input.
-            if len == 0 {
-                libc::close(fd);
-                return Ok(Self {
-                    ptr: std::ptr::null(),
-                    len: 0,
-                });
-            }
-
-            let ptr = libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            );
-            libc::close(fd);
-
-            if ptr == libc::MAP_FAILED {
+    /// Open a segment with an explicit `size`, mapping exactly `size`
+    /// bytes regardless of what `fstat` would report.
+    ///
+    /// This is the cross-platform-correct way to read gpl-boundary's
+    /// output segments: `ShmWriter` produces sparse-mmap reservations
+    /// whose reported file size is the reservation, not the data
+    /// length. Pass `ShmOutput::size` from the protocol response.
+    ///
+    /// In production, miint reads outputs this way; in this crate, only
+    /// the tests exercise it (hence `dead_code` allow).
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    pub fn open_with_size(name: &str, size: usize) -> io::Result<Self> {
+        let c_name = to_cstring(name)?;
+        unsafe {
+            let fd = libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0);
+            if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
-            Ok(Self {
-                ptr: ptr as *const u8,
-                len,
-            })
+            Self::map_fd(fd, size)
         }
+    }
+
+    /// Shared mmap helper. Closes `fd` before returning. `len == 0` is
+    /// special-cased because `mmap` with length 0 is undefined.
+    #[cfg(unix)]
+    unsafe fn map_fd(fd: i32, len: usize) -> io::Result<Self> {
+        if len == 0 {
+            libc::close(fd);
+            return Ok(Self {
+                ptr: std::ptr::null(),
+                len: 0,
+            });
+        }
+
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        );
+        libc::close(fd);
+
+        if ptr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            ptr: ptr as *const u8,
+            len,
+        })
     }
 
     pub fn as_ptr(&self) -> *const u8 {

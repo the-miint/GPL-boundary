@@ -239,8 +239,14 @@ string on an existing knob) bump only `describe_version`.
 
 - **Format**: Arrow IPC **stream** format (not file format).
 - **Offset**: raw IPC bytes start at byte 0 of the shared memory region.
-- **Length**: `size` in `shm_outputs` is the exact byte count of IPC data.
-  Read exactly `size` bytes; the shm region may be larger due to page alignment.
+- **Length**: `size` in `shm_outputs` is the exact byte count of IPC data
+  and is the **only** authoritative size source. The output segment is
+  sparse-mmap-reserved by gpl-boundary at a much larger ceiling (default
+  1 GiB), so `fstat` on the segment returns the reservation, not the data
+  length. Readers must mmap exactly `size` bytes from offset 0; do not call
+  `fstat` to size the mapping. This is required for cross-platform correctness:
+  Darwin POSIX shm permits `ftruncate` to set the size only once, so the
+  writer cannot legally shrink the segment after writing.
 - **Batches**: a single RecordBatch per stream (current convention; consumers
   should handle multiple batches for forward compatibility).
 

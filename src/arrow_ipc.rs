@@ -8,13 +8,20 @@
 //! shm objects on Linux and macOS are sparse — physical pages are only
 //! allocated on first touch — so the reservation is virtually free. The
 //! Arrow `StreamWriter` writes directly into the mapping; on `finish()` we
-//! `ftruncate` the fd down to the exact written byte count, releasing any
-//! unused pages back to the kernel. There is exactly one `mmap`, no remaps
-//! during writing, and no `Vec<u8>` intermediate buffer.
+//! `munmap` and `close`. There is exactly one `mmap`, no remaps during
+//! writing, and no `Vec<u8>` intermediate buffer.
+//!
+//! The segment's reported file size stays at the over-allocated reservation,
+//! not the actual byte count written. **The reader must use the explicit
+//! `size` field returned in the protocol response — not `fstat` — to size
+//! its mapping.** Linux historically allowed shrinking via a second
+//! `ftruncate` at finish time, but POSIX shm on macOS only permits a single
+//! `ftruncate` to set the initial size; subsequent calls return EINVAL. The
+//! protocol's `size` field is the canonical, cross-platform source of truth.
 //!
 //! ## Input: zero-copy reader via `Buffer::from_custom_allocation`
 //!
-//! `read_batches_from_shm` opens the input segment as a `ReadOnlyShm` (a
+//! `read_batches_from_shm` opens an input segment as a `ReadOnlyShm` (a
 //! Sync-by-construction wrapper around an `O_RDONLY` + `PROT_READ` mmap)
 //! and wraps it as an `arrow::buffer::Buffer` whose Arc-counted owner is
 //! the mmap itself. `StreamDecoder::with_require_alignment(true)` enforces
@@ -22,6 +29,13 @@
 //! out rather than silently fall back to allocate + memcpy on misalignment.
 //! The mmap stays alive until the last batch (and any column it carries)
 //! is dropped, even after `shm_unlink`.
+//!
+//! `read_batches_from_shm` is for **input** segments (sized exactly by
+//! their writer, e.g. miint creating a request). For reading
+//! gpl-boundary's own **output** segments — which are over-allocated and
+//! whose `fstat` size does not equal the data length — use
+//! `read_batches_from_shm_sized` and pass the `size` from the
+//! corresponding `ShmOutput`.
 
 use std::ffi::CString;
 use std::io::{self, Write};
@@ -68,11 +82,13 @@ fn default_max_shm_bytes() -> usize {
 ///   and registers the name for signal-handler cleanup.
 /// - `Write::write` — copies bytes into the mapping at the current write
 ///   offset; returns `WriteZero` if the write would exceed `max_capacity`.
-/// - `finish(self)` — munmaps, truncates the fd down to exactly `written`
-///   bytes (releasing unused pages), closes the fd, and returns a
-///   `ShmOutput` describing the segment. The shm remains linked for the
-///   reader; the cleanup-registry deregister happens in `main.rs` after the
-///   JSON response is on stdout.
+/// - `finish(self)` — munmaps, closes the fd, and returns a `ShmOutput`
+///   carrying the exact `written` byte count. The segment is left at its
+///   `max_capacity` reservation (no second `ftruncate` — Darwin POSIX shm
+///   forbids it); the reader must use `ShmOutput::size`, not `fstat`, to
+///   size its mapping. The shm remains linked for the reader; the
+///   cleanup-registry deregister happens in `main.rs` after the JSON
+///   response is on stdout.
 /// - `Drop` (without `finish`) — munmaps, closes, deregisters cleanup, and
 ///   `shm_unlink`s. Used to clean up after a write error or an aborted
 ///   transaction.
@@ -155,12 +171,18 @@ impl ShmWriter {
         }
     }
 
-    /// Consume the writer, truncate the shm down to the exact written size,
-    /// munmap, close, and return a `ShmOutput` describing the segment. The
-    /// shm remains linked; the caller (typically `write_batch_to_output_shm`)
-    /// passes ownership of cleanup to miint via the response and to the
-    /// signal-handler registry until `main.rs` deregisters after stdout
-    /// flush.
+    /// Consume the writer: munmap, close, and return a `ShmOutput`
+    /// carrying the exact `written` byte count. The segment itself is
+    /// left at the `max_capacity` reservation — Darwin POSIX shm
+    /// forbids a second `ftruncate`, so the segment's reported size
+    /// is not the data length on either platform. The reader must
+    /// honor `ShmOutput::size` rather than `fstat` (see
+    /// `read_batches_from_shm_sized`).
+    ///
+    /// The shm remains linked; the caller (typically
+    /// `write_batch_to_output_shm`) passes ownership of cleanup to
+    /// miint via the response and to the signal-handler registry
+    /// until `main.rs` deregisters after stdout flush.
     pub fn finish(mut self) -> io::Result<ShmOutput> {
         let written = self.written;
         let fd = self.fd;
@@ -177,14 +199,6 @@ impl ShmWriter {
             if libc::munmap(ptr as *mut c_void, max_capacity) < 0 {
                 let err = io::Error::last_os_error();
                 // Best-effort cleanup of the now-orphaned fd and name.
-                libc::close(fd);
-                let c_name = CString::new(name.as_str()).unwrap_or_default();
-                libc::shm_unlink(c_name.as_ptr());
-                crate::shm::deregister_cleanup(&name);
-                return Err(err);
-            }
-            if libc::ftruncate(fd, written as libc::off_t) < 0 {
-                let err = io::Error::last_os_error();
                 libc::close(fd);
                 let c_name = CString::new(name.as_str()).unwrap_or_default();
                 libc::shm_unlink(c_name.as_ptr());
@@ -286,7 +300,16 @@ pub fn write_batch_to_output_shm(batch: &RecordBatch, label: &str) -> Result<Shm
         .map_err(|e| format!("Failed to finalize output shm: {e}"))
 }
 
-/// Read all RecordBatches from an Arrow IPC stream in shared memory.
+/// Read all RecordBatches from an Arrow IPC stream in an **input** shared
+/// memory segment — one that was sized to fit its data exactly by its
+/// writer (e.g. miint creating a request, or `test_util` in unit tests).
+/// The mapping size is taken from `fstat`.
+///
+/// Use `read_batches_from_shm_sized` instead when reading a segment that
+/// gpl-boundary itself produced via `ShmWriter`/`write_batch_to_output_shm`:
+/// those segments are over-allocated to a sparse-mmap reservation, so
+/// `fstat` does not reflect the data length. The protocol's
+/// `ShmOutput::size` is the authoritative size in that case.
 ///
 /// Zero-copy: the read-only mmap (`ReadOnlyShm`, which is `Send + Sync` by
 /// construction — `O_RDONLY` + `PROT_READ` makes writes a SIGBUS) is
@@ -303,7 +326,32 @@ pub fn write_batch_to_output_shm(batch: &RecordBatch, label: &str) -> Result<Shm
 pub fn read_batches_from_shm(shm_name: &str) -> Result<Vec<RecordBatch>, String> {
     let shm =
         ReadOnlyShm::open(shm_name).map_err(|e| format!("Failed to open shm '{shm_name}': {e}"))?;
+    decode_readonly_shm(shm_name, shm)
+}
 
+/// Read all RecordBatches from an Arrow IPC stream in an **output** shared
+/// memory segment — i.e. one produced by `ShmWriter` whose underlying
+/// segment is over-allocated to a sparse-mmap reservation. `size` must be
+/// the exact byte count from the corresponding `ShmOutput::size`; only
+/// that many bytes are mapped, regardless of the segment's reported file
+/// size.
+///
+/// Same zero-copy guarantees as `read_batches_from_shm`. This is the
+/// production-correct way for any consumer (miint, gpl-boundary's own
+/// tests) to read gpl-boundary outputs across both Linux and macOS.
+/// In production miint is the consumer; within this crate only the
+/// tests exercise it (hence `dead_code` allow).
+#[allow(dead_code)]
+pub fn read_batches_from_shm_sized(
+    shm_name: &str,
+    size: usize,
+) -> Result<Vec<RecordBatch>, String> {
+    let shm = ReadOnlyShm::open_with_size(shm_name, size)
+        .map_err(|e| format!("Failed to open shm '{shm_name}': {e}"))?;
+    decode_readonly_shm(shm_name, shm)
+}
+
+fn decode_readonly_shm(shm_name: &str, shm: ReadOnlyShm) -> Result<Vec<RecordBatch>, String> {
     let len = shm.len();
     if len == 0 {
         return Ok(Vec::new());
@@ -346,7 +394,7 @@ pub fn read_batches_from_shm(shm_name: &str) -> Result<Vec<RecordBatch>, String>
 mod tests {
     use super::*;
     use crate::shm::SharedMemory;
-    use crate::test_util::{read_arrow_from_shm, unique_shm_name, write_arrow_to_shm};
+    use crate::test_util::{unique_shm_name, write_arrow_to_shm};
     use arrow::array::{Array, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
@@ -372,7 +420,7 @@ mod tests {
         assert!(shm_out.name.contains("gb-"));
         assert!(shm_out.name.ends_with("-test"));
 
-        let batches = read_arrow_from_shm(&shm_out.name);
+        let batches = read_batches_from_shm_sized(&shm_out.name, shm_out.size).unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);
 
@@ -464,23 +512,33 @@ mod tests {
     }
 
     #[test]
-    fn test_shm_writer_truncates_to_written_size() {
-        // After finish(), the shm fd's reported size must equal the byte
-        // count we wrote, not the 1 GiB virtual reservation. Without the
-        // ftruncate-down step, the segment would consume up to 1 GiB of
-        // tmpfs quota even for a tiny output.
+    fn test_shm_writer_finish_leaves_segment_at_reservation() {
+        // After finish(), the shm fd's reported size is the over-allocated
+        // reservation, not the data length. macOS POSIX shm forbids a
+        // second ftruncate, so the writer cannot legally shrink the
+        // segment after sizing it once at create. The data length lives
+        // in `ShmOutput::size`; readers must honor that, not `fstat`.
+        // Sparse pages mean the actual RAM cost still tracks `written`,
+        // not the reservation.
         let batch = make_large_batch(10, 4);
         let shm_out = write_batch_to_output_shm(&batch, "truncchk").unwrap();
         let on_disk = fstat_shm_size(&shm_out.name);
+        let reservation = std::env::var("GPL_BOUNDARY_MAX_SHM_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_MAX_SHM_BYTES);
         assert_eq!(
-            on_disk, shm_out.size,
-            "ShmOutput.size and on-disk size disagree: {} vs {}",
-            shm_out.size, on_disk
+            on_disk, reservation,
+            "Segment fstat size {} should equal the reservation {} — \
+             a regression that re-introduced ftruncate-down would make \
+             it match shm_out.size {} instead",
+            on_disk, reservation, shm_out.size
         );
         assert!(
-            on_disk < 1 << 20,
-            "Tiny batch should produce <1 MiB shm, got {on_disk} bytes \
-             (suggests ftruncate-down didn't run)"
+            shm_out.size > 0 && shm_out.size < on_disk,
+            "Data length {} should be much smaller than reservation {}",
+            shm_out.size,
+            on_disk
         );
         crate::shm::deregister_cleanup(&shm_out.name);
         let _ = SharedMemory::unlink(&shm_out.name);
@@ -499,7 +557,7 @@ mod tests {
             shm_out.size
         );
 
-        let batches = read_batches_from_shm(&shm_out.name).unwrap();
+        let batches = read_batches_from_shm_sized(&shm_out.name, shm_out.size).unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 2048);
 
@@ -563,7 +621,7 @@ mod tests {
         let batch = make_large_batch(n_rows, str_len);
         let shm_out = write_batch_to_output_shm(&batch, "zcin").unwrap();
 
-        let shm = crate::shm::ReadOnlyShm::open(&shm_out.name).unwrap();
+        let shm = crate::shm::ReadOnlyShm::open_with_size(&shm_out.name, shm_out.size).unwrap();
         let mmap_start = shm.as_ptr() as usize;
         let mmap_end = mmap_start + shm.len();
         let ptr = NonNull::new(shm.as_ptr() as *mut u8).unwrap();
@@ -617,7 +675,7 @@ mod tests {
         let batch = make_large_batch(n_rows, str_len);
         let shm_out = write_batch_to_output_shm(&batch, "outlive").unwrap();
 
-        let batches = read_batches_from_shm(&shm_out.name).unwrap();
+        let batches = read_batches_from_shm_sized(&shm_out.name, shm_out.size).unwrap();
 
         crate::shm::deregister_cleanup(&shm_out.name);
         SharedMemory::unlink(&shm_out.name).unwrap();
