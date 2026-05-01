@@ -200,10 +200,7 @@ impl ShmWriter {
 
 impl Write for ShmWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let remaining = self
-            .max_capacity
-            .checked_sub(self.written)
-            .unwrap_or_default();
+        let remaining = self.max_capacity.saturating_sub(self.written);
         if buf.len() > remaining {
             // We could partially write up to `remaining`, but Arrow's
             // StreamWriter expects all-or-nothing for record batch bodies —

@@ -27,7 +27,7 @@ jobs:
 
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install rocksdb zlib
+        run: brew install rocksdb zlib libomp
 
       - uses: dtolnay/rust-toolchain@stable
 

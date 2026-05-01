@@ -60,6 +60,7 @@ gpl-boundary --describe fasttree
 gpl-boundary --describe prodigal
 gpl-boundary --describe sortmerna
 gpl-boundary --describe bowtie2-align
+gpl-boundary --describe bowtie2-build
 ```
 
 ## Usage
@@ -179,26 +180,60 @@ miint (C++ DuckDB ext)                    gpl-boundary (Rust)
 This section specifies the protocol precisely enough for a clean-room client
 implementation (e.g., the BSD-licensed miint consumer).
 
-### JSON request (stdin)
+The wire format is line-delimited JSON (NDJSON) on stdin/stdout. Every line
+on stdin is one of three envelopes; each line on stdout is one response.
+
+### Stdin envelopes
+
+| Envelope | Required first? | Shape |
+|----------|-----------------|-------|
+| `init` | yes (line 1) | `{"init": { ...session knobs... }}` |
+| batch | no | `{"tool": "...", "config": {...}, "shm_input": "...", "batch_id": ...}` |
+| `shutdown` | no | `{"shutdown": true}` |
+
+Closing stdin or letting `idle_timeout_ms` elapse is equivalent to sending
+`shutdown`.
+
+### Batch request fields
 
 | Field | Type | Required | Notes |
 |-------|------|----------|-------|
 | `tool` | string | yes | Must match a tool from `--list-tools` |
 | `config` | object | yes | May be `{}`; defaults are applied for missing keys. Unknown keys are silently ignored. |
 | `shm_input` | string | yes | POSIX shm name (must start with `/`) |
+| `batch_id` | integer | no | Echoed on the response so out-of-order completions across fingerprints can be correlated |
 
 Config parameter types (`seed` is a JSON number, `seq_type` is a JSON string,
 etc.) are documented per-tool in `--describe` output.
 
-### JSON response (stdout)
+### Response fields (stdout)
 
 | Field | Type | Present | Notes |
 |-------|------|---------|-------|
 | `success` | boolean | always | |
 | `error` | string | on failure only | Human-readable error message |
-| `schema_version` | integer | on success only | Bumped on breaking output schema changes |
-| `shm_outputs` | array | on success, if non-empty | Each element: `{ "name": string, "label": string, "size": integer }` |
-| `result` | object | on success | Tool-specific lightweight metadata (never bulk data) |
+| `protocol_version` | integer | init reply only | Wire-envelope version; bumped on any envelope shape change |
+| `schema_version` | integer | batch success only | Per-tool output Arrow schema version |
+| `batch_id` | integer | batch reply, if request set it | Echoed from the matching request |
+| `shm_outputs` | array | batch success, if non-empty | Each element: `{ "name": string, "label": string, "size": integer }` |
+| `result` | object | batch success | Tool-specific lightweight metadata (never bulk data) |
+
+### Versioning
+
+Three independent integer versions cover three independent surfaces:
+
+- **`protocol_version`** — the wire envelope (init/batch/shutdown shape).
+  Returned once on the init reply. Bumped on any envelope-shape change.
+- **`schema_version`** — per-tool output Arrow schema. Returned on every
+  successful batch response. Bumped when a tool's output columns,
+  types, or nullability change.
+- **`describe_version`** — per-tool `--describe` introspection surface
+  (config-knob set, defaults, doc strings). Surfaced inside the
+  `--describe` JSON. Bumped when a tool's config surface changes.
+
+Schema changes always co-bump `describe_version` (the schema is part of
+the describe surface), but pure introspection edits (e.g. a new doc
+string on an existing knob) bump only `describe_version`.
 
 ### Arrow IPC layout in shared memory
 
