@@ -95,3 +95,8 @@ jobs:
             install.sh
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # Auto-mark anything with a pre-release suffix (-rc, -alpha, -beta)
+          # as a GitHub pre-release so dry-runs and previews aren't surfaced
+          # as the latest stable release. softprops/action-gh-release@v2 does
+          # not do this automatically.
+          prerelease: ${{ contains(github.ref_name, '-') }}
