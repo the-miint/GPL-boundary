@@ -106,9 +106,19 @@ GPL-licensed tools live as git submodules under `ext/`. Currently:
 - `ext/prodigal` -- Prodigal prokaryotic gene prediction (GPL-3.0, C99,
   branch `v2.6.4-miint`)
 - `ext/sortmerna` -- SortMeRNA rRNA filtering and sequence alignment
-  (LGPL-3.0, C++17, branch `v4.4.0-miint`). Requires system-installed
-  RocksDB and zlib. Build uses two `cc::Build` instances (C and C++17)
-  plus pkg-config for RocksDB discovery.
+  (LGPL-3.0, C++17, branch `v4.4.0-miint`). Requires system zlib only;
+  RocksDB comes from the vendored `ext/rocksdb` submodule (built static
+  via CMake, linked into the binary). Build uses two `cc::Build`
+  instances (C and C++17) for SortMeRNA itself.
+- `ext/rocksdb` -- RocksDB key-value store (Apache-2.0/GPL-2.0 dual,
+  pinned to v8.11.5). Vendored to make `cargo build` self-contained and
+  enable single-binary release distribution. We deviate from SortMeRNA's
+  own pin (v7.10.2) because that release predates GCC 13's stricter
+  transitive-include rules; SortMeRNA only consumes the most stable
+  RocksDB headers (`db.h`, `options.h`, `slice.h`, `version.h`) so the
+  bump is API-safe. Built via the `cmake` crate with the same flags as
+  SortMeRNA's `cmake/presets/CMakePresets_rocksdb.json`, plus
+  `PORTABLE=1` to avoid `-march=native`.
 - `ext/bowtie2` -- Bowtie2 short read aligner (GPL-3.0, C++11, branch
   `v2.5.5-miint`). Requires zlib. Uses global mutable state behind a mutex
   (only one alignment per process at a time; acceptable for single-invocation
@@ -153,10 +163,13 @@ cargo test           # unit + integration tests (uses real POSIX shared memory)
 make check           # fmt + clippy + test
 ```
 
-The `build.rs` compiles C/C++ sources from submodules using the `cc` crate.
-SortMeRNA requires system-installed RocksDB and zlib (`librocksdb-dev` and
-`libz-dev` on Debian/Ubuntu, or `brew install rocksdb zlib` on macOS).
-RocksDB is discovered via `pkg-config`.
+The `build.rs` compiles C/C++ sources from submodules using the `cc` crate
+and drives a CMake build of vendored RocksDB via the `cmake` crate. The
+only system C/C++ dependencies are CMake itself (build-time tool) and
+zlib: `sudo apt-get install cmake libz-dev` on Debian/Ubuntu,
+`brew install cmake libomp` on macOS (zlib ships in the SDK). The first
+build adds a few minutes for the RocksDB compile; subsequent builds are
+cached by the `cmake` crate.
 
 ## Code organization
 

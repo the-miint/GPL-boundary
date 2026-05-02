@@ -14,3 +14,6 @@
 	path = ext/bowtie2
 	url = https://github.com/the-miint/bowtie2.git
 	branch = v2.5.5-miint
+[submodule "ext/rocksdb"]
+	path = ext/rocksdb
+	url = https://github.com/facebook/rocksdb.git

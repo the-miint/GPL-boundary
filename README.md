@@ -9,6 +9,32 @@ miint is a BSD-licensed DuckDB extension. Some bioinformatics tools it needs to 
 - **Control plane**: JSON over stdin/stdout
 - **Data exchange**: Apache Arrow IPC over POSIX shared memory (zero-copy)
 
+## Install
+
+Prebuilt binaries are published on every `v*` git tag for Linux x86_64
+(glibc 2.35+, i.e. Ubuntu 22.04+, Debian 12+, RHEL 9+), macOS Intel, and
+macOS Apple Silicon. Install the latest release with:
+
+```bash
+curl -fsSL https://github.com/the-miint/GPL-boundary/releases/latest/download/install.sh | sh
+```
+
+The script downloads the right binary for your platform, verifies its
+SHA256 against the release's `SHA256SUMS`, and installs it to
+`~/.local/bin/gpl-boundary`. Override with environment variables:
+
+```bash
+GPL_BOUNDARY_VERSION=v0.2.0 INSTALL_DIR=/usr/local/bin \
+  curl -fsSL https://github.com/the-miint/GPL-boundary/releases/latest/download/install.sh | sh
+```
+
+Runtime requirements: zlib (every Linux distro ships it; macOS provides
+it in the SDK) and, on macOS, Homebrew's libomp (`brew install libomp`)
+for FastTree's OpenMP runtime.
+
+For unsupported platforms (e.g. Linux arm64), build from source — see
+[Building](#building) below.
+
 ## Supported tools
 
 | Tool | License | Description | Streaming |
@@ -21,13 +47,14 @@ miint is a BSD-licensed DuckDB extension. Some bioinformatics tools it needs to 
 
 ## Building
 
-Requires a Rust toolchain, a C/C++ compiler, and the following system
-libraries (needed by SortMeRNA):
+Requires a Rust toolchain, a C/C++ compiler, CMake, and zlib:
 
-- RocksDB (`librocksdb-dev` on Debian/Ubuntu, `brew install rocksdb` on macOS)
-- zlib (`libz-dev` on Debian/Ubuntu, `brew install zlib` on macOS)
+- Debian/Ubuntu: `sudo apt-get install cmake libz-dev`
+- macOS: `brew install cmake libomp` (zlib ships in the SDK)
 
-RocksDB is discovered via `pkg-config`.
+RocksDB is built from a vendored submodule (`ext/rocksdb`, pinned to
+v8.11.5) and linked statically into the binary. The first build adds
+~3–5 minutes for the RocksDB compile; subsequent builds are cached.
 
 ```bash
 # Clone with submodules
