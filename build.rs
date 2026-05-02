@@ -2,11 +2,53 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    let rocksdb_include = build_rocksdb();
     build_fasttree();
     build_prodigal();
-    build_sortmerna();
+    build_sortmerna(&rocksdb_include);
     build_bowtie2();
     link_math();
+}
+
+/// Build RocksDB as a static library from the vendored submodule.
+///
+/// Pinned to v8.11.5. We deviate from SortMeRNA's own pin (v7.10.2)
+/// because that release omits `<cstdint>` in headers that use
+/// `uint16_t`/`uint8_t` and fails to compile on GCC 13+. SortMeRNA only
+/// includes the most stable RocksDB headers (`db.h`, `options.h`,
+/// `slice.h`, `version.h`) — all API-stable across 7.x→8.x — so the bump
+/// is API-safe.
+///
+/// CMake flags mirror SortMeRNA's `cmake/presets/CMakePresets_rocksdb.json`:
+/// tests/tools/gflags off, only zlib compression on. `PORTABLE=1` is added
+/// to disable `-march=native` so the resulting binary runs on any CPU of
+/// the target architecture (required for distributed release builds).
+///
+/// Returns the include path (`<install>/include`) so `build_sortmerna` can
+/// add it to its C++ include search list. The `librocksdb.a` link-lib is
+/// emitted from `link_sortmerna_deps` to control link order: SortMeRNA's
+/// objects must appear before `-lrocksdb` so the linker resolves their
+/// references.
+fn build_rocksdb() -> PathBuf {
+    let dst = cmake::Config::new("ext/rocksdb")
+        .profile("Release")
+        .define("WITH_TESTS", "OFF")
+        .define("WITH_TOOLS", "OFF")
+        .define("WITH_BENCHMARK_TOOLS", "OFF")
+        .define("WITH_CORE_TOOLS", "OFF")
+        .define("WITH_GFLAGS", "OFF")
+        .define("ROCKSDB_BUILD_SHARED", "OFF")
+        .define("WITH_ZLIB", "ON")
+        .define("USE_RTTI", "1")
+        .define("PORTABLE", "1")
+        .define("FAIL_ON_WARNINGS", "OFF")
+        .build();
+
+    println!("cargo:rustc-link-search=native={}/lib", dst.display());
+
+    println!("cargo:rerun-if-changed=ext/rocksdb/CMakeLists.txt");
+
+    dst.join("include")
 }
 
 /// Compile FastTree C sources into a static library.
@@ -176,21 +218,17 @@ fn build_prodigal() {
 
 /// Compile SortMeRNA C and C++ sources into static libraries.
 ///
-/// SortMeRNA is C++17 and requires RocksDB + zlib as system dependencies.
-/// Split into two cc::Build instances: one for C sources (cmph + ssw),
-/// one for C++17 sources (alp + sortmerna core + smr_api).
-fn build_sortmerna() {
+/// SortMeRNA is C++17. RocksDB comes from the vendored static build
+/// (`build_rocksdb`); zlib is still expected from the system. Split into
+/// two cc::Build instances: one for C sources (cmph + ssw), one for C++17
+/// sources (alp + sortmerna core + smr_api).
+fn build_sortmerna(rocksdb_include: &PathBuf) {
     let dir = PathBuf::from("ext/sortmerna");
     let smr_src = dir.join("src/sortmerna");
     let api_src = dir.join("src/smr_api");
     let cmph_dir = dir.join("3rdparty/cmph");
     let alp_dir = dir.join("3rdparty/alp");
     let cq_dir = PathBuf::from("vendor/concurrentqueue"); // vendored header-only lib
-
-    // Probe RocksDB early so we can pass its include paths to the C++ build.
-    let rocksdb = pkg_config::Config::new()
-        .probe("rocksdb")
-        .expect("RocksDB not found. Install librocksdb-dev (Debian/Ubuntu) or rocksdb (brew).");
 
     // -- C sources: cmph (23 files) + ssw.c --
     let cmph_files: Vec<PathBuf> = [
@@ -309,12 +347,8 @@ fn build_sortmerna() {
         .include(dir.join("include"))
         .include(&cmph_dir)
         .include(&alp_dir)
-        .include(&cq_dir);
-    // RocksDB include paths from pkg-config (needed on macOS where brew
-    // installs to /opt/homebrew, not on the default include path)
-    for path in &rocksdb.include_paths {
-        cpp_build.include(path);
-    }
+        .include(&cq_dir)
+        .include(rocksdb_include);
     cpp_build
         .define("SMR_NO_MAIN", None)
         .flag("-fvisibility=hidden")
@@ -356,11 +390,21 @@ namespace sortmerna {
     println!("cargo:rerun-if-changed=ext/sortmerna/src/smr_api/smr_api.cpp");
 }
 
-/// Link system libraries required by SortMeRNA.
-/// RocksDB is already probed via pkg-config in build_sortmerna() (which
-/// emits the link flags). This handles the remaining libraries.
+/// Link libraries required by SortMeRNA.
+///
+/// Order matters for static linking: the linker resolves symbols
+/// left-to-right, so each lib must come *after* anything that depends on it.
+/// SortMeRNA's `smr_cpp` archive is emitted by cc::Build above; this
+/// function appends rocksdb (referenced by smr_cpp), then zlib (referenced
+/// by both smr_cpp and rocksdb), then the C++ runtime.
 fn link_sortmerna_deps() {
-    // zlib (used directly by sortmerna for gzip support)
+    // RocksDB static lib from build_rocksdb(). Must come AFTER smr_cpp
+    // (emitted by cc::Build above) and BEFORE zlib (which rocksdb uses).
+    println!("cargo:rustc-link-lib=static=rocksdb");
+
+    // zlib (used directly by sortmerna for gzip support and by rocksdb
+    // for SST compression). Stays dynamic — every supported platform ships
+    // a usable libz.
     println!("cargo:rustc-link-lib=z");
 
     // C++ standard library (cc crate handles this for compiled objects,

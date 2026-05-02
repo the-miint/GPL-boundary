@@ -23,11 +23,11 @@ jobs:
 
       - name: Install system dependencies (Ubuntu)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y librocksdb-dev libz-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake libz-dev
 
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install rocksdb zlib libomp
+        run: brew install cmake libomp
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -46,7 +46,7 @@ jobs:
         with:
           submodules: recursive
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y librocksdb-dev libz-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake libz-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
