@@ -24,10 +24,11 @@ jobs:
           # modern distros without per-distro packaging.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-          # macOS Intel.
-          - os: macos-13
-            target: x86_64-apple-darwin
           # macOS Apple Silicon. Native arm64 runner.
+          # Intel Macs are intentionally NOT built — GitHub-hosted macos-13
+          # runners have very thin capacity (queue waits exceed an hour),
+          # and Apple Silicon is the modern default. Intel Mac users build
+          # from source via the README's "Building from source" section.
           - os: macos-14
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}

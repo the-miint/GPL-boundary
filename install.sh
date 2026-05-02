@@ -21,11 +21,15 @@ os="$(uname -s)"
 arch="$(uname -m)"
 case "$os/$arch" in
     Linux/x86_64)   target="x86_64-unknown-linux-gnu" ;;
-    Darwin/x86_64)  target="x86_64-apple-darwin" ;;
     Darwin/arm64)   target="aarch64-apple-darwin" ;;
+    Darwin/x86_64)
+        printf 'gpl-boundary: Intel Macs are not in the prebuilt matrix.\n' >&2
+        printf 'Build from source — see https://github.com/%s#building-from-source\n' "$REPO" >&2
+        exit 1
+        ;;
     *)
         printf 'gpl-boundary: no prebuilt binary for %s/%s.\n' "$os" "$arch" >&2
-        printf 'Build from source: https://github.com/%s\n' "$REPO" >&2
+        printf 'Build from source — see https://github.com/%s#building-from-source\n' "$REPO" >&2
         exit 1
         ;;
 esac

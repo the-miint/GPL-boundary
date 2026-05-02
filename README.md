@@ -11,16 +11,23 @@ miint is a BSD-licensed DuckDB extension. Some bioinformatics tools it needs to 
 
 ## Install
 
-Prebuilt binaries are published on every `v*` git tag for Linux x86_64
-(glibc 2.35+, i.e. Ubuntu 22.04+, Debian 12+, RHEL 9+), macOS Intel, and
-macOS Apple Silicon. Install the latest release with:
+### Prebuilt binary (recommended)
+
+Prebuilt binaries are published on every `v*` git tag for:
+
+| Platform | Target triple | Notes |
+|----------|---------------|-------|
+| Linux x86_64 | `x86_64-unknown-linux-gnu` | glibc 2.35+ (Ubuntu 22.04+, Debian 12+, RHEL 9+) |
+| macOS Apple Silicon | `aarch64-apple-darwin` | macOS 14+ |
+
+Install the latest release with:
 
 ```bash
 curl -fsSL https://github.com/the-miint/GPL-boundary/releases/latest/download/install.sh | sh
 ```
 
-The script downloads the right binary for your platform, verifies its
-SHA256 against the release's `SHA256SUMS`, and installs it to
+The script detects your platform, downloads the matching tarball,
+verifies its SHA256 against the release's `SHA256SUMS`, and installs to
 `~/.local/bin/gpl-boundary`. Override with environment variables:
 
 ```bash
@@ -32,8 +39,36 @@ Runtime requirements: zlib (every Linux distro ships it; macOS provides
 it in the SDK) and, on macOS, Homebrew's libomp (`brew install libomp`)
 for FastTree's OpenMP runtime.
 
-For unsupported platforms (e.g. Linux arm64), build from source — see
-[Building](#building) below.
+### Building from source
+
+For platforms outside the prebuilt matrix — **Intel Macs**, **Linux
+arm64**, older glibc, and any other configuration — build from source.
+The build is self-contained: no system RocksDB, no `pkg-config` magic.
+
+```bash
+# 1. Install build prerequisites
+#    Debian/Ubuntu:
+sudo apt-get install -y build-essential cmake libz-dev curl
+#    macOS (any arch):
+brew install cmake libomp     # Xcode command-line tools provide the rest
+
+# 2. Install the Rust toolchain (skip if you already have it)
+curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y
+. "$HOME/.cargo/env"
+
+# 3. Clone with submodules and build a release binary
+git clone --recurse-submodules https://github.com/the-miint/GPL-boundary.git
+cd GPL-boundary
+cargo build --release
+
+# 4. Install the binary somewhere on PATH
+install -m 755 target/release/gpl-boundary ~/.local/bin/
+```
+
+The first build takes ~5 minutes (RocksDB compile is the bottleneck;
+subsequent builds are cached by the `cmake` crate). The submodule clone
+is heavy — RocksDB alone is several hundred MB. If you want to verify
+the build, run `cargo test` or `make check`.
 
 ## Supported tools
 
@@ -47,29 +82,19 @@ For unsupported platforms (e.g. Linux arm64), build from source — see
 
 ## Building
 
-Requires a Rust toolchain, a C/C++ compiler, CMake, and zlib:
+See [Building from source](#building-from-source) above. Quick reference
+for contributors already set up:
 
-- Debian/Ubuntu: `sudo apt-get install cmake libz-dev`
-- macOS: `brew install cmake libomp` (zlib ships in the SDK)
+```bash
+cargo build          # debug build
+cargo test           # unit + integration tests (uses real POSIX shared memory)
+make check           # fmt + clippy + test
+```
 
 RocksDB is built from a vendored submodule (`ext/rocksdb`, pinned to
 v8.11.5) and linked statically into the binary. The first build adds
-~3–5 minutes for the RocksDB compile; subsequent builds are cached.
-
-```bash
-# Clone with submodules
-git clone --recurse-submodules https://github.com/the-miint/GPL-boundary.git
-cd GPL-boundary
-
-# Build
-cargo build
-
-# Test
-cargo test
-
-# All checks (fmt + clippy + test)
-make check
-```
+~3–5 minutes for the RocksDB compile; subsequent builds are cached by
+the `cmake` crate.
 
 ## Introspection
 
