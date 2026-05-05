@@ -36,8 +36,8 @@ GPL_BOUNDARY_VERSION=v0.2.0 INSTALL_DIR=/usr/local/bin \
 ```
 
 Runtime requirements: zlib (every Linux distro ships it; macOS provides
-it in the SDK) and, on macOS, Homebrew's libomp (`brew install libomp`)
-for FastTree's OpenMP runtime.
+it in the SDK). The macOS binary statically links libomp, so no
+Homebrew install is needed at runtime.
 
 ### Building from source
 

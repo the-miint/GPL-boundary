@@ -42,18 +42,13 @@ else
 fi
 
 # --- Soft runtime-dep check (warn, don't block) ---------------------------
+# macOS has no runtime check: libomp is linked statically into the binary,
+# and zlib lives in the macOS SDK.
 case "$os" in
     Linux)
         if ! ldconfig -p 2>/dev/null | grep -q 'libz\.so'; then
             printf 'warning: libz not found in ldconfig cache.\n' >&2
             printf '         Install with: sudo apt-get install zlib1g (or your distro equivalent)\n' >&2
-        fi
-        ;;
-    Darwin)
-        if [ ! -f /opt/homebrew/opt/libomp/lib/libomp.dylib ] \
-           && [ ! -f /usr/local/opt/libomp/lib/libomp.dylib ]; then
-            printf 'warning: Homebrew libomp not found.\n' >&2
-            printf '         Install with: brew install libomp\n' >&2
         fi
         ;;
 esac

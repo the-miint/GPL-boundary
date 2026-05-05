@@ -86,6 +86,16 @@ fn build_fasttree() {
         // fail-fast if missing — `-fopenmp` would otherwise be silently
         // accepted by the preprocessor while the runtime symbols never
         // resolve, leaving `n_threads` a no-op without any error.
+        //
+        // Link libomp **statically** so the released binary has no runtime
+        // dependency on a Homebrew-installed `libomp.dylib`. A dynamic link
+        // bakes `/opt/homebrew/opt/libomp/lib/libomp.dylib` into
+        // `LC_LOAD_DYLIB`, which makes the binary unusable on any macOS
+        // box without Homebrew. Homebrew's libomp formula ships
+        // `libomp.a` alongside the dylib, and libomp's only transitive
+        // deps on macOS (pthread, libm, libdl) live in libSystem.dylib —
+        // so the static archive folds in cleanly with no further link
+        // additions.
         let libomp = locate_macos_libomp();
         build
             .flag("-Xpreprocessor")
@@ -95,7 +105,7 @@ fn build_fasttree() {
             "cargo:rustc-link-search=native={}",
             libomp.join("lib").display()
         );
-        println!("cargo:rustc-link-lib=omp");
+        println!("cargo:rustc-link-lib=static=omp");
     } else {
         // Linux + other Unix: GCC and Clang both accept `-fopenmp` for
         // the *compiler* (it enables the pragmas + sets the omp_* macros),
@@ -155,22 +165,24 @@ fn locate_macos_libomp() -> PathBuf {
         Some(PathBuf::from("/opt/homebrew/opt/libomp")),
         Some(PathBuf::from("/usr/local/opt/libomp")),
     ];
-    // Require both the header AND the actual dylib (or static lib) — a
-    // half-installed prefix where `lib/` exists but `libomp.dylib` is
-    // missing would otherwise pass the `is_dir()` check and the link
-    // would fail later with cryptic `__kmpc_*` errors.
+    // Require both the header AND the static archive. We link libomp
+    // statically (see `build_fasttree`) so a prefix that only has
+    // `libomp.dylib` is not usable. Homebrew's libomp formula ships
+    // both, so a normal `brew install libomp` satisfies this; an
+    // unusual half-install would otherwise pass an `is_dir()` check
+    // and fail later with cryptic `__kmpc_*` errors at link time.
     for p in candidates.into_iter().flatten() {
-        let has_dylib = p.join("lib/libomp.dylib").is_file();
-        let has_static = p.join("lib/libomp.a").is_file();
-        if p.join("include/omp.h").is_file() && (has_dylib || has_static) {
+        if p.join("include/omp.h").is_file() && p.join("lib/libomp.a").is_file() {
             return p;
         }
     }
     panic!(
-        "OpenMP runtime (libomp) not found on macOS. Install with:\n\
+        "OpenMP static archive (libomp.a) not found on macOS. Install with:\n\
          \n    brew install libomp\n\n\
-         FastTree needs OpenMP to honor the `threads` config knob. \
-         Checked: `brew --prefix libomp`, /opt/homebrew/opt/libomp, /usr/local/opt/libomp."
+         FastTree needs OpenMP to honor the `threads` config knob, and we \
+         link it statically so the resulting binary has no runtime dependency \
+         on Homebrew. Checked: `brew --prefix libomp`, /opt/homebrew/opt/libomp, \
+         /usr/local/opt/libomp."
     );
 }
 
