@@ -88,24 +88,32 @@ fn build_fasttree() {
         // resolve, leaving `n_threads` a no-op without any error.
         //
         // Link libomp **statically** so the released binary has no runtime
-        // dependency on a Homebrew-installed `libomp.dylib`. A dynamic link
-        // bakes `/opt/homebrew/opt/libomp/lib/libomp.dylib` into
+        // dependency on a Homebrew-installed `libomp.dylib`. A dynamic
+        // link bakes `/opt/homebrew/opt/libomp/lib/libomp.dylib` into
         // `LC_LOAD_DYLIB`, which makes the binary unusable on any macOS
-        // box without Homebrew. Homebrew's libomp formula ships
-        // `libomp.a` alongside the dylib, and libomp's only transitive
-        // deps on macOS (pthread, libm, libdl) live in libSystem.dylib —
-        // so the static archive folds in cleanly with no further link
-        // additions.
+        // box without Homebrew.
+        //
+        // We pass `libomp.a` as a positional linker arg rather than using
+        // `cargo:rustc-link-lib=static=omp`. On Linux the `static=` kind
+        // wraps the lib in `-Wl,-Bstatic ... -Wl,-Bdynamic` so GNU ld is
+        // forced to pick the archive; Apple's ld has no `-Bstatic`/
+        // `-Bdynamic` switch, so when both `libomp.a` and `libomp.dylib`
+        // sit in the same Homebrew lib dir, ld silently picks the dylib
+        // and the `static=` annotation is a no-op. A positional `.a`
+        // path is unambiguous: ld treats it as "include this archive."
+        // Homebrew's libomp formula ships `libomp.a` alongside the
+        // dylib, and libomp's only transitive deps on macOS (pthread,
+        // libm, libdl) live in libSystem.dylib — so the static archive
+        // folds in cleanly with no further link additions.
         let libomp = locate_macos_libomp();
         build
             .flag("-Xpreprocessor")
             .flag("-fopenmp")
             .include(libomp.join("include"));
         println!(
-            "cargo:rustc-link-search=native={}",
-            libomp.join("lib").display()
+            "cargo:rustc-link-arg={}",
+            libomp.join("lib/libomp.a").display()
         );
-        println!("cargo:rustc-link-lib=static=omp");
     } else {
         // Linux + other Unix: GCC and Clang both accept `-fopenmp` for
         // the *compiler* (it enables the pragmas + sets the omp_* macros),
