@@ -356,6 +356,162 @@ if (config->log_callback) {
 The Rust adapter routes log callback output to stderr when the caller enables
 `verbose` mode in the tool config. Keep messages informative but not excessive.
 
+## Encapsulation and symbol surface
+
+GPL-boundary statically links every tool into a single `gpl-boundary`
+binary. All tools share one global symbol namespace at link time, so
+unprefixed helpers and accidentally-exported internals collide across
+tools — and the linker resolves the collision silently, picking one
+definition and binding every caller to it. Encapsulation discipline is
+what keeps the static link correct.
+
+Two related sections cover adjacent concerns: "Opaque context pointer"
+under "Context lifecycle" covers hiding internal *state*, and "Separate
+API from core" under "Build integration" covers file layout. This
+section covers the *symbol-level* discipline that makes both effective.
+
+### Namespace-prefix every public symbol
+
+Pick a unique prefix (typically the tool name) and apply it to every
+symbol declared in your public header:
+
+```c
+/* Good */
+void  fasttree_config_init(fasttree_config_t *config);
+int   fasttree_run(fasttree_ctx_t *ctx, ...);
+#define FASTTREE_OK 0
+
+/* Bad -- collides with anyone else's run/config_init/OK */
+void  config_init(config_t *config);
+int   run(ctx_t *ctx, ...);
+#define OK 0
+```
+
+This applies to functions, types (`tool_config_t`, `tool_ctx_t`), error
+code macros, and any other `#define` declared in the header. The prefix
+can be short, but it must be present and consistent.
+
+### Mark internal C functions `static`
+
+Anything not declared in the public header should be `static` in the
+`.c` file that defines it:
+
+```c
+/* internal -- file-scope only */
+static int decode_sequence(const char *s, int len, ...);
+
+/* public -- declared in tool.h */
+int tool_run(tool_ctx_t *ctx, ...);
+```
+
+Without `static`, every helper in your codebase becomes a public symbol
+of the final binary, eligible to collide with another tool's helper of
+the same name. If two tools both define non-`static` `parse_header`,
+the linker silently binds both tools to whichever definition it sees
+first.
+
+### Keep internal types out of the public header
+
+The public header should expose only what the caller needs:
+
+- Function prototypes for the public API
+- Config struct (caller allocates it)
+- Stats struct (caller reads it)
+- Error code `#define`s
+- Forward declaration of the opaque context
+
+It should *not* expose:
+
+- The full definition of the context struct
+- Internal data structures, lookup tables, or scratch buffers
+- Internal helper function prototypes
+- Algorithm constants used only inside `.c` files
+
+If a definition is genuinely needed by multiple `.c` files but not by
+callers, put it in a private header (`tool_internal.h`) that the public
+`tool.h` does not include.
+
+### `extern "C"` guards in the public header
+
+Wrap the public header so it can be included from C++ without name
+mangling:
+
+```c
+#ifndef TOOL_H
+#define TOOL_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ... API declarations ... */
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* TOOL_H */
+```
+
+This is required for tools whose own implementation is C++ (SortMeRNA,
+Bowtie2) and is good practice even for C-only tools, since the
+gpl-boundary build mixes C and C++ translation units.
+
+### C++ namespaces (for C++ implementations)
+
+If your tool's implementation is C++ (SortMeRNA, Bowtie2), wrap the
+internal code in a tool-specific namespace:
+
+```cpp
+namespace fasttree {
+
+class Aligner { /* ... */ };
+static int decode_sequence(/* ... */);
+
+} // namespace fasttree
+```
+
+Namespaces do **not** help the public API. `extern "C"` declarations
+have C linkage and ignore the surrounding namespace, so
+`extern "C" int tool_run(...)` produces a symbol named `tool_run`
+regardless of whether it's nested in `namespace fasttree`. The public
+surface still depends on prefixing.
+
+What namespaces protect against is **ODR (One Definition Rule)
+violations** in the C++ internals. If two tools both define
+`class Aligner` with different layouts, both definitions reach the
+final binary's link step. The linker is allowed to merge them, and
+which one "wins" is unspecified — one tool then calls into the
+other's class layout with no diagnostic. Namespacing the
+implementation mangles every internal symbol with the namespace name,
+so the `Aligner`s become `fasttree::Aligner` vs. `bowtie2::Aligner`
+and collisions surface as link errors rather than silent UB.
+
+Templates and inline functions defined in headers are especially
+prone to ODR issues, since each translation unit can produce its own
+copy.
+
+### Optional: `-fvisibility=hidden`
+
+For larger codebases with many cross-file internal helpers, compile
+with `-fvisibility=hidden` and explicitly tag exports:
+
+```c
+#if defined(__GNUC__) || defined(__clang__)
+  #define TOOL_EXPORT __attribute__((visibility("default")))
+#else
+  #define TOOL_EXPORT
+#endif
+
+TOOL_EXPORT int tool_run(tool_ctx_t *ctx, ...);
+```
+
+This makes "not in the public header" mean "not in the symbol table",
+which is stronger than `static` alone (it also hides cross-file helpers
+that need external linkage within the tool's own object files but
+should not escape into other tools). Optional -- most tools are fine
+with disciplined `static` plus prefixing.
+
 ## Build integration
 
 Your source files are compiled into a static library by `build.rs` using the
@@ -705,6 +861,10 @@ Before starting integration, verify your C API against this list:
 - [ ] Context reusable after error
 - [ ] Separate API and core source files
 - [ ] Public header with `extern "C"` guards for C++ compatibility
+- [ ] All public symbols prefixed with a tool-specific name (e.g. `fasttree_*`)
+- [ ] Internal helper functions marked `static` (or hidden via visibility attrs)
+- [ ] Public header declares only API surface (no internal types or helpers)
+- [ ] C++ implementations wrap internals in a tool-specific `namespace`
 - [ ] ABI size-check test for config struct
 - [ ] Happy-path smoke test (Arrow IPC roundtrip through shared memory)
 - [ ] Bad-shm-name error test
