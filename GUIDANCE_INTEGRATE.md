@@ -469,6 +469,110 @@ new tools:
 - Pick column names that match consumer vocabulary (e.g. `is_tip`
   rather than `is_leaf` for tree nodes).
 
+## Per-tool integration contracts
+
+Cross-cutting conventions live above; this section documents
+tool-specific input shapes and lifetime invariants that callers
+(currently `duckdb-miint`) need to understand to drive the daemon
+correctly.
+
+### bowtie2-align: paired-end auto-detection
+
+Detection is by the presence of any non-null `sequence2` value in the
+input Arrow stream:
+
+- **Single-end**: `sequence2` column either missing entirely OR present
+  with all rows null.
+- **Paired-end**: `sequence2` column present with at least one non-null
+  value. All rows in the submission must then have non-null
+  `sequence2`.
+
+The rules:
+
+1. **Within a single shared-memory submission, paired/single mode is
+   uniform.** A submission containing one paired batch and one
+   all-null-`sequence2` batch under the same schema is rejected with
+   "inconsistent paired-end mode across batches". Mode-mixing here
+   would leave `seqs2.len() < read_ids.len()` and feed the C library a
+   short pointer array; the rejection surfaces that as a clean error
+   rather than silent OOB.
+2. **Across separate `run_batch` calls in one streaming session, mode
+   switching is permitted.** Each batch is parsed independently, so
+   one session can serve a mix of single-end and paired-end
+   submissions back-to-back through the same loaded index.
+3. **Within a single submission, `sequence2` must be uniformly null
+   or uniformly non-null.** Mixed null/non-null `sequence2` rows are
+   rejected.
+
+### bowtie2-align: qual1 / qual2 nullability
+
+`qual1` and `qual2` are Phred+33 quality strings; null on a row means
+"FASTA-equivalent default quality" for that mate. The daemon enforces:
+
+- `qual1` must be uniformly null (FASTA mode) or uniformly non-null
+  (FASTQ mode) across all rows in a submission. Mixed → reject.
+- In paired-end mode, `qual2` follows the same rule.
+- In paired-end mode, the `qual1` and `qual2` null-states must agree:
+  FASTQ on both mates or FASTA on both mates. FASTQ on one mate and
+  FASTA on the other is rejected. A missing `qual2` column counts as
+  "all null" (paired FASTA on mate 2).
+
+The rationale is to surface a precise SQL-level diagnostic at the
+input boundary rather than a cryptic bowtie2 internal error
+mid-alignment.
+
+### bowtie2-align: streaming semantics
+
+The daemon's per-fingerprint worker pool gives sharded callers
+per-shard parallelism for free. The four invariants miint relies on:
+
+1. **One streaming context = one loaded index = one
+   `(tool, config_fingerprint)` worker.** The
+   `src/registry.rs::Registry` keys on canonical-config JSON, so two
+   configs differing only in key order share a worker.
+2. **Each `run_batch()` call produces exactly one Arrow record batch
+   in a fresh output shared-memory segment.** No batching across
+   `run_batch` calls.
+3. **Same `index_path` (and same other config) → same fingerprint →
+   serialized through one subprocess worker.** bowtie2's
+   process-wide alignment mutex makes within-fingerprint parallelism
+   pointless; the `workers_per_fingerprint` init knob is accepted but
+   has no effect for bowtie2 (`src/main.rs::eviction_config_from`
+   discards it).
+4. **Distinct `index_path` values → distinct fingerprints → distinct
+   subprocess workers running in parallel.** This is the sharded
+   alignment path: each shard is a different `index_path`; the daemon
+   schedules them concurrently up to the `max_workers` budget. No
+   shard-aware tool variant needed on the gpl-boundary side.
+
+Eviction (sweeper thread, default 100 ms tick) frees a subprocess
+when its `last_used + worker_idle_ms < now` AND it has no in-flight
+batches, or under LRU pressure when a new fingerprint would exceed
+`max_workers`. In-flight batches are protected from eviction.
+
+### bowtie2-build: temp files + index ownership
+
+`bowtie2-build` materializes its input Arrow batches to a temporary
+FASTA file before invoking the C builder API (the builder takes disk
+paths today; see `localdocs/GUIDANCE_BT2_BUILD_API.md` for the
+future in-memory-builder path). Two contract points:
+
+- **`TMPDIR` is honored.** The temp FASTA is created via
+  `tempfile::Builder::new().tempfile()`, which calls
+  `std::env::temp_dir()`, which honors `TMPDIR` on Unix. HPC users
+  who set `TMPDIR` to a scratch filesystem will see the materialized
+  FASTA land there.
+- **`index_files` paths in the response are caller-owned.** The
+  caller specifies `index_path` (basename) in config; bowtie2-build
+  writes `.bt2` / `.bt2l` files at that basename; the response's
+  `result.index_files` array lists the absolute paths actually
+  written. The daemon does NOT manage their lifetime — no LRU, no
+  TTL, no auto-cleanup. The caller is responsible for `unlink()`ing
+  them when done (miint does this in its `Data` destructor).
+
+There is no daemon-managed built-index cache today. A future LRU is
+plausible but explicitly out of scope.
+
 ## Common mistakes
 
 ### Forgetting `cargo:rerun-if-changed` in build.rs
