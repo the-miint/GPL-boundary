@@ -232,7 +232,7 @@ distinct bump policies and are NOT substitutes for each other:
   protocol checks this.
 
 Current landmark values (see `src/tools/mod.rs::tests::test_describe_version_landmarks`):
-fasttree=3, prodigal/sortmerna/bowtie2-align/bowtie2-build=1.
+fasttree=3, bowtie2-align=2, prodigal/sortmerna/bowtie2-build=1.
 fasttree's history is documented in a CHANGELOG block above its
 `describe()` method. When you intentionally edit a `--describe`
 surface, bump the version in that tool's `describe()` AND update
@@ -359,7 +359,7 @@ There is no single-shot mode.
  "result": {"n_nodes": 7, "n_leaves": 4, "root": 6}}
 ```
 - `schema_version` — per-tool (FastTree=2, Prodigal=1, SortMeRNA=2,
-  Bowtie2=1, Bowtie2-build=1 as of writing); bumped on breaking
+  Bowtie2=2, Bowtie2-build=1 as of writing); bumped on breaking
   output-schema changes.
 - `shm_outputs` — omitted when empty. Labels match `[a-z0-9-]+`.
 - `result` — lightweight metadata; bulk data always travels in
@@ -493,21 +493,30 @@ from the presence of the `sequence2` column — sequences are interleaved as
 - `qual1: Utf8` (nullable) -- Phred+33 quality string; null = FASTA (default quality)
 - `qual2: Utf8` (nullable) -- mate 2 quality string; null = FASTA
 
-**Bowtie2-align output** (written by gpl-boundary to shm_outputs, label "alignments"):
+**Bowtie2-align output** (written by gpl-boundary to shm_outputs, label "alignments"; schema_version=2):
 - `read_id: Utf8` -- read name (QNAME)
 - `flags: UInt16` -- SAM flags
 - `reference: Utf8` -- reference name (RNAME); * if unmapped
 - `position: Int64` -- 1-based leftmost position; 0 if unmapped
+- `stop_position: Int64` -- 1-based inclusive end on reference, derived from `position + reference-length(cigar) - 1`; 0 if unmapped. Computed in Rust (`cigar_reference_length`), not in the bowtie2 C API.
 - `mapq: UInt8` -- mapping quality
 - `cigar: Utf8` -- CIGAR string; * if unmapped
 - `mate_reference: Utf8` -- mate reference name; * if unavailable
 - `mate_position: Int64` -- mate position; 0 if unavailable
 - `template_length: Int64` -- template length; 0 if unavailable
 - `tag_as: Int32` (nullable) -- AS:i alignment score
-- `tag_xs: Int32` (nullable) -- XS:i second-best score
+- `tag_xs: Int32` (nullable) -- XS:i second-best score; NULL when bowtie2 emits the `INT32_MIN` "absent" sentinel
+- `tag_ys: Int32` (nullable) -- YS:i mate alignment score; NULL on single-end or when mate is unaligned (bowtie2 sentinel `INT32_MIN`)
+- `tag_xn: Int32` (nullable) -- XN:i ambiguous bases in covered reference; NULL when read is unmapped (SAM flag 0x4)
+- `tag_xm: Int32` (nullable) -- XM:i mismatches; NULL when read is unmapped
+- `tag_xo: Int32` (nullable) -- XO:i gap opens; NULL when read is unmapped
+- `tag_xg: Int32` (nullable) -- XG:i gap extensions (incl. opens); NULL when read is unmapped
 - `tag_nm: Int32` (nullable) -- NM:i edit distance
 - `tag_yt: Utf8` (nullable) -- YT:Z pairing type (UU/CP/DP/UP)
 - `tag_md: Utf8` (nullable) -- MD:Z mismatch string
+- `tag_sa: Utf8` (nullable) -- SA:Z chimeric alignment; always NULL — bowtie2 does not emit SA. Carried for parity with HTSlib-based schemas.
+
+Schema v2 (2026-05) added 7 columns to match the prior HTSlib-derived 21-column schema in `duckdb-miint`: `stop_position` (Rust-side CIGAR derive), `tag_sa` (always-null stub), and the five SAM tags `YS`/`XN`/`XM`/`XO`/`XG` that bowtie2 ships through `bt2_align_output_t` as of `ext/bowtie2` commit `7e3f900` (BT2 API v0.3).
 
 Bowtie2-align requires `index_path` (path to pre-built `.bt2` index files) in
 the config JSON. The output does not include `seq` or `qual` columns (caller

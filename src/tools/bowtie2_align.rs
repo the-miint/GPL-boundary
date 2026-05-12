@@ -88,6 +88,12 @@ pub struct Bt2AlignOutput {
     pub tag_nm: *const i32,
     pub tag_md: *const *const c_char,
     pub tag_yt: *const *const c_char,
+    // v0.3 fields (bt2_api.h BT2_API_VERSION_MINOR=3, commit 7e3f900):
+    pub tag_ys: *const i32,
+    pub tag_xn: *const i32,
+    pub tag_xm: *const i32,
+    pub tag_xo: *const i32,
+    pub tag_xg: *const i32,
     pub _backing: *mut c_void,
 }
 
@@ -172,6 +178,7 @@ fn output_schema() -> Schema {
         Field::new("flags", DataType::UInt16, false),
         Field::new("reference", DataType::Utf8, false),
         Field::new("position", DataType::Int64, false),
+        Field::new("stop_position", DataType::Int64, false),
         Field::new("mapq", DataType::UInt8, false),
         Field::new("cigar", DataType::Utf8, false),
         Field::new("mate_reference", DataType::Utf8, false),
@@ -179,9 +186,15 @@ fn output_schema() -> Schema {
         Field::new("template_length", DataType::Int64, false),
         Field::new("tag_as", DataType::Int32, true),
         Field::new("tag_xs", DataType::Int32, true),
+        Field::new("tag_ys", DataType::Int32, true),
+        Field::new("tag_xn", DataType::Int32, true),
+        Field::new("tag_xm", DataType::Int32, true),
+        Field::new("tag_xo", DataType::Int32, true),
+        Field::new("tag_xg", DataType::Int32, true),
         Field::new("tag_nm", DataType::Int32, true),
         Field::new("tag_yt", DataType::Utf8, true),
         Field::new("tag_md", DataType::Utf8, true),
+        Field::new("tag_sa", DataType::Utf8, true),
     ])
 }
 
@@ -693,11 +706,52 @@ impl StreamingContext for Bowtie2StreamingContext {
     }
 }
 
+/// SAM flag bit for an unmapped read (BAM_FUNMAP).
+const SAM_FLAG_UNMAPPED: u16 = 0x4;
+
+/// Sum the reference-consuming op lengths in a CIGAR string.
+///
+/// Reference-consuming ops per the SAM spec: M, D, N, =, X. The other ops
+/// (I, S, H, P) consume the read but not the reference. Returns 0 for the
+/// unmapped sentinel "*" or for any unparsable token (the latter is a
+/// defensive choice: bowtie2 controls the CIGAR string and won't produce
+/// junk, but a 0 fallback keeps the derived `stop_position` from going
+/// negative if something upstream ever does).
+fn cigar_reference_length(cigar: &str) -> i64 {
+    if cigar == "*" || cigar.is_empty() {
+        return 0;
+    }
+    let mut total: i64 = 0;
+    let mut num: i64 = 0;
+    for b in cigar.bytes() {
+        match b {
+            b'0'..=b'9' => {
+                num = num * 10 + (b - b'0') as i64;
+            }
+            b'M' | b'D' | b'N' | b'=' | b'X' => {
+                total += num;
+                num = 0;
+            }
+            b'I' | b'S' | b'H' | b'P' => {
+                num = 0;
+            }
+            _ => return 0,
+        }
+    }
+    total
+}
+
 /// Convert bt2_align_output_t SOA arrays into an Arrow RecordBatch.
 ///
 /// Skips seq and qual from the C output (caller already has the reads).
-/// Handles nullable tags: NULL pointer = all-null column,
-/// tag_xs uses INT32_MIN sentinel per-record.
+/// Handles nullable tags:
+///   - `tag_as` / `tag_nm` / `tag_md` / `tag_yt`: NULL pointer = all-null column.
+///   - `tag_xs` / `tag_ys`: per-record `INT32_MIN` sentinel → NULL (bowtie2's
+///     "absent" convention for those score fields).
+///   - `tag_xn` / `tag_xm` / `tag_xo` / `tag_xg`: bowtie2 returns 0 for unaligned
+///     records; we re-map those to NULL using the SAM unmapped flag (0x4) so
+///     downstream SQL `IS NULL` semantics match miint's prior HTSlib path.
+///   - `tag_sa`: bowtie2 never emits SA. Always NULL; carried for schema parity.
 unsafe fn soa_to_record_batch(output: &Bt2AlignOutput) -> Result<RecordBatch, String> {
     let n = output.n_records;
 
@@ -712,6 +766,7 @@ unsafe fn soa_to_record_batch(output: &Bt2AlignOutput) -> Result<RecordBatch, St
                 Arc::new(UInt16Array::from(Vec::<u16>::new())),
                 Arc::new(StringArray::from(Vec::<&str>::new())),
                 Arc::new(Int64Array::from(Vec::<i64>::new())),
+                Arc::new(Int64Array::from(Vec::<i64>::new())),
                 Arc::new(UInt8Array::from(Vec::<u8>::new())),
                 Arc::new(StringArray::from(Vec::<&str>::new())),
                 Arc::new(StringArray::from(Vec::<&str>::new())),
@@ -720,6 +775,12 @@ unsafe fn soa_to_record_batch(output: &Bt2AlignOutput) -> Result<RecordBatch, St
                 Arc::new(Int32Builder::new().finish()),
                 Arc::new(Int32Builder::new().finish()),
                 Arc::new(Int32Builder::new().finish()),
+                Arc::new(Int32Builder::new().finish()),
+                Arc::new(Int32Builder::new().finish()),
+                Arc::new(Int32Builder::new().finish()),
+                Arc::new(Int32Builder::new().finish()),
+                Arc::new(Int32Builder::new().finish()),
+                Arc::new(StringBuilder::new().finish()),
                 Arc::new(StringBuilder::new().finish()),
                 Arc::new(StringBuilder::new().finish()),
             ],
@@ -785,14 +846,42 @@ unsafe fn soa_to_record_batch(output: &Bt2AlignOutput) -> Result<RecordBatch, St
     // flags: i32 -> u16
     let flags_u16: Vec<u16> = flags.iter().map(|&f| f as u16).collect();
 
+    // stop_position: 1-based inclusive end on the reference. 0 when unmapped
+    // (pos == 0 OR the unmapped flag is set OR cigar == "*"). Derived once
+    // here so downstream coverage filters don't have to re-parse CIGAR.
+    let stop_positions: Vec<i64> = (0..n)
+        .map(|i| {
+            if pos[i] == 0 || (flags_u16[i] & SAM_FLAG_UNMAPPED) != 0 || cigars[i] == "*" {
+                0
+            } else {
+                pos[i] + cigar_reference_length(cigars[i]) - 1
+            }
+        })
+        .collect();
+
     // Nullable integer tags
     let tag_as_col = build_nullable_i32_tag(output.tag_as, n, None);
     let tag_xs_col = build_nullable_i32_tag(output.tag_xs, n, Some(i32::MIN));
+    let tag_ys_col = build_nullable_i32_tag(output.tag_ys, n, Some(i32::MIN));
+    let tag_xn_col = build_unmapped_aware_i32_tag(output.tag_xn, n, &flags_u16);
+    let tag_xm_col = build_unmapped_aware_i32_tag(output.tag_xm, n, &flags_u16);
+    let tag_xo_col = build_unmapped_aware_i32_tag(output.tag_xo, n, &flags_u16);
+    let tag_xg_col = build_unmapped_aware_i32_tag(output.tag_xg, n, &flags_u16);
     let tag_nm_col = build_nullable_i32_tag(output.tag_nm, n, None);
 
     // Nullable string tags
     let tag_yt_col = build_nullable_string_tag(output.tag_yt, n);
     let tag_md_col = build_nullable_string_tag(output.tag_md, n);
+
+    // tag_sa: always NULL — bowtie2 never emits SA. Stub for parity with
+    // miint's prior 21-column HTSlib-based schema.
+    let tag_sa_col = {
+        let mut b = StringBuilder::with_capacity(n, 0);
+        for _ in 0..n {
+            b.append_null();
+        }
+        b.finish()
+    };
 
     let schema = Arc::new(output_schema());
     RecordBatch::try_new(
@@ -802,6 +891,7 @@ unsafe fn soa_to_record_batch(output: &Bt2AlignOutput) -> Result<RecordBatch, St
             Arc::new(UInt16Array::from(flags_u16)),
             Arc::new(StringArray::from(references)),
             Arc::new(Int64Array::from(pos.to_vec())),
+            Arc::new(Int64Array::from(stop_positions)),
             Arc::new(UInt8Array::from(mapq.to_vec())),
             Arc::new(StringArray::from(cigars)),
             Arc::new(StringArray::from(mate_refs)),
@@ -809,9 +899,15 @@ unsafe fn soa_to_record_batch(output: &Bt2AlignOutput) -> Result<RecordBatch, St
             Arc::new(Int64Array::from(tlen.to_vec())),
             Arc::new(tag_as_col),
             Arc::new(tag_xs_col),
+            Arc::new(tag_ys_col),
+            Arc::new(tag_xn_col),
+            Arc::new(tag_xm_col),
+            Arc::new(tag_xo_col),
+            Arc::new(tag_xg_col),
             Arc::new(tag_nm_col),
             Arc::new(tag_yt_col),
             Arc::new(tag_md_col),
+            Arc::new(tag_sa_col),
         ],
     )
     .map_err(|e| format!("Failed to create Arrow RecordBatch: {e}"))
@@ -835,6 +931,31 @@ unsafe fn build_nullable_i32_tag(
         let vals = std::slice::from_raw_parts(ptr, n);
         for &v in vals {
             if per_record_sentinel == Some(v) {
+                builder.append_null();
+            } else {
+                builder.append_value(v);
+            }
+        }
+    }
+    builder.finish()
+}
+
+/// Build a nullable Int32 Arrow array from a C int32_t* pointer, mapping
+/// values to NULL when the corresponding SAM flag has the unmapped bit
+/// (0x4) set. Used for tags that bowtie2 stores as 0 on unaligned records
+/// (`XN`/`XM`/`XO`/`XG`) — we re-NULL those to match HTSlib semantics so
+/// downstream SQL `IS NULL` filters behave like miint's prior pipeline.
+/// A NULL pointer still maps to an all-null column.
+unsafe fn build_unmapped_aware_i32_tag(ptr: *const i32, n: usize, flags: &[u16]) -> Int32Array {
+    let mut builder = Int32Builder::with_capacity(n);
+    if ptr.is_null() {
+        for _ in 0..n {
+            builder.append_null();
+        }
+    } else {
+        let vals = std::slice::from_raw_parts(ptr, n);
+        for (i, &v) in vals.iter().enumerate() {
+            if (flags[i] & SAM_FLAG_UNMAPPED) != 0 {
                 builder.append_null();
             } else {
                 builder.append_value(v);
@@ -880,7 +1001,7 @@ impl GplTool for Bowtie2AlignTool {
     }
 
     fn schema_version(&self) -> u32 {
-        1
+        2
     }
 
     fn describe(&self) -> ToolDescription {
@@ -888,7 +1009,7 @@ impl GplTool for Bowtie2AlignTool {
             name: "bowtie2-align",
             version: self.version(),
             schema_version: self.schema_version(),
-            describe_version: 1,
+            describe_version: 2,
             description: "Short read alignment against a bowtie2 index",
             config_params: vec![
                 // Core
@@ -1227,6 +1348,14 @@ impl GplTool for Bowtie2AlignTool {
                     description: "1-based leftmost position (POS); 0 if unmapped",
                 },
                 FieldDescription {
+                    name: "stop_position",
+                    arrow_type: "Int64",
+                    nullable: false,
+                    description: "1-based inclusive end on reference; \
+                                  derived from POS + reference-length(CIGAR) - 1; \
+                                  0 if unmapped",
+                },
+                FieldDescription {
                     name: "mapq",
                     arrow_type: "UInt8",
                     nullable: false,
@@ -1269,6 +1398,39 @@ impl GplTool for Bowtie2AlignTool {
                     description: "XS:i second-best alignment score; null if absent",
                 },
                 FieldDescription {
+                    name: "tag_ys",
+                    arrow_type: "Int32",
+                    nullable: true,
+                    description: "YS:i mate alignment score (paired-end); \
+                                  null on single-end or when mate is unaligned",
+                },
+                FieldDescription {
+                    name: "tag_xn",
+                    arrow_type: "Int32",
+                    nullable: true,
+                    description: "XN:i ambiguous bases in covered reference; \
+                                  null if read is unmapped",
+                },
+                FieldDescription {
+                    name: "tag_xm",
+                    arrow_type: "Int32",
+                    nullable: true,
+                    description: "XM:i mismatches; null if read is unmapped",
+                },
+                FieldDescription {
+                    name: "tag_xo",
+                    arrow_type: "Int32",
+                    nullable: true,
+                    description: "XO:i gap opens; null if read is unmapped",
+                },
+                FieldDescription {
+                    name: "tag_xg",
+                    arrow_type: "Int32",
+                    nullable: true,
+                    description: "XG:i gap extensions (incl. opens); \
+                                  null if read is unmapped",
+                },
+                FieldDescription {
                     name: "tag_nm",
                     arrow_type: "Int32",
                     nullable: true,
@@ -1285,6 +1447,14 @@ impl GplTool for Bowtie2AlignTool {
                     arrow_type: "Utf8",
                     nullable: true,
                     description: "MD:Z mismatch string; null if absent",
+                },
+                FieldDescription {
+                    name: "tag_sa",
+                    arrow_type: "Utf8",
+                    nullable: true,
+                    description: "SA:Z chimeric alignment string; always null \
+                                  (bowtie2 does not emit SA). Carried for parity \
+                                  with HTSlib-derived schemas.",
                 },
             ],
             response_metadata: vec![
@@ -1627,9 +1797,13 @@ AAACCCGGGTTTAAACCCGGGTTTAAACCCGGGTTTAAACCCGGGTTTAAACCG\
 GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
 
     fn build_test_index() -> (tempfile::TempDir, String) {
+        build_test_index_with_ref(TEST_REF)
+    }
+
+    fn build_test_index_with_ref(ref_seq: &str) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().expect("Failed to create temp dir");
         let ref_path = dir.path().join("ref.fa");
-        std::fs::write(&ref_path, format!(">ref1\n{TEST_REF}\n"))
+        std::fs::write(&ref_path, format!(">ref1\n{ref_seq}\n"))
             .expect("Failed to write test reference");
 
         let index_prefix = dir.path().join("idx").to_string_lossy().into_owned();
@@ -1768,7 +1942,7 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
     #[test]
     fn test_output_schema_field_count_and_types() {
         let schema = output_schema();
-        assert_eq!(schema.fields().len(), 14);
+        assert_eq!(schema.fields().len(), 21);
 
         assert_eq!(
             schema.field_with_name("read_id").unwrap().data_type(),
@@ -1789,6 +1963,11 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             &DataType::Int64
         );
 
+        // stop_position: non-null Int64, sibling of `position`.
+        let stop = schema.field_with_name("stop_position").unwrap();
+        assert_eq!(stop.data_type(), &DataType::Int64);
+        assert!(!stop.is_nullable());
+
         assert_eq!(
             schema.field_with_name("tag_as").unwrap().data_type(),
             &DataType::Int32
@@ -1796,9 +1975,42 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
         assert!(schema.field_with_name("tag_as").unwrap().is_nullable());
         assert!(schema.field_with_name("tag_yt").unwrap().is_nullable());
 
+        // v0.3 tag columns — all Int32 nullable.
+        for name in ["tag_ys", "tag_xn", "tag_xm", "tag_xo", "tag_xg"] {
+            let f = schema.field_with_name(name).unwrap();
+            assert_eq!(f.data_type(), &DataType::Int32, "{name} should be Int32");
+            assert!(f.is_nullable(), "{name} should be nullable");
+        }
+
+        // tag_sa: always-null Utf8 stub for schema parity.
+        let sa = schema.field_with_name("tag_sa").unwrap();
+        assert_eq!(sa.data_type(), &DataType::Utf8);
+        assert!(sa.is_nullable());
+
         // seq and qual are NOT in the output schema
         assert!(schema.field_with_name("seq").is_err());
         assert!(schema.field_with_name("qual").is_err());
+    }
+
+    #[test]
+    fn test_cigar_reference_length() {
+        // "*" sentinel
+        assert_eq!(cigar_reference_length("*"), 0);
+        assert_eq!(cigar_reference_length(""), 0);
+        // Pure match: 50M consumes 50 ref bases
+        assert_eq!(cigar_reference_length("50M"), 50);
+        // Insert is read-only, doesn't advance ref
+        assert_eq!(cigar_reference_length("10M5I10M"), 20);
+        // Deletion consumes ref
+        assert_eq!(cigar_reference_length("10M5D10M"), 25);
+        // Soft/hard clip don't consume ref
+        assert_eq!(cigar_reference_length("5S40M5H"), 40);
+        // Equal / mismatch are ref-consuming
+        assert_eq!(cigar_reference_length("10=5X10="), 25);
+        // Skip (N) is ref-consuming (intron)
+        assert_eq!(cigar_reference_length("10M100N10M"), 120);
+        // Unknown op falls back to 0 (defensive)
+        assert_eq!(cigar_reference_length("10M5Z10M"), 0);
     }
 
     // ---------------------------------------------------------------
@@ -1962,7 +2174,7 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
         let batches =
             read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].num_columns(), 14);
+        assert_eq!(batches[0].num_columns(), 21);
 
         let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
     }
@@ -2006,7 +2218,7 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
         assert_eq!(batches.len(), 1);
         let out = &batches[0];
-        assert_eq!(out.num_columns(), 14);
+        assert_eq!(out.num_columns(), 21);
         assert!(out.num_rows() >= 1);
 
         let read_id_col = out
@@ -2051,6 +2263,55 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             .downcast_ref::<StringArray>()
             .unwrap();
         assert!(!cigar_col.value(0).is_empty(), "Expected non-empty CIGAR");
+
+        // stop_position is the 1-based inclusive end on the reference. For
+        // this perfect 27bp match alignment, that's position + 27 - 1.
+        let stop_col = out
+            .column_by_name("stop_position")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(
+            stop_col.value(0),
+            pos_col.value(0) + cigar_reference_length(cigar_col.value(0)) - 1,
+            "stop_position must equal position + ref-len(CIGAR) - 1"
+        );
+
+        // Aligned records: the new int32 tags are emitted (not NULL), even
+        // when the value is 0 (no mismatches / no gaps). Single-end: tag_ys
+        // must be NULL (no mate).
+        for n in ["tag_xn", "tag_xm", "tag_xo", "tag_xg"] {
+            let c = out
+                .column_by_name(n)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            assert!(
+                c.is_valid(0),
+                "{n} must be set (not NULL) on an aligned record"
+            );
+        }
+        let ys_col = out
+            .column_by_name("tag_ys")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert!(
+            ys_col.is_null(0),
+            "tag_ys must be NULL on single-end alignments"
+        );
+
+        // tag_sa: always NULL — bowtie2 never emits SA. Schema-parity stub.
+        let sa_col = out
+            .column_by_name("tag_sa")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(sa_col.is_null(0), "tag_sa must always be NULL");
 
         // seq and qual are NOT in the output
         assert!(out.column_by_name("seq").is_none());
@@ -2126,6 +2387,7 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
         let result = response.result.unwrap();
         // bowtie2 counts n_reads as the number of read pairs for paired-end
         assert!(result["n_reads"].as_i64().unwrap() >= 1);
+        let n_concordant = result["n_aligned_concordant"].as_i64().unwrap();
 
         let batches =
             read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
@@ -2145,6 +2407,228 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             "Expected paired flag in at least one record"
         );
 
+        // YS:i (opposite mate's score) is set on a record iff this record
+        // was emitted as part of a paired alignment where the mate also has
+        // a valid score (bowtie2's `summ.paired() && rs->oscore().valid()`
+        // condition; see ext/bowtie2/aln_sink_columnar.cpp). The TEST_REF
+        // fixture is intentionally repetitive, so concordant alignment is
+        // not guaranteed across bowtie2 versions — only check YS when the
+        // run actually produced a concordant pair.
+        if n_concordant >= 1 {
+            let ys_col = out
+                .column_by_name("tag_ys")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let aligned_paired = (0..out.num_rows()).any(|i| {
+                (flags_col.value(i) & 0x4) == 0
+                    && (flags_col.value(i) & 0x1) != 0
+                    && ys_col.is_valid(i)
+            });
+            assert!(
+                aligned_paired,
+                "n_aligned_concordant >= 1 but no record carries a tag_ys value"
+            );
+        }
+
+        let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
+    }
+
+    // ---------------------------------------------------------------
+    // Paired-end YS positive case (non-repetitive synthetic ref so the
+    // pair aligns concordantly; bowtie2 then sets YS:i to the opposite
+    // mate's AS:i score and the columnar path must carry it through).
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_bowtie2_align_paired_end_tag_ys_set() {
+        // 240bp non-repetitive synthetic reference. Picked to be unique
+        // enough at 30bp granularity that bowtie2 reports a single
+        // concordant pair under default parameters.
+        const UNIQUE_REF: &str = "GATTACAGTACCAGCTAGGTCAGCGAATCGTACGCAGTACCATTG\
+ACGTACGGTACGAATCAGCTGAGCTAGCATCGATCGTAGCATGAC\
+ATGCATGCAATGCATTGCATGCAGGTACGATCAGACGTACGCAGT\
+ACCAGTACAGCTAGCATCGATCAGCTAGCGATTGCATCAGCATGC\
+AGCAGCTAGCATCGATCAGCTAGCGATTGAGCATGCATGAGGCAT\
+CGATCATGCATGCAGGTACGATCAGACAGGCTAGCATCGATCAGC";
+
+        let (_dir, index_prefix) = build_test_index_with_ref(UNIQUE_REF);
+
+        fn reverse_complement(s: &str) -> String {
+            s.chars()
+                .rev()
+                .map(|c| match c {
+                    'A' => 'T',
+                    'T' => 'A',
+                    'C' => 'G',
+                    'G' => 'C',
+                    'N' => 'N',
+                    other => other,
+                })
+                .collect()
+        }
+
+        // FR orientation: mate1 forward, mate2 reverse-complement of a
+        // downstream region. With ~90bp between them, this is a textbook
+        // concordant pair under bowtie2's default insert range.
+        let read1 = UNIQUE_REF[10..40].to_string();
+        let read2 = reverse_complement(&UNIQUE_REF[100..130]);
+        let qual = "I".repeat(30);
+
+        let input_name = unique_shm_name("bt2-pe-ys");
+        let batch = make_paired_end_input(
+            &["pair1"],
+            &[read1.as_str()],
+            &[read2.as_str()],
+            &[Some(qual.as_str())],
+            &[Some(qual.as_str())],
+        );
+        let shm_holder = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder_size = shm_holder.len();
+
+        let tool = Bowtie2AlignTool;
+        let config = serde_json::json!({
+            "index_path": index_prefix,
+            "nthreads": 1,
+            "seed": 42,
+        });
+        let response = tool.execute(&config, &input_name, shm_holder_size);
+        assert!(response.success, "Failed: {:?}", response.error);
+
+        let result = response.result.unwrap();
+        assert!(
+            result["n_aligned_concordant"].as_i64().unwrap() >= 1,
+            "non-repetitive PE fixture must produce a concordant pair, got result={result}"
+        );
+
+        let batches =
+            read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
+        let out = &batches[0];
+
+        let flags_col = out
+            .column_by_name("flags")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .unwrap();
+        let ys_col = out
+            .column_by_name("tag_ys")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let as_col = out
+            .column_by_name("tag_as")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        // Cross-mate parity: for a properly-paired alignment, YS on mate A
+        // equals AS on mate B. Same invariant bowtie2's test_align_tag_fields.c
+        // verifies on the lambda fixture — just doing it once here so the
+        // pointer plumbing is end-to-end checked from Rust.
+        let mut checked_pairs = 0;
+        for i in 0..out.num_rows() {
+            if (flags_col.value(i) & 0x4) != 0 {
+                continue; // unmapped
+            }
+            if (flags_col.value(i) & 0x2) == 0 {
+                continue; // not properly paired
+            }
+            assert!(
+                ys_col.is_valid(i),
+                "tag_ys must be set on a properly-paired mapped record (row {i})"
+            );
+            // Find the sibling mate (same read_id, different mate bit).
+            let sibling = (0..out.num_rows()).find(|&j| {
+                j != i && (flags_col.value(j) & 0x4) == 0 && (flags_col.value(j) & 0x2) != 0
+            });
+            if let Some(j) = sibling {
+                assert!(as_col.is_valid(j), "sibling AS must be set when YS was set");
+                assert_eq!(
+                    ys_col.value(i),
+                    as_col.value(j),
+                    "YS on row {i} must equal AS on sibling row {j}"
+                );
+                checked_pairs += 1;
+            }
+        }
+        assert!(
+            checked_pairs >= 1,
+            "Expected to check at least one mate pair for YS==AS_sibling"
+        );
+
+        let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
+    }
+
+    // ---------------------------------------------------------------
+    // Unaligned record: tag_xn/xm/xo/xg/ys must be NULL, stop_position == 0
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_bowtie2_align_unaligned_nulls() {
+        let (_dir, index_prefix) = build_test_index();
+
+        // A garbage read that won't align. Without no_unal, bowtie2 emits
+        // one unmapped SAM record per read; that's what we want to inspect.
+        let garbage_read = "TTTTTTTTTTTTTTTTTTTTTTTTTTT";
+        let garbage_qual = &"!".repeat(27);
+
+        let input_name = unique_shm_name("bt2-una");
+        let batch = make_single_end_input(&["garbage"], &[garbage_read], &[Some(garbage_qual)]);
+        let shm_holder = write_arrow_to_shm(&input_name, &batch);
+        let shm_holder_size = shm_holder.len();
+
+        let tool = Bowtie2AlignTool;
+        let config = serde_json::json!({
+            "index_path": index_prefix,
+            "seed": 42,
+        });
+        let response = tool.execute(&config, &input_name, shm_holder_size);
+        assert!(response.success, "Failed: {:?}", response.error);
+
+        let batches =
+            read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
+        let out = &batches[0];
+        assert_eq!(out.num_rows(), 1, "Expected 1 unmapped record");
+
+        let flags_col = out
+            .column_by_name("flags")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .unwrap();
+        assert!(
+            (flags_col.value(0) & 0x4) != 0,
+            "Unaligned record must have SAM unmapped flag set"
+        );
+
+        // stop_position must be 0 (no reference span)
+        let stop_col = out
+            .column_by_name("stop_position")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(stop_col.value(0), 0, "stop_position must be 0 on unmapped");
+
+        // All five new int32 tags must be NULL on the unmapped row.
+        for n in ["tag_ys", "tag_xn", "tag_xm", "tag_xo", "tag_xg"] {
+            let c = out
+                .column_by_name(n)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            assert!(
+                c.is_null(0),
+                "{n} must be NULL on an unmapped record (was: {:?})",
+                c.value(0)
+            );
+        }
+
         let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
     }
 
@@ -2157,10 +2641,24 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
         let tool = Bowtie2AlignTool;
         let desc = tool.describe();
         assert_eq!(desc.name, "bowtie2-align");
-        assert_eq!(desc.schema_version, 1);
+        assert_eq!(desc.schema_version, 2);
 
         assert_eq!(desc.input_schema.len(), 5);
-        assert_eq!(desc.output_schema.len(), 14);
+        assert_eq!(desc.output_schema.len(), 21);
+
+        // Spot-check the v0.3-derived columns are advertised.
+        let output_names: Vec<&str> = desc.output_schema.iter().map(|f| f.name).collect();
+        for n in [
+            "stop_position",
+            "tag_ys",
+            "tag_xn",
+            "tag_xm",
+            "tag_xo",
+            "tag_xg",
+            "tag_sa",
+        ] {
+            assert!(output_names.contains(&n), "describe() missing {n}");
+        }
 
         let param_names: Vec<&str> = desc.config_params.iter().map(|p| p.name).collect();
         assert!(param_names.contains(&"index_path"));
