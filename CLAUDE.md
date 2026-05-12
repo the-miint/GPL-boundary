@@ -294,7 +294,8 @@ There is no single-shot mode.
 
 ```
 1. {"init": {...}}                         ← required first line
-   ←  {"success": true, "protocol_version": 1}
+   ←  {"success": true, "protocol_version": 3,
+        "tools": [{"name": "bowtie2-align", "schema_version": 2}, ...]}
 2. {"tool":"...","config":{...},"shm_input":"...","shm_input_size":S,"batch_id":N}   (≥0 times)
    ←  {"success": true, "schema_version": K, "batch_id": N,
         "shm_outputs": [...], "result": {...}}
@@ -323,13 +324,28 @@ There is no single-shot mode.
   worker when its `last_used + worker_idle_ms < now` AND it has no
   in-flight batch. Default 300_000.
 
-**Init reply** carries the wire-protocol version:
+**Init reply** carries the wire-protocol version and a tool-registry
+advertisement:
 ```json
-{"success": true, "protocol_version": 1}
+{"success": true,
+ "protocol_version": 3,
+ "tools": [
+   {"name": "bowtie2-align",  "schema_version": 2},
+   {"name": "bowtie2-build",  "schema_version": 1},
+   {"name": "fasttree",       "schema_version": 2},
+   {"name": "prodigal",       "schema_version": 1},
+   {"name": "sortmerna",      "schema_version": 2}
+ ]}
 ```
 - `protocol_version` is incremented on any breaking change to the wire
   envelope (init/batch/shutdown shape, response field set). Separate from
-  per-tool `schema_version`.
+  per-tool `schema_version`. Current: 3.
+- `tools` (added in protocol v3) is the daemon's tool registry. Lets
+  miint do capability detection ("is bowtie2-align available?") and
+  per-tool schema-version drift checks at handshake time without a
+  trial batch submission. Entries are sorted by name for deterministic
+  output. Older clients ignore the unknown field; the addition is
+  strictly additive.
 
 **Batch request** (one per line, any number):
 ```json

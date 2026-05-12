@@ -184,6 +184,7 @@ pub type StreamingSession = (Box<dyn StreamingContext>, u32);
 ///   to set up.
 /// - `Ok(Some((ctx, schema_version)))` — context successfully created;
 ///   reuse `ctx` across all batches in the session.
+#[allow(clippy::result_large_err)] // see registry::build_worker
 pub fn streaming_setup(
     tool_name: &str,
     config: &serde_json::Value,
@@ -225,6 +226,21 @@ pub fn tool_schema_version(name: &str) -> Option<u32> {
         .into_iter()
         .find(|t| t.name() == name)
         .map(|t| t.schema_version())
+}
+
+/// (name, schema_version) for every registered tool, sorted by name for
+/// stable JSON output. Used by the init reply's `tools` registry
+/// advertisement.
+pub fn registered_tools_with_versions() -> Vec<crate::protocol::ToolEntry> {
+    let mut entries: Vec<crate::protocol::ToolEntry> = all_tools()
+        .iter()
+        .map(|t| crate::protocol::ToolEntry {
+            name: t.name().to_string(),
+            schema_version: t.schema_version(),
+        })
+        .collect();
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries
 }
 
 /// Version info for gpl-boundary and all tools.

@@ -151,6 +151,7 @@ impl InProcessSlot {
     /// accept `submit` calls. On failure (unknown tool, `create_streaming_context`
     /// errored), no thread or context is leaked — the caller surfaces the
     /// returned `Response` to the client and discards the slot.
+    #[allow(clippy::result_large_err)] // see registry::build_worker
     pub fn new(
         tool_name: &str,
         config: &serde_json::Value,
@@ -400,6 +401,7 @@ impl SubprocessWorker {
     /// fails to acknowledge init. Step 5 will add explicit init-handshake
     /// surfacing; step 3 lets dispatch errors travel through the normal
     /// response path.
+    #[allow(clippy::result_large_err)] // see registry::build_worker
     pub fn new(
         tool_name: &str,
         config: &serde_json::Value,

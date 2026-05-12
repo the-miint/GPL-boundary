@@ -242,6 +242,12 @@ impl Registry {
             .map(Arc::clone)
     }
 
+    // Response is intentionally used as the Err type: setup failures here
+    // need to surface as a ready-to-send response on the stdout channel,
+    // and boxing on every error path costs an allocation per failure
+    // without changing semantics. Suppress the result_large_err lint at
+    // each construction site.
+    #[allow(clippy::result_large_err)]
     fn build_worker(
         &self,
         tool_name: &str,

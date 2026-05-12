@@ -28,7 +28,11 @@ use registry::{EvictionConfig, Registry};
 ///   no longer consults `fstat` to size the input mapping (Darwin POSIX
 ///   shm has unreliable `fstat` semantics); the protocol's explicit byte
 ///   count is now the cross-platform source of truth.
-const PROTOCOL_VERSION: u32 = 2;
+/// - v3: init reply gains a `tools: [{name, schema_version}, ...]`
+///   registry advertisement. Lets miint do capability detection and
+///   schema-version drift checks at handshake time without a trial
+///   Submit. Strictly additive — older clients ignore the unknown field.
+const PROTOCOL_VERSION: u32 = 3;
 
 /// Default idle timeout (ms) when `init.idle_timeout_ms` is unset. Auto-exit
 /// after this much stdin silence so a stuck miint doesn't leave gpl-boundary
@@ -195,7 +199,12 @@ fn run_session() -> i32 {
         }
     };
 
-    if write_response(&mut stdout, &Response::init_ok(PROTOCOL_VERSION)).is_err() {
+    if write_response(
+        &mut stdout,
+        &Response::init_ok(PROTOCOL_VERSION, tools::registered_tools_with_versions()),
+    )
+    .is_err()
+    {
         return 1;
     }
 

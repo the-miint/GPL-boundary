@@ -151,6 +151,70 @@ fn init_line(idle_timeout_ms: Option<u64>) -> String {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn test_init_reply_carries_tool_registry() {
+    // Protocol v3: the init reply must advertise every registered tool with
+    // its current schema_version, so miint can do capability detection at
+    // handshake time without running a trial batch.
+    let mut child = spawn_daemon();
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(init_line(None).as_bytes()).unwrap();
+        stdin.write_all(b"{\"shutdown\":true}\n").unwrap();
+    }
+    drop(child.stdin.take());
+
+    let out = child.wait_with_output().expect("Failed to wait");
+    assert!(
+        out.status.success(),
+        "Process exited non-zero: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let lines = parse_lines(&out.stdout);
+    assert_eq!(lines.len(), 1, "Expected init reply only, got {lines:?}");
+    let reply = &lines[0];
+    assert!(reply["success"].as_bool().unwrap());
+    assert_eq!(reply["protocol_version"].as_u64().unwrap(), 3);
+
+    let tools = reply["tools"]
+        .as_array()
+        .expect("init reply must carry a tools array");
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    for expected in [
+        "bowtie2-align",
+        "bowtie2-build",
+        "fasttree",
+        "prodigal",
+        "sortmerna",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "expected {expected} in tools registry: {names:?}"
+        );
+    }
+
+    // Entries are sorted by name; verify the property explicitly so
+    // miint's deterministic ordering assumption holds.
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted, "tools entries must be sorted by name");
+
+    // schema_version must be present and >= 1 on every entry.
+    for entry in tools {
+        let v = entry["schema_version"].as_u64().unwrap();
+        assert!(
+            v >= 1,
+            "{} schema_version must be >= 1, got {v}",
+            entry["name"]
+        );
+    }
+
+    // Sanity-check bowtie2-align lands at the post-Phase-A landmark of 2.
+    let bt2 = tools.iter().find(|t| t["name"] == "bowtie2-align").unwrap();
+    assert_eq!(bt2["schema_version"].as_u64().unwrap(), 2);
+}
+
+#[test]
 fn test_shutdown_message_exits_cleanly() {
     let shm1 = ShmGuard::create_with_batch("ph3-sd", &make_prodigal_batch(&["c1"], &[TEST_SEQ_1]));
     let mut child = spawn_daemon();
@@ -184,7 +248,7 @@ fn test_shutdown_message_exits_cleanly() {
 
     // First line: init reply with protocol_version
     assert!(lines[0]["success"].as_bool().unwrap());
-    assert_eq!(lines[0]["protocol_version"].as_u64().unwrap(), 2);
+    assert_eq!(lines[0]["protocol_version"].as_u64().unwrap(), 3);
 
     // Second line: batch response with batch_id echoed
     assert!(lines[1]["success"].as_bool().unwrap());

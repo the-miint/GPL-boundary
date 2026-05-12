@@ -69,6 +69,15 @@ pub struct BatchRequest {
     pub batch_id: Option<u64>,
 }
 
+/// One entry of the init reply's tool-registry advertisement. Lets miint
+/// query "is bowtie2-align registered?" and "what schema does it emit?"
+/// at session-init time without a trial Submit. Added in protocol v2.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ToolEntry {
+    pub name: String,
+    pub schema_version: u32,
+}
+
 /// A single shared memory output segment.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ShmOutput {
@@ -115,11 +124,18 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_id: Option<u64>,
 
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shm_outputs: Vec<ShmOutput>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
+
+    /// Tool registry advertisement on the init reply. Empty (and omitted)
+    /// on every other response. Lets miint do capability detection +
+    /// schema-version drift checks at session-init time without a trial
+    /// Submit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolEntry>,
 }
 
 impl Response {
@@ -141,12 +157,14 @@ impl Response {
     }
 
     /// Reply to a successful init message — carries the protocol version
-    /// and nothing else. The current protocol version is defined in
-    /// `main.rs::PROTOCOL_VERSION`; bump there on any wire-envelope change.
-    pub fn init_ok(protocol_version: u32) -> Self {
+    /// plus the tool registry (added in protocol v2 so miint can do
+    /// capability detection at handshake time). `PROTOCOL_VERSION` lives
+    /// in `main.rs`; bump there on any wire-envelope change.
+    pub fn init_ok(protocol_version: u32, tools: Vec<ToolEntry>) -> Self {
         Self {
             success: true,
             protocol_version: Some(protocol_version),
+            tools,
             ..Self::default()
         }
     }
@@ -193,14 +211,60 @@ mod tests {
     }
 
     #[test]
-    fn test_response_init_ok() {
-        let resp = Response::init_ok(1);
+    fn test_response_init_ok_no_tools() {
+        // Empty registry advertisement: `tools` should be omitted from JSON.
+        let resp = Response::init_ok(3, vec![]);
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
         assert!(json["success"].as_bool().unwrap());
-        assert_eq!(json["protocol_version"].as_u64().unwrap(), 1);
+        assert_eq!(json["protocol_version"].as_u64().unwrap(), 3);
         assert!(json.get("batch_id").is_none());
         assert!(json.get("schema_version").is_none());
         assert!(json.get("shm_outputs").is_none());
+        assert!(json.get("tools").is_none());
+    }
+
+    #[test]
+    fn test_response_init_ok_with_tools() {
+        let resp = Response::init_ok(
+            3,
+            vec![
+                ToolEntry {
+                    name: "bowtie2-align".into(),
+                    schema_version: 2,
+                },
+                ToolEntry {
+                    name: "fasttree".into(),
+                    schema_version: 2,
+                },
+            ],
+        );
+        let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
+        assert!(json["success"].as_bool().unwrap());
+        assert_eq!(json["protocol_version"].as_u64().unwrap(), 3);
+        let tools = json["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"], "bowtie2-align");
+        assert_eq!(tools[0]["schema_version"].as_u64().unwrap(), 2);
+        assert_eq!(tools[1]["name"], "fasttree");
+    }
+
+    #[test]
+    fn test_response_init_ok_round_trip() {
+        // miint will deserialize the init reply on its side; round-trip
+        // through serde to verify ToolEntry's serde derives are symmetric.
+        let resp = Response::init_ok(
+            3,
+            vec![ToolEntry {
+                name: "prodigal".into(),
+                schema_version: 1,
+            }],
+        );
+        let s = serde_json::to_string(&resp).unwrap();
+        let back: Response = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.protocol_version, Some(3));
+        assert_eq!(back.tools.len(), 1);
+        assert_eq!(back.tools[0].name, "prodigal");
+        assert_eq!(back.tools[0].schema_version, 1);
     }
 
     #[test]
