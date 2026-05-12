@@ -826,6 +826,12 @@ fn cigar_reference_length(cigar: &str) -> i64 {
             _ => return 0,
         }
     }
+    // Trailing digits with no terminating op = malformed. Returning the
+    // partial total would silently drop the unterminated run, which is
+    // worse than the explicit 0 fallback used for unknown ops above.
+    if num != 0 {
+        return 0;
+    }
     total
 }
 
@@ -1041,6 +1047,15 @@ unsafe fn build_unmapped_aware_i32_tag(ptr: *const i32, n: usize, flags: &[u16])
             builder.append_null();
         }
     } else {
+        // Load-bearing: `flags[i]` below would panic if shorter than n.
+        // All current call sites pass the flags slice derived from the same
+        // n at line 880, but lock the contract so a future copy-paste
+        // doesn't silently violate it.
+        debug_assert_eq!(
+            flags.len(),
+            n,
+            "build_unmapped_aware_i32_tag: flags slice must have length n"
+        );
         let vals = std::slice::from_raw_parts(ptr, n);
         for (i, &v) in vals.iter().enumerate() {
             if (flags[i] & SAM_FLAG_UNMAPPED) != 0 {
@@ -2099,6 +2114,10 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
         assert_eq!(cigar_reference_length("10M100N10M"), 120);
         // Unknown op falls back to 0 (defensive)
         assert_eq!(cigar_reference_length("10M5Z10M"), 0);
+        // Trailing digits with no terminating op = malformed → 0,
+        // not a silent partial total of the leading run.
+        assert_eq!(cigar_reference_length("10M5"), 0);
+        assert_eq!(cigar_reference_length("42"), 0);
     }
 
     // ---------------------------------------------------------------
