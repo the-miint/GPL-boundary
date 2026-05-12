@@ -226,6 +226,74 @@ struct Bt2InputData {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Reject mixed null/non-null in quality columns and FASTA-on-one-mate /
+/// FASTQ-on-the-other inputs. miint relies on this to surface a clean
+/// SQL-level diagnostic instead of a cryptic bowtie2 internal error.
+///
+/// Rules:
+///   - `qual1` must be uniformly null (FASTA) or uniformly non-null (FASTQ)
+///     across all rows in the submission.
+///   - In paired-end mode (`seqs2.is_some()`), `qual2` must be uniform under
+///     the same rule.
+///   - In paired-end mode, the q1 and q2 null-states must agree. A missing
+///     `qual2` column counts as "all null" (i.e. paired FASTA on mate 2).
+fn validate_qual_uniformity(
+    quals1: &[Option<String>],
+    seqs2: &Option<Vec<String>>,
+    quals2: &Option<Vec<Option<String>>>,
+) -> Result<(), String> {
+    let n = quals1.len();
+    let q1_null = quals1.iter().filter(|q| q.is_none()).count();
+    let q1_non_null = n - q1_null;
+    if q1_null != 0 && q1_non_null != 0 {
+        return Err(format!(
+            "qual1 has mix of null and non-null values across {n} rows \
+             ({q1_null} null, {q1_non_null} non-null); within a single \
+             submission, qual1 must be uniformly null (FASTA) or uniformly \
+             non-null (FASTQ)."
+        ));
+    }
+
+    if seqs2.is_none() {
+        // Single-end: qual2 state is irrelevant.
+        return Ok(());
+    }
+
+    // Paired-end: validate qual2 the same way.
+    let q2_non_null = match quals2 {
+        Some(v) => {
+            let q2_null = v.iter().filter(|q| q.is_none()).count();
+            let q2_non_null = v.len() - q2_null;
+            if q2_null != 0 && q2_non_null != 0 {
+                return Err(format!(
+                    "qual2 has mix of null and non-null values across {} rows \
+                     ({q2_null} null, {q2_non_null} non-null); within a single \
+                     submission, qual2 must be uniformly null (FASTA) or \
+                     uniformly non-null (FASTQ).",
+                    v.len()
+                ));
+            }
+            q2_non_null
+        }
+        None => 0,
+    };
+
+    let q1_is_set = q1_non_null > 0;
+    let q2_is_set = q2_non_null > 0;
+    if q1_is_set != q2_is_set {
+        return Err(format!(
+            "paired-end input: qual1 and qual2 must be uniformly present \
+             (FASTQ on both mates) or uniformly absent (FASTA on both mates); \
+             got qual1={} and qual2={}. Cannot mix FASTA on one mate with \
+             FASTQ on the other.",
+            if q1_is_set { "non-null" } else { "null" },
+            if q2_is_set { "non-null" } else { "null" },
+        ));
+    }
+
+    Ok(())
+}
+
 impl Bowtie2AlignTool {
     fn read_input(shm_input: &str, shm_input_size: usize) -> Result<Bt2InputData, String> {
         let batches = crate::arrow_ipc::read_batches_from_shm(shm_input, shm_input_size)?;
@@ -319,6 +387,26 @@ impl Bowtie2AlignTool {
                 }
             }
         }
+
+        // Paired-end mode must be uniform across all batches in this
+        // shm_input. The FFI call passes `n_reads2 = read_ids.len()`, so
+        // if seqs2 covers fewer rows than read_ids (because some batches
+        // were paired and others were single-end) the C library would
+        // read past the end of the pointer array. Reject explicitly.
+        if let Some(ref s2) = seqs2 {
+            if s2.len() != read_ids.len() {
+                return Err(format!(
+                    "inconsistent paired-end mode across batches in a single \
+                     input: {} total reads but only {} have non-null sequence2. \
+                     One submission must be entirely paired-end or entirely \
+                     single-end; switch modes across separate submissions instead.",
+                    read_ids.len(),
+                    s2.len(),
+                ));
+            }
+        }
+
+        validate_qual_uniformity(&quals1, &seqs2, &quals2)?;
 
         Ok(Bt2InputData {
             read_ids,
@@ -2144,6 +2232,181 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
         let response = tool.execute(&config, &input_name, shm_holder_size);
         assert!(!response.success);
         assert!(response.error.as_ref().unwrap().contains("At least 1"));
+    }
+
+    // ---------------------------------------------------------------
+    // qual1/qual2 uniformity + paired-mate agreement (Ask 2)
+    // ---------------------------------------------------------------
+
+    fn read_input_via_shm(label: &str, batch: &RecordBatch) -> Result<Bt2InputData, String> {
+        let shm_name = unique_shm_name(label);
+        let holder = write_arrow_to_shm(&shm_name, batch);
+        let res = Bowtie2AlignTool::read_input(&shm_name, holder.len());
+        let _ = SharedMemory::unlink(&shm_name);
+        res
+    }
+
+    /// Expect a read_input call to return Err containing `needle` and return
+    /// the full error string for fixture diagnostics. Bt2InputData has no
+    /// Debug impl so we can't use `Result::expect_err` directly.
+    fn expect_read_input_err(label: &str, batch: &RecordBatch, needle: &str) -> String {
+        match read_input_via_shm(label, batch) {
+            Ok(_) => panic!("expected error containing {needle:?}, got Ok"),
+            Err(e) => {
+                assert!(e.contains(needle), "expected {needle:?}, got: {e}");
+                e
+            }
+        }
+    }
+
+    #[test]
+    fn test_read_input_rejects_qual1_mixed_null() {
+        // qual1 column has one null and one non-null row → mixed-mode rejection.
+        let batch = make_single_end_input(
+            &["r1", "r2"],
+            &["ACGTACGTACGT", "TGCATGCATGCA"],
+            &[Some("IIIIIIIIIIII"), None],
+        );
+        expect_read_input_err("bt2-q1-mix", &batch, "qual1 has mix");
+    }
+
+    #[test]
+    fn test_read_input_rejects_qual2_mixed_null() {
+        // qual2 column has one null and one non-null row in paired-end input.
+        let qual = "IIIIIIIIIIII";
+        let batch = make_paired_end_input(
+            &["r1", "r2"],
+            &["ACGTACGTACGT", "TGCATGCATGCA"],
+            &["AAAATTTTCCCC", "GGGGTTTTAAAA"],
+            &[Some(qual), Some(qual)],
+            &[Some(qual), None],
+        );
+        expect_read_input_err("bt2-q2-mix", &batch, "qual2 has mix");
+    }
+
+    #[test]
+    fn test_read_input_rejects_paired_qual1_set_qual2_null() {
+        // Paired-end FASTQ on mate1 but FASTA on mate2 — must reject.
+        let qual = "IIIIIIIIIIII";
+        let batch = make_paired_end_input(
+            &["r1", "r2"],
+            &["ACGTACGTACGT", "TGCATGCATGCA"],
+            &["AAAATTTTCCCC", "GGGGTTTTAAAA"],
+            &[Some(qual), Some(qual)],
+            &[None, None],
+        );
+        expect_read_input_err(
+            "bt2-q1set-q2null",
+            &batch,
+            "qual1 and qual2 must be uniformly",
+        );
+    }
+
+    #[test]
+    fn test_read_input_rejects_paired_qual1_null_qual2_set() {
+        // Paired-end FASTA on mate1 but FASTQ on mate2 — must reject.
+        let qual = "IIIIIIIIIIII";
+        let batch = make_paired_end_input(
+            &["r1", "r2"],
+            &["ACGTACGTACGT", "TGCATGCATGCA"],
+            &["AAAATTTTCCCC", "GGGGTTTTAAAA"],
+            &[None, None],
+            &[Some(qual), Some(qual)],
+        );
+        expect_read_input_err(
+            "bt2-q1null-q2set",
+            &batch,
+            "qual1 and qual2 must be uniformly",
+        );
+    }
+
+    #[test]
+    fn test_read_input_accepts_paired_fasta() {
+        // Both quals all-null on a paired-end batch must be accepted.
+        let batch = make_paired_end_input(
+            &["r1", "r2"],
+            &["ACGTACGTACGT", "TGCATGCATGCA"],
+            &["AAAATTTTCCCC", "GGGGTTTTAAAA"],
+            &[None, None],
+            &[None, None],
+        );
+        let data = read_input_via_shm("bt2-pe-fa", &batch).expect("paired FASTA must parse");
+        assert_eq!(data.read_ids.len(), 2);
+        assert!(data.seqs2.is_some());
+        // quals1 / quals2 are still populated (per-row Option), but all None.
+        assert!(data.quals1.iter().all(|q| q.is_none()));
+    }
+
+    #[test]
+    fn test_read_input_rejects_mixed_paired_single_across_batches() {
+        // Surface the prior UB: a single Arrow IPC stream carrying two
+        // RecordBatches with the same paired schema, but the second batch
+        // has all-null sequence2 (single-end mode within the paired
+        // schema). Before this fix, the paired branch ran for batch 1 and
+        // skipped batch 2, leaving seqs2.len() < read_ids.len(); the FFI
+        // call then passed `n_reads2 = read_ids.len()`, so the C library
+        // would read past the end of the pointer array.
+        use arrow::ipc::writer::StreamWriter;
+
+        let qual = "IIIIIIIIIIII";
+        let paired = make_paired_end_input(
+            &["pair1"],
+            &["ACGTACGTACGT"],
+            &["AAAATTTTCCCC"],
+            &[Some(qual)],
+            &[Some(qual)],
+        );
+        // Same schema, but mate2 columns all-null = "single-end" sub-batch.
+        let pseudo_single = make_paired_end_input(
+            &["solo1"],
+            &["TGCATGCATGCA"],
+            &[""], // placeholder; we'll force null below
+            &[Some(qual)],
+            &[None],
+        );
+        // Replace sequence2 with a fully-null StringArray to model
+        // "no paired data in this batch".
+        let pseudo_single = {
+            use arrow::array::StringArray;
+            let columns: Vec<_> = pseudo_single
+                .columns()
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    if pseudo_single.schema().field(i).name() == "sequence2" {
+                        std::sync::Arc::new(StringArray::from(vec![Option::<&str>::None]))
+                            as std::sync::Arc<dyn Array>
+                    } else {
+                        c.clone()
+                    }
+                })
+                .collect();
+            RecordBatch::try_new(pseudo_single.schema(), columns).unwrap()
+        };
+
+        let mut buf = Vec::<u8>::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buf, paired.schema().as_ref()).unwrap();
+            writer.write(&paired).unwrap();
+            writer.write(&pseudo_single).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let shm_name = unique_shm_name("bt2-mixed-batches");
+        let mut shm =
+            crate::shm::SharedMemory::create(&shm_name, buf.len()).expect("create shm for test");
+        shm.as_mut_slice()[..buf.len()].copy_from_slice(&buf);
+
+        let res = Bowtie2AlignTool::read_input(&shm_name, buf.len());
+        // shm holder drops here — but read_input has already consumed the
+        // mapping. Explicitly unlink so subsequent test runs don't collide.
+        drop(shm);
+        let _ = SharedMemory::unlink(&shm_name);
+
+        match res {
+            Ok(_) => panic!("expected inconsistent-paired-end rejection"),
+            Err(err) => assert!(err.contains("inconsistent paired-end mode"), "got: {err}"),
+        }
     }
 
     #[test]
