@@ -66,6 +66,9 @@ pub struct Bt2AlignConfig {
     pub rg_id: *const c_char,
     pub ignore_quals: c_int,
     pub reorder: c_int,
+    // v0.3 fields (bt2_api.h, commit 3a6ba62): MIN half of --mp MAX,MIN.
+    // Pairs with `mismatch_penalty` (the MAX). Default -1 = mode-dependent.
+    pub mismatch_penalty_min: c_int,
 }
 
 #[repr(C)]
@@ -153,11 +156,14 @@ const BT2_MATE_FR: c_int = 0;
 const BT2_MATE_RF: c_int = 1;
 const BT2_MATE_FF: c_int = 2;
 
-// bowtie2's `--mp` option is MX,MN (max,min). Our single-value
-// `mismatch_penalty` knob only sets MX; MN stays at bowtie2's compiled-in
-// `DEFAULT_MM_PENALTY_MIN` (see ext/bowtie2/scoring.h). A single-value
-// `--mp MX` with MX below this makes min > max, which bowtie2 rejects.
+// bowtie2's `--mp` option is MX,MN (max,min). `mismatch_penalty` sets MX and
+// `mismatch_penalty_min` sets MN; an unset side falls back to bowtie2's
+// compiled-in default below (see ext/bowtie2/scoring.h). The C argv builder
+// emits the pair the same way, so these defaults mirror what bowtie2 will use.
+// bowtie2 rejects the pair when MN > MX; we pre-check that here so the batch
+// fails with a knob-named message instead of a generic parser error.
 const BT2_DEFAULT_MM_PENALTY_MIN: i64 = 2;
+const BT2_DEFAULT_MM_PENALTY_MAX: i64 = 6;
 
 // ---------------------------------------------------------------------------
 // Log callback
@@ -514,28 +520,37 @@ fn build_config(
     if let Some(v) = config.get("match_bonus").and_then(|v| v.as_i64()) {
         bt2.match_bonus = v as c_int;
     }
-    if let Some(v) = config.get("mismatch_penalty").and_then(|v| v.as_i64()) {
-        // `mismatch_penalty` maps to bowtie2's `--mp MX` (max only); the min
-        // stays at DEFAULT_MM_PENALTY_MIN. bowtie2 rejects MX < min via a bare
-        // `throw 1` deep in option parsing — which, in the C API's memory
-        // path, runs *outside* the try/catch (bt2_api.cpp), so the int escapes
-        // the extern "C" boundary and aborts the whole worker (SIGABRT)
-        // instead of returning an error. Reject it here so the batch fails
-        // cleanly. Expressing both values (e.g. woltka's `--mp 1,1`) requires a
-        // two-value form the bowtie2 C API does not yet expose.
-        if (0..BT2_DEFAULT_MM_PENALTY_MIN).contains(&v) {
+    // `mismatch_penalty` maps to bowtie2's `--mp` MAX, `mismatch_penalty_min`
+    // to the MIN. Either being set makes the C side emit a `MX,MN` pair.
+    let mp_max = config.get("mismatch_penalty").and_then(|v| v.as_i64());
+    let mp_min = config.get("mismatch_penalty_min").and_then(|v| v.as_i64());
+    if let Some(v) = mp_max {
+        bt2.mismatch_penalty = v as c_int;
+    }
+    if let Some(v) = mp_min {
+        bt2.mismatch_penalty_min = v as c_int;
+    }
+    if mp_max.is_some() || mp_min.is_some() {
+        // Mirror bowtie2's MX,MN validation: an unset side defaults to the
+        // compiled-in value, and the pair is rejected when MN > MX. bowtie2
+        // itself now returns a clean error for this (commit 3a6ba62), but
+        // checking here fails before context creation with a knob-named
+        // message — e.g. woltka's mismatch_penalty=1 alone (MN defaults to 2)
+        // is the common foot-gun and the fix is to set mismatch_penalty_min=1
+        // too.
+        let eff_max = mp_max.unwrap_or(BT2_DEFAULT_MM_PENALTY_MAX);
+        let eff_min = mp_min.unwrap_or(BT2_DEFAULT_MM_PENALTY_MIN);
+        if eff_min > eff_max {
             return Err(format!(
-                "mismatch_penalty={v} is below bowtie2's minimum mismatch \
-                 penalty ({BT2_DEFAULT_MM_PENALTY_MIN}). The single-value \
-                 `mismatch_penalty` knob sets only bowtie2's `--mp` maximum; \
-                 the minimum stays at {BT2_DEFAULT_MM_PENALTY_MIN}, and \
-                 bowtie2 rejects a maximum below the minimum. Setting both \
-                 (e.g. `--mp 1,1`) needs the two-value form, which the bowtie2 \
-                 C API does not yet expose. Use mismatch_penalty >= \
-                 {BT2_DEFAULT_MM_PENALTY_MIN}, or omit it for the preset default."
+                "mismatch penalty MIN ({eff_min}) exceeds MAX ({eff_max}); \
+                 bowtie2's `--mp MAX,MIN` requires MAX >= MIN. \
+                 mismatch_penalty sets MAX (unset defaults to \
+                 {BT2_DEFAULT_MM_PENALTY_MAX}), mismatch_penalty_min sets MIN \
+                 (unset defaults to {BT2_DEFAULT_MM_PENALTY_MIN}). For a low \
+                 symmetric penalty (e.g. `--mp 1,1`), set both to the same \
+                 value."
             ));
         }
-        bt2.mismatch_penalty = v as c_int;
     }
     if let Some(v) = config.get("n_penalty").and_then(|v| v.as_i64()) {
         bt2.n_penalty = v as c_int;
@@ -1143,7 +1158,10 @@ impl GplTool for Bowtie2AlignTool {
             name: "bowtie2-align",
             version: self.version(),
             schema_version: self.schema_version(),
-            describe_version: 2,
+            // v3: added `mismatch_penalty_min` config param (two-value --mp
+            // MAX,MIN; bt2 C API commit 3a6ba62). schema_version unchanged —
+            // no output columns affected.
+            describe_version: 3,
             description: "Short read alignment against a bowtie2 index",
             config_params: vec![
                 // Core
@@ -1233,7 +1251,17 @@ impl GplTool for Bowtie2AlignTool {
                     name: "mismatch_penalty",
                     param_type: "integer",
                     default: serde_json::json!(null),
-                    description: "Max mismatch penalty (--mp); null = mode-dependent default",
+                    description: "Max mismatch penalty (--mp arg1, the MAX of MAX,MIN); \
+                                  null = mode-dependent default",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "mismatch_penalty_min",
+                    param_type: "integer",
+                    default: serde_json::json!(null),
+                    description: "Min mismatch penalty (--mp arg2, the MIN of MAX,MIN); \
+                                  pairs with mismatch_penalty. Set both equal for a \
+                                  symmetric penalty (e.g. 1,1). null = mode-dependent default",
                     allowed_values: vec![],
                 },
                 ConfigParam {
@@ -2200,33 +2228,69 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
     }
 
     #[test]
-    fn test_config_mismatch_penalty_below_min_rejected() {
-        // A single-value `--mp MX` with MX < 2 would make bowtie2's min (2) >
-        // max, which it rejects with a bare `throw 1` that aborts the worker
-        // subprocess. We must reject it cleanly at config-build time instead.
+    fn test_config_mismatch_penalty_max_alone_below_min_rejected() {
+        // `mismatch_penalty` (MAX) alone with MAX < 2 defaults MIN to 2, so
+        // MIN > MAX — which bowtie2 rejects. Catch it at config-build time with
+        // a knob-named message rather than letting it reach the C library.
         for v in [0, 1] {
             let config_json =
                 serde_json::json!({"index_path": "target/scratch/idx", "mismatch_penalty": v});
             let result = build_config(&config_json, false);
             assert!(
                 result.is_err(),
-                "Expected mismatch_penalty={v} to be rejected"
+                "Expected mismatch_penalty={v} (alone) to be rejected"
             );
             let err = result.err().unwrap();
             assert!(
-                err.contains("mismatch_penalty") && err.contains("minimum"),
-                "Expected mismatch_penalty/minimum error, got: {err}"
+                err.contains("MIN") && err.contains("MAX") && err.contains("mismatch_penalty_min"),
+                "Expected MIN/MAX/knob error, got: {err}"
             );
         }
     }
 
     #[test]
-    fn test_config_mismatch_penalty_at_or_above_min_accepted() {
-        // 2 is the minimum single-value `--mp` bowtie2 accepts (max == min).
+    fn test_config_mismatch_penalty_symmetric_pair_accepted() {
+        // woltka's `--mp 1,1`: both halves set equal => MIN == MAX, valid.
+        let config_json = serde_json::json!({
+            "index_path": "target/scratch/idx",
+            "mismatch_penalty": 1,
+            "mismatch_penalty_min": 1,
+        });
+        let (bt2, _cstrings) = build_config(&config_json, false).unwrap();
+        assert_eq!(bt2.mismatch_penalty, 1);
+        assert_eq!(bt2.mismatch_penalty_min, 1);
+    }
+
+    #[test]
+    fn test_config_mismatch_penalty_min_exceeds_max_rejected() {
+        // MIN explicitly above MAX is rejected regardless of which side is set.
+        let config_json = serde_json::json!({
+            "index_path": "target/scratch/idx",
+            "mismatch_penalty": 3,
+            "mismatch_penalty_min": 5,
+        });
+        assert!(build_config(&config_json, false).is_err());
+    }
+
+    #[test]
+    fn test_config_mismatch_penalty_max_alone_at_or_above_min_accepted() {
+        // MAX == default MIN (2) is the floor for a lone `mismatch_penalty`.
         let config_json =
             serde_json::json!({"index_path": "target/scratch/idx", "mismatch_penalty": 2});
         let (bt2, _cstrings) = build_config(&config_json, false).unwrap();
         assert_eq!(bt2.mismatch_penalty, 2);
+        // MIN left unset stays at the -1 sentinel (C side defaults it to 2).
+        assert_eq!(bt2.mismatch_penalty_min, -1);
+    }
+
+    #[test]
+    fn test_config_mismatch_penalty_min_alone_accepted() {
+        // MIN alone (below default MAX 6) is valid: eff MAX 6 >= MIN 5.
+        let config_json =
+            serde_json::json!({"index_path": "target/scratch/idx", "mismatch_penalty_min": 5});
+        let (bt2, _cstrings) = build_config(&config_json, false).unwrap();
+        assert_eq!(bt2.mismatch_penalty_min, 5);
+        assert_eq!(bt2.mismatch_penalty, -1);
     }
 
     // ---------------------------------------------------------------
@@ -3011,6 +3075,8 @@ CGATCATGCATGCAGGTACGATCAGACAGGCTAGCATCGATCAGC";
         assert!(param_names.contains(&"k"));
         assert!(param_names.contains(&"trim5"));
         assert!(param_names.contains(&"match_bonus"));
+        assert!(param_names.contains(&"mismatch_penalty"));
+        assert!(param_names.contains(&"mismatch_penalty_min"));
         assert!(param_names.contains(&"min_insert"));
         assert!(param_names.contains(&"mate_orientation"));
         assert!(param_names.contains(&"seed_mismatches"));
