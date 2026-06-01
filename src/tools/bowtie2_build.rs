@@ -72,7 +72,10 @@ unsafe extern "C" fn stderr_log_callback(
 ) {
     if !msg.is_null() {
         let s = CStr::from_ptr(msg).to_string_lossy();
-        eprint!("{s}");
+        // bowtie2 routes cerr/cout through LogCallbackStreambuf, which flushes
+        // one line per call with the trailing newline stripped. Re-add it with
+        // eprintln! so successive log lines don't run together on one line.
+        eprintln!("{s}");
     }
 }
 

@@ -153,6 +153,12 @@ const BT2_MATE_FR: c_int = 0;
 const BT2_MATE_RF: c_int = 1;
 const BT2_MATE_FF: c_int = 2;
 
+// bowtie2's `--mp` option is MX,MN (max,min). Our single-value
+// `mismatch_penalty` knob only sets MX; MN stays at bowtie2's compiled-in
+// `DEFAULT_MM_PENALTY_MIN` (see ext/bowtie2/scoring.h). A single-value
+// `--mp MX` with MX below this makes min > max, which bowtie2 rejects.
+const BT2_DEFAULT_MM_PENALTY_MIN: i64 = 2;
+
 // ---------------------------------------------------------------------------
 // Log callback
 // ---------------------------------------------------------------------------
@@ -164,7 +170,12 @@ unsafe extern "C" fn stderr_log_callback(
 ) {
     if !msg.is_null() {
         let s = CStr::from_ptr(msg).to_string_lossy();
-        eprint!("{s}");
+        // bowtie2 routes cerr through LogCallbackStreambuf, which flushes one
+        // line per call with the trailing newline stripped. Re-add it with
+        // eprintln! so successive log lines don't run together — and so a
+        // bowtie2 error line isn't concatenated with a following runtime
+        // message (e.g. "terminate called ...") on the same line.
+        eprintln!("{s}");
     }
 }
 
@@ -504,6 +515,26 @@ fn build_config(
         bt2.match_bonus = v as c_int;
     }
     if let Some(v) = config.get("mismatch_penalty").and_then(|v| v.as_i64()) {
+        // `mismatch_penalty` maps to bowtie2's `--mp MX` (max only); the min
+        // stays at DEFAULT_MM_PENALTY_MIN. bowtie2 rejects MX < min via a bare
+        // `throw 1` deep in option parsing — which, in the C API's memory
+        // path, runs *outside* the try/catch (bt2_api.cpp), so the int escapes
+        // the extern "C" boundary and aborts the whole worker (SIGABRT)
+        // instead of returning an error. Reject it here so the batch fails
+        // cleanly. Expressing both values (e.g. woltka's `--mp 1,1`) requires a
+        // two-value form the bowtie2 C API does not yet expose.
+        if (0..BT2_DEFAULT_MM_PENALTY_MIN).contains(&v) {
+            return Err(format!(
+                "mismatch_penalty={v} is below bowtie2's minimum mismatch \
+                 penalty ({BT2_DEFAULT_MM_PENALTY_MIN}). The single-value \
+                 `mismatch_penalty` knob sets only bowtie2's `--mp` maximum; \
+                 the minimum stays at {BT2_DEFAULT_MM_PENALTY_MIN}, and \
+                 bowtie2 rejects a maximum below the minimum. Setting both \
+                 (e.g. `--mp 1,1`) needs the two-value form, which the bowtie2 \
+                 C API does not yet expose. Use mismatch_penalty >= \
+                 {BT2_DEFAULT_MM_PENALTY_MIN}, or omit it for the preset default."
+            ));
+        }
         bt2.mismatch_penalty = v as c_int;
     }
     if let Some(v) = config.get("n_penalty").and_then(|v| v.as_i64()) {
@@ -2166,6 +2197,36 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             err.contains("index_path"),
             "Expected index_path error, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_config_mismatch_penalty_below_min_rejected() {
+        // A single-value `--mp MX` with MX < 2 would make bowtie2's min (2) >
+        // max, which it rejects with a bare `throw 1` that aborts the worker
+        // subprocess. We must reject it cleanly at config-build time instead.
+        for v in [0, 1] {
+            let config_json =
+                serde_json::json!({"index_path": "target/scratch/idx", "mismatch_penalty": v});
+            let result = build_config(&config_json, false);
+            assert!(
+                result.is_err(),
+                "Expected mismatch_penalty={v} to be rejected"
+            );
+            let err = result.err().unwrap();
+            assert!(
+                err.contains("mismatch_penalty") && err.contains("minimum"),
+                "Expected mismatch_penalty/minimum error, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_mismatch_penalty_at_or_above_min_accepted() {
+        // 2 is the minimum single-value `--mp` bowtie2 accepts (max == min).
+        let config_json =
+            serde_json::json!({"index_path": "target/scratch/idx", "mismatch_penalty": 2});
+        let (bt2, _cstrings) = build_config(&config_json, false).unwrap();
+        assert_eq!(bt2.mismatch_penalty, 2);
     }
 
     // ---------------------------------------------------------------
