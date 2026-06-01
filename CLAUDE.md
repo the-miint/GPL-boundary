@@ -232,7 +232,7 @@ distinct bump policies and are NOT substitutes for each other:
   protocol checks this.
 
 Current landmark values (see `src/tools/mod.rs::tests::test_describe_version_landmarks`):
-fasttree=3, bowtie2-align=2, prodigal/sortmerna/bowtie2-build=1.
+fasttree=3, bowtie2-align=3, prodigal/sortmerna/bowtie2-build=1.
 fasttree's history is documented in a CHANGELOG block above its
 `describe()` method. When you intentionally edit a `--describe`
 surface, bump the version in that tool's `describe()` AND update
@@ -539,7 +539,11 @@ the config JSON. The output does not include `seq` or `qual` columns (caller
 already has the reads). Paired-end mode is inferred from the `sequence2`
 column. The tool has ~30 config parameters covering scoring, seeding,
 paired-end behavior, effort, and SAM output options — see `--describe
-bowtie2-align` for the full list.
+bowtie2-align` for the full list. The mismatch penalty is a two-value
+`--mp MAX,MIN` pair: `mismatch_penalty` sets MAX, `mismatch_penalty_min`
+sets MIN. An unset side defaults to bowtie2's compiled-in value (MAX=6,
+MIN=2); set both equal for a symmetric penalty (e.g. woltka's `1,1`). The
+adapter rejects MIN > MAX before the C library sees it.
 
 **Bowtie2-build input** (written by miint to shm_input):
 - `name: Utf8` -- sequence identifier
