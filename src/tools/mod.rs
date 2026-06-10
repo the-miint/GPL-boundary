@@ -372,7 +372,7 @@ mod tests {
             ("fasttree", 3),
             ("prodigal", 1),
             ("sortmerna", 1),
-            ("bowtie2-align", 3),
+            ("bowtie2-align", 4),
             ("bowtie2-build", 1),
         ];
         for (name, expected) in cases {

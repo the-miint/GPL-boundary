@@ -545,6 +545,25 @@ per-shard parallelism for free. The four invariants miint relies on:
    schedules them concurrently up to the `max_workers` budget. No
    shard-aware tool variant needed on the gpl-boundary side.
 
+**Index loading — gpl-boundary always memory-maps the index (`--mm`).**
+Invariant 1's "one loaded index" describes the daemon's worker model, not
+the C library. As of the v2.5.5-miint pin (bt2 C API v0.4), the bowtie2 C
+API *reconstructs* the FM-index on every `bt2_align_run` rather than holding
+it resident — the persistent-`Ebwt` refactor was declined upstream as too
+complex. To keep that per-batch reload cheap, gpl-boundary sets bowtie2's
+`--mm` unconditionally on every alignment (`memory_mapped = 1`): the index is
+mapped from the page cache (shared `MAP_SHARED` pages, cheap minor faults)
+instead of read-copied into a private buffer each batch, which removes the
+bulk of the prior ~30–40% per-batch reload tax. This is **implicit** and is
+**not** a config knob — there is no miint scenario that benefits from turning
+it off, so it does not appear in the `--describe` surface and does not affect
+`describe_version`. Two implications for miint: (a) the on-disk `.bt2` index
+files must stay present and unmodified for the lifetime of a worker (already
+true — miint owns them and builds them once); (b) per-worker RSS shifts toward
+shared page-cache pages rather than private anonymous memory, so resident-set
+accounting for a bowtie2-align worker will read lower and be shared with other
+processes mapping the same index.
+
 Eviction (sweeper thread, default 100 ms tick) frees a subprocess
 when its `last_used + worker_idle_ms < now` AND it has no in-flight
 batches, or under LRU pressure when a new fingerprint would exceed

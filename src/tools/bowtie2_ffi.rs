@@ -10,11 +10,19 @@
 
 use std::os::raw::{c_char, c_int};
 
-/// API version reported by the linked libbowtie2. Mirrors the
-/// `BT2_API_VERSION_*` macros in `ext/bowtie2/bt2_api.h`. Update when the
-/// submodule bumps its version. Used by both bowtie2_align and bowtie2_build
-/// as the value returned from `GplTool::version()`.
-pub const BT2_VERSION: &str = "0.2.0";
+/// bowtie2 **software** version reported by `GplTool::version()` for both
+/// bowtie2-align and bowtie2-build. Tracks the `ext/bowtie2` submodule pin
+/// (`v2.5.5-miint`) and must stay in sync with the `BOWTIE2_VERSION` string
+/// compiled into the C library by `build.rs` — bump both together when the
+/// submodule is upgraded.
+///
+/// This is deliberately NOT the C **API** version (`BT2_API_VERSION_*` in
+/// `bt2_api.h`, currently 0.3.0) nor a per-tool `schema_version`. `version()`
+/// reports the upstream tool version, matching `FASTTREE_VERSION` /
+/// `PRODIGAL_VERSION`. The bowtie2 C API exposes no runtime version accessor
+/// (unlike sortmerna's `smr_version()`), so this is a manual constant; if the
+/// submodule ever adds a `bt2_version()` symbol, prefer querying it at runtime.
+pub const BOWTIE2_VERSION: &str = "2.5.5";
 
 /// Success return code shared by every bt2_*_run function.
 pub const BT2_OK: c_int = 0;

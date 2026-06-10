@@ -45,7 +45,7 @@ extern "C" {
     pub fn bt2_build_last_error(ctx: *const bt2_build_ctx_t) -> *const c_char;
 }
 
-use crate::tools::bowtie2_ffi::{bt2_strerror, BT2_OK, BT2_VERSION};
+use crate::tools::bowtie2_ffi::{bt2_strerror, BOWTIE2_VERSION, BT2_OK};
 
 const INDEX_SUFFIXES_SMALL: &[&str] = &[
     ".1.bt2",
@@ -204,7 +204,7 @@ impl GplTool for Bowtie2BuildTool {
     }
 
     fn version(&self) -> String {
-        BT2_VERSION.to_string()
+        BOWTIE2_VERSION.to_string()
     }
 
     fn schema_version(&self) -> u32 {
