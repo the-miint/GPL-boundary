@@ -69,6 +69,16 @@ pub struct Bt2AlignConfig {
     // v0.3 fields (bt2_api.h, commit 3a6ba62): MIN half of --mp MAX,MIN.
     // Pairs with `mismatch_penalty` (the MAX). Default -1 = mode-dependent.
     pub mismatch_penalty_min: c_int,
+    // v0.4 fields (bt2_api.h BT2_API_VERSION_MINOR=4, commit d35e377). Order
+    // must match the C struct tail exactly (ABI size check catches size, not
+    // reordering). `lowseeds` + three seed-behavior knobs are NOT exposed as
+    // JSON config yet (left at config_init defaults: NULL/0); `memory_mapped`
+    // is set implicitly by build_config — see the note there.
+    pub lowseeds: *const c_char,
+    pub no_exact_upfront: c_int,
+    pub no_1mm_upfront: c_int,
+    pub deterministic_seeds: c_int,
+    pub memory_mapped: c_int,
 }
 
 #[repr(C)]
@@ -143,7 +153,7 @@ extern "C" {
     fn bt2_align_last_error(ctx: *const bt2_align_ctx_t) -> *const c_char;
 }
 
-use crate::tools::bowtie2_ffi::{bt2_strerror, BT2_OK, BT2_VERSION};
+use crate::tools::bowtie2_ffi::{bt2_strerror, BOWTIE2_VERSION, BT2_OK};
 
 // Preset constants
 const BT2_PRESET_VERY_FAST: c_int = 0;
@@ -621,6 +631,55 @@ fn build_config(
         bt2.max_seed_rounds = v as c_int;
     }
 
+    // Effort / seeding (bt2 C API v0.4, commit d35e377)
+    if let Some(s) = config.get("lowseeds").and_then(|v| v.as_str()) {
+        let c = CString::new(s).map_err(|_| "lowseeds contains interior null byte")?;
+        bt2.lowseeds = c.as_ptr();
+        cstrings.push(c);
+    }
+    if let Some(v) = config.get("no_exact_upfront").and_then(|v| v.as_bool()) {
+        bt2.no_exact_upfront = if v { 1 } else { 0 };
+    }
+    if let Some(v) = config.get("no_1mm_upfront").and_then(|v| v.as_bool()) {
+        bt2.no_1mm_upfront = if v { 1 } else { 0 };
+    }
+    if let Some(v) = config.get("deterministic_seeds").and_then(|v| v.as_bool()) {
+        bt2.deterministic_seeds = if v { 1 } else { 0 };
+    }
+    // bowtie2 couples -d/--deterministic-seeds with -a (report_all) and the two
+    // upfront-disable flags, and rejects it alongside -k. The C parser enforces
+    // this (BT2_ERR_INVALID_CONFIG at create time), but we surface it here with
+    // a knob-named message — same convention as the --mp MIN>MAX check above.
+    // report_all / k are already applied above, so we read the resolved struct.
+    if bt2.deterministic_seeds != 0 {
+        let mut missing: Vec<&str> = Vec::new();
+        if bt2.report_all == 0 {
+            missing.push("report_all");
+        }
+        if bt2.no_exact_upfront == 0 {
+            missing.push("no_exact_upfront");
+        }
+        if bt2.no_1mm_upfront == 0 {
+            missing.push("no_1mm_upfront");
+        }
+        if !missing.is_empty() {
+            return Err(format!(
+                "deterministic_seeds requires {} to also be set; bowtie2 couples \
+                 -d/--deterministic-seeds with -a and the upfront-disable flags for \
+                 reproducible seed selection",
+                missing.join(", ")
+            ));
+        }
+        if bt2.k != 0 {
+            return Err(
+                "deterministic_seeds is incompatible with k; bowtie2 rejects \
+                        -d together with -k. Use report_all instead of k for \
+                        reproducible multi-alignment reporting"
+                    .to_string(),
+            );
+        }
+    }
+
     // SAM output
     if let Some(v) = config.get("no_unal").and_then(|v| v.as_bool()) {
         bt2.no_unal = if v { 1 } else { 0 };
@@ -642,6 +701,18 @@ fn build_config(
         bt2.reorder = if v { 1 } else { 0 };
     }
 
+    // Index loading: always memory-map (--mm), not a caller-facing knob.
+    // GPL-boundary's daemon reuses one context across many batches against a
+    // stable, caller-owned on-disk index, so mmap is strictly beneficial here:
+    // it replaces the per-batch whole-index read-copy (and its RSS churn +
+    // major page faults) with shared page-cache-backed mmap (cheap minor
+    // faults). There is no miint scenario that benefits from turning it off, so
+    // it is set unconditionally rather than exposed as a config param (keeps
+    // the --describe surface and describe_version unchanged). The upstream C
+    // API caps the win here — see the Bowtie2StreamingContext note and
+    // localdocs/REQUEST-bowtie2-index-reload-fix-and-mm.md.
+    bt2.memory_mapped = 1;
+
     // Log callback
     bt2.quiet = 1;
     if verbose {
@@ -655,8 +726,23 @@ fn build_config(
 // Streaming context
 // ---------------------------------------------------------------------------
 
-/// Holds a bowtie2 alignment context for batched streaming. The .bt2 index is
-/// loaded once during create and reused across all run_batch calls.
+/// Holds a bowtie2 alignment context for batched streaming. We call
+/// `bt2_align_create` once and reuse the `ctx` across every `run_batch`, so the
+/// daemon-side "one context = one resident worker" contract holds here.
+///
+/// CAVEAT (as of the v2.5.5-miint pin, bt2 C API v0.4): the C API does NOT keep
+/// the FM-index resident across calls. `bt2_align_create` loads no `Ebwt`; each
+/// `bt2_align_run` calls `driver<T>()`, which reconstructs the index every
+/// batch. The reuse above only amortizes process spawn + config-string
+/// ownership, not the index load itself.
+///
+/// We mitigate this by always passing `--mm` (`build_config` sets
+/// `memory_mapped = 1`): the per-batch reload becomes a memory-map + minor
+/// faults against shared page-cache pages instead of a full whole-index
+/// read-copy, which removed the bulk of the ~30-40% reload tax. A fully
+/// resident index would need the upstream persistent-`Ebwt` refactor, declined
+/// as too complex (the `driver<T>()` surgery). Background:
+/// `localdocs/REQUEST-bowtie2-index-reload-fix-and-mm.md`.
 struct Bowtie2StreamingContext {
     ctx: *mut bt2_align_ctx_t,
     /// CStrings backing the config's raw pointers. Kept alive for the session
@@ -1146,7 +1232,7 @@ impl GplTool for Bowtie2AlignTool {
     }
 
     fn version(&self) -> String {
-        BT2_VERSION.to_string()
+        BOWTIE2_VERSION.to_string()
     }
 
     fn schema_version(&self) -> u32 {
@@ -1159,9 +1245,13 @@ impl GplTool for Bowtie2AlignTool {
             version: self.version(),
             schema_version: self.schema_version(),
             // v3: added `mismatch_penalty_min` config param (two-value --mp
-            // MAX,MIN; bt2 C API commit 3a6ba62). schema_version unchanged —
-            // no output columns affected.
-            describe_version: 3,
+            // MAX,MIN; bt2 C API commit 3a6ba62).
+            // v4: exposed `lowseeds`, `no_exact_upfront`, `no_1mm_upfront`,
+            // `deterministic_seeds` config params (bt2 C API v0.4, commit
+            // d35e377). `--mm` is set implicitly and is intentionally NOT a
+            // config param, so it does not appear here. schema_version
+            // unchanged throughout — no output columns affected.
+            describe_version: 4,
             description: "Short read alignment against a bowtie2 index",
             config_params: vec![
                 // Core
@@ -1405,6 +1495,43 @@ impl GplTool for Bowtie2AlignTool {
                     param_type: "integer",
                     default: serde_json::json!(null),
                     description: "Max seed rounds (-R); null = preset-dependent",
+                    allowed_values: vec![],
+                },
+                // Effort / seeding (bt2 C API v0.4)
+                ConfigParam {
+                    name: "lowseeds",
+                    param_type: "string",
+                    default: serde_json::json!(null),
+                    description: "Discard seeds whose reference (suffix-array) range exceeds a \
+                                  threshold (-l/--lowseeds); null = no cut. Passed through \
+                                  verbatim, honoring an optional suffix: bare = absolute count, \
+                                  '%' = /100, 'm' = /1000, 'n' = /1000000 of the reference",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "no_exact_upfront",
+                    param_type: "boolean",
+                    default: serde_json::json!(false),
+                    description: "Disable the exact end-to-end alignment attempt before \
+                                  multiseed (--no-exact-upfront)",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "no_1mm_upfront",
+                    param_type: "boolean",
+                    default: serde_json::json!(false),
+                    description: "Disable the 1-mismatch end-to-end alignment attempt before \
+                                  multiseed (--no-1mm-upfront)",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "deterministic_seeds",
+                    param_type: "boolean",
+                    default: serde_json::json!(false),
+                    description: "Reproducible seed selection: disable random subsampling of \
+                                  low-quality seed ranges (-d/--deterministic-seeds). Requires \
+                                  report_all, no_exact_upfront, and no_1mm_upfront all set, and \
+                                  is incompatible with k; the adapter rejects invalid combinations",
                     allowed_values: vec![],
                 },
                 // SAM output
@@ -2262,6 +2389,97 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
     }
 
     #[test]
+    fn test_config_memory_mapped_always_on() {
+        // gpl-boundary always passes --mm (memory-mapped index). It is implicit
+        // behavior, not a JSON knob, so any config must yield memory_mapped = 1.
+        let config_json = serde_json::json!({"index_path": "target/scratch/idx"});
+        let (bt2, _cstrings) = build_config(&config_json, false).unwrap();
+        assert_eq!(
+            bt2.memory_mapped, 1,
+            "build_config must unconditionally enable --mm (memory_mapped)"
+        );
+    }
+
+    #[test]
+    fn test_config_v04_seeding_knobs_parsed() {
+        let config_json = serde_json::json!({
+            "index_path": "target/scratch/idx",
+            "lowseeds": "1.5%",
+            "no_exact_upfront": true,
+            "no_1mm_upfront": true,
+        });
+        let (bt2, _cstrings) = build_config(&config_json, false).unwrap();
+        assert!(!bt2.lowseeds.is_null(), "lowseeds should be set");
+        assert_eq!(
+            unsafe { CStr::from_ptr(bt2.lowseeds) }.to_str().unwrap(),
+            "1.5%"
+        );
+        assert_eq!(bt2.no_exact_upfront, 1);
+        assert_eq!(bt2.no_1mm_upfront, 1);
+        // Defaults when absent.
+        let (bt2d, _c) = build_config(
+            &serde_json::json!({"index_path": "target/scratch/idx"}),
+            false,
+        )
+        .unwrap();
+        assert!(bt2d.lowseeds.is_null());
+        assert_eq!(bt2d.no_exact_upfront, 0);
+        assert_eq!(bt2d.no_1mm_upfront, 0);
+        assert_eq!(bt2d.deterministic_seeds, 0);
+    }
+
+    #[test]
+    fn test_config_deterministic_seeds_valid_combo_accepted() {
+        // The reproducible-seeds path: -d with -a and both upfront-disable flags.
+        let config_json = serde_json::json!({
+            "index_path": "target/scratch/idx",
+            "deterministic_seeds": true,
+            "report_all": true,
+            "no_exact_upfront": true,
+            "no_1mm_upfront": true,
+        });
+        let (bt2, _cstrings) = build_config(&config_json, false).unwrap();
+        assert_eq!(bt2.deterministic_seeds, 1);
+        assert_eq!(bt2.report_all, 1);
+    }
+
+    #[test]
+    fn test_config_deterministic_seeds_requires_coupling() {
+        // deterministic_seeds alone (no report_all / upfront flags) is rejected
+        // with a knob-named message before the C library sees it.
+        let config_json = serde_json::json!({
+            "index_path": "target/scratch/idx",
+            "deterministic_seeds": true,
+        });
+        let err = build_config(&config_json, false).err().unwrap();
+        assert!(
+            err.contains("deterministic_seeds")
+                && err.contains("report_all")
+                && err.contains("no_exact_upfront")
+                && err.contains("no_1mm_upfront"),
+            "expected coupling error naming the required knobs, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_config_deterministic_seeds_rejects_k() {
+        // Couplings satisfied but k is set — incompatible with -d.
+        let config_json = serde_json::json!({
+            "index_path": "target/scratch/idx",
+            "deterministic_seeds": true,
+            "report_all": true,
+            "no_exact_upfront": true,
+            "no_1mm_upfront": true,
+            "k": 5,
+        });
+        let err = build_config(&config_json, false).err().unwrap();
+        assert!(
+            err.contains("deterministic_seeds") && err.contains("k"),
+            "expected k-incompatibility error, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_config_mismatch_penalty_min_exceeds_max_rejected() {
         // MIN explicitly above MAX is rejected regardless of which side is set.
         let config_json = serde_json::json!({
@@ -3080,6 +3298,13 @@ CGATCATGCATGCAGGTACGATCAGACAGGCTAGCATCGATCAGC";
         assert!(param_names.contains(&"min_insert"));
         assert!(param_names.contains(&"mate_orientation"));
         assert!(param_names.contains(&"seed_mismatches"));
+        assert!(param_names.contains(&"lowseeds"));
+        assert!(param_names.contains(&"no_exact_upfront"));
+        assert!(param_names.contains(&"no_1mm_upfront"));
+        assert!(param_names.contains(&"deterministic_seeds"));
+        // --mm is implicit, never advertised as a config param
+        assert!(!param_names.contains(&"memory_mapped"));
+        assert!(!param_names.contains(&"mm"));
         assert!(param_names.contains(&"no_unal"));
         assert!(param_names.contains(&"xeq"));
         assert!(param_names.contains(&"ignore_quals"));

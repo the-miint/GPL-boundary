@@ -232,7 +232,7 @@ distinct bump policies and are NOT substitutes for each other:
   protocol checks this.
 
 Current landmark values (see `src/tools/mod.rs::tests::test_describe_version_landmarks`):
-fasttree=3, bowtie2-align=3, prodigal/sortmerna/bowtie2-build=1.
+fasttree=3, bowtie2-align=4, prodigal/sortmerna/bowtie2-build=1.
 fasttree's history is documented in a CHANGELOG block above its
 `describe()` method. When you intentionally edit a `--describe`
 surface, bump the version in that tool's `describe()` AND update
@@ -544,6 +544,25 @@ bowtie2-align` for the full list. The mismatch penalty is a two-value
 sets MIN. An unset side defaults to bowtie2's compiled-in value (MAX=6,
 MIN=2); set both equal for a symmetric penalty (e.g. woltka's `1,1`). The
 adapter rejects MIN > MAX before the C library sees it.
+
+**Index is always memory-mapped (`--mm`), implicitly.** `build_config` sets
+the C API's `memory_mapped = 1` on every alignment; it is deliberately NOT a
+JSON knob and NOT in the `--describe` surface (so it does not affect
+`describe_version`). The bowtie2 C API (v0.4, commit `d35e377`) reconstructs
+the FM-index per `bt2_align_run` rather than holding it resident — the
+persistent-`Ebwt` fix was declined upstream as too complex — so `--mm` is the
+mitigation: the per-batch reload becomes a page-cache mmap (minor faults)
+instead of a whole-index read-copy. Requires the `.bt2` files to stay on disk
+unmodified for the worker's lifetime (caller-owned, already true).
+
+Commit `d35e377` (bt2 C API v0.4) also added four seeding knobs, now exposed
+as config params (`describe_version=4`): `lowseeds` (string, `-l/--lowseeds`),
+`no_exact_upfront`, `no_1mm_upfront`, and `deterministic_seeds`
+(`-d/--deterministic-seeds`). `deterministic_seeds` is the reproducible-seed
+path: bowtie2 couples it with `report_all` + both upfront-disable flags and
+rejects it alongside `k`. The adapter enforces that coupling at config-build
+time with a knob-named error (like the `--mp` MIN>MAX check), before the C
+library sees it.
 
 **Bowtie2-build input** (written by miint to shm_input):
 - `name: Utf8` -- sequence identifier
