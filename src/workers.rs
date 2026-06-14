@@ -806,6 +806,7 @@ mod tests {
             shm_input: "/gb-does-not-exist".to_string(),
             shm_input_size: 0,
             batch_id: Some(99),
+            metrics: false,
         });
 
         let response = rx
@@ -842,6 +843,7 @@ mod tests {
             shm_input: "/gb-does-not-exist".to_string(),
             shm_input_size: 0,
             batch_id: Some(7),
+            metrics: false,
         });
         let response = rx
             .recv_timeout(std::time::Duration::from_secs(2))

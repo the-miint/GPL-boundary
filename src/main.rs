@@ -1,6 +1,7 @@
 mod arrow_ipc;
 mod protocol;
 mod registry;
+mod rusage;
 mod shm;
 #[cfg(test)]
 mod test_util;
@@ -401,6 +402,12 @@ fn run_worker(tool_name: &str) -> i32 {
 
     let schema_version = tools::tool_schema_version(tool_name).unwrap_or_default();
 
+    // Counts batches actually run against this resident context. Used to set
+    // `worker_reused`: the first batch after spawn hits a cold index; later
+    // batches reuse the warm (mmap'd) one. A parent evict+respawn starts a
+    // fresh process here, so the counter correctly resets to cold.
+    let mut batches_processed: u64 = 0;
+
     // Batch loop.
     loop {
         let mut line = String::new();
@@ -428,7 +435,20 @@ fn run_worker(tool_name: &str) -> i32 {
             }
         };
 
-        let mut response = ctx.run_batch(&batch.shm_input, batch.shm_input_size);
+        // Opt-in telemetry: bracket the tool call with getrusage(RUSAGE_SELF)
+        // + /proc deltas. Skipped entirely when the caller didn't ask, so a
+        // production batch pays nothing.
+        let reused = batches_processed > 0;
+        let mut response = if batch.metrics {
+            let (mut resp, metrics) = rusage::measure(reused, || {
+                ctx.run_batch(&batch.shm_input, batch.shm_input_size)
+            });
+            resp.metrics = Some(metrics);
+            resp
+        } else {
+            ctx.run_batch(&batch.shm_input, batch.shm_input_size)
+        };
+        batches_processed += 1;
         if response.success {
             response.schema_version = Some(schema_version);
         }
