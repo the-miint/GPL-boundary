@@ -98,6 +98,8 @@ fn unique_test_shm_name(prefix: &str) -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
+    // Keep prefixes short: macOS caps POSIX shm names at 31 chars
+    // (PSHMNAMLEN), and `/{prefix}-{pid}-{n}` must fit. Linux allows 255.
     format!("/{prefix}-{pid}-{n}")
 }
 
@@ -137,7 +139,7 @@ fn build_index(index_path: &str, ref_name: &str, ref_seq: &str) {
         ],
     )
     .unwrap();
-    let input = ShmGuard::create_with_batch("bt2-build-metrics-fixture", &batch);
+    let input = ShmGuard::create_with_batch("mtr-bld", &batch);
 
     let mut session = String::new();
     session.push_str(init_line());
@@ -224,9 +226,9 @@ fn test_bowtie2_align_metrics_opt_in() {
     //   1: metrics on  -> cold worker (worker_reused = false)
     //   2: metrics on  -> warm worker (worker_reused = true)
     //   3: metrics off -> no metrics object at all
-    let shm1 = ShmGuard::create_with_batch("metrics-1", &make_align_batch("r1", &read));
-    let shm2 = ShmGuard::create_with_batch("metrics-2", &make_align_batch("r2", &read));
-    let shm3 = ShmGuard::create_with_batch("metrics-3", &make_align_batch("r3", &read));
+    let shm1 = ShmGuard::create_with_batch("mtr-1", &make_align_batch("r1", &read));
+    let shm2 = ShmGuard::create_with_batch("mtr-2", &make_align_batch("r2", &read));
+    let shm3 = ShmGuard::create_with_batch("mtr-3", &make_align_batch("r3", &read));
 
     let mut child = spawn_daemon();
     let session = format!(
