@@ -288,9 +288,8 @@ fn test_bowtie2_align_metrics_opt_in() {
         m1["worker_majflt"].as_u64().is_some(),
         "worker_majflt must be an integer: {m1}"
     );
-    assert_eq!(
-        m1["worker_reused"].as_bool().unwrap(),
-        false,
+    assert!(
+        !m1["worker_reused"].as_bool().unwrap(),
         "first batch after spawn must report a cold (non-reused) worker: {m1}"
     );
     // On Linux the /proc-derived fields must survive the round-trip from the
@@ -307,10 +306,29 @@ fn test_bowtie2_align_metrics_opt_in() {
         );
     }
 
+    // Daemon-clock fields, injected by the parent's reader thread.
+    let t_dispatch = m1["t_dispatch_ms"].as_u64();
+    let t_worker = m1["t_worker_ms"].as_u64();
+    assert!(
+        t_dispatch.is_some(),
+        "metrics must carry t_dispatch_ms (daemon queue/dispatch time): {m1}"
+    );
+    assert!(
+        t_worker.is_some(),
+        "metrics must carry t_worker_ms (daemon-observed worker portion): {m1}"
+    );
+    // t_worker_ms brackets the worker's own wall time — it additionally covers
+    // the batch read, Arrow (de)serialization, and pipe transit — so it must
+    // be >= worker_wall_ms.
+    assert!(
+        t_worker.unwrap() >= m1["worker_wall_ms"].as_u64().unwrap(),
+        "t_worker_ms ({t_worker:?}) must be >= worker_wall_ms ({:?}): {m1}",
+        m1["worker_wall_ms"].as_u64()
+    );
+
     // Batch 2: same fingerprint, warm worker reused.
-    assert_eq!(
+    assert!(
         r2["metrics"]["worker_reused"].as_bool().unwrap(),
-        true,
         "second same-fingerprint batch must report a reused worker: {}",
         r2["metrics"]
     );

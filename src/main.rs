@@ -255,7 +255,13 @@ fn run_session() -> i32 {
                 );
                 break;
             }
-            Event::Stdin(StdinEvent::Message(ControlMessage::Batch(batch))) => {
+            Event::Stdin(StdinEvent::Message(ControlMessage::Batch(mut batch))) => {
+                // Stamp the coordinator-receive time so a subprocess worker's
+                // reader thread can compute t_dispatch_ms (queue + dispatch
+                // latency). Rides with the batch through the registry's
+                // pending queue, so a queued batch's t_dispatch_ms correctly
+                // includes its wait. No effect on in-process tools.
+                batch.received_at = Some(std::time::Instant::now());
                 registry.submit(batch);
             }
             Event::Response(response) => {

@@ -319,6 +319,7 @@ mod tests {
             shm_input_size: 0,
             batch_id: None,
             metrics: false,
+            received_at: None,
         };
         let response = dispatch(&request);
         assert!(!response.success);

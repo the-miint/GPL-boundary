@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 
 /// Top-level NDJSON message on stdin, in its final-shape envelope so the
@@ -74,6 +76,14 @@ pub struct BatchRequest {
     /// shared-process `getrusage` would mix concurrent batches.
     #[serde(default)]
     pub metrics: bool,
+    /// Coordinator-receive timestamp, stamped in `main.rs` just before
+    /// `registry.submit`. Rides with the batch in-process (through the
+    /// registry and its pending queue) so a subprocess worker's reader thread
+    /// can compute `t_dispatch_ms` (queue + dispatch latency). `#[serde(skip)]`:
+    /// it never crosses the wire — the child worker doesn't need it, and
+    /// `Instant` isn't serializable regardless. Defaults to `None`.
+    #[serde(skip)]
+    pub received_at: Option<Instant>,
 }
 
 /// Per-batch worker telemetry, populated only when the request opts in with

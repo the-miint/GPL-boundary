@@ -584,6 +584,7 @@ mod tests {
             shm_input_size: 0,
             batch_id: None,
             metrics: false,
+            received_at: None,
         };
         let b2 = BatchRequest {
             tool: "prodigal".to_string(),
@@ -592,6 +593,7 @@ mod tests {
             shm_input_size: 0,
             batch_id: None,
             metrics: false,
+            received_at: None,
         };
         assert_eq!(Fingerprint::from_batch(&b1), Fingerprint::from_batch(&b2));
     }
@@ -607,6 +609,7 @@ mod tests {
             shm_input_size: 0,
             batch_id: Some(id),
             metrics: false,
+            received_at: None,
         };
         reg.submit(b(1, "/gb-does-not-exist-1"));
         reg.submit(b(2, "/gb-does-not-exist-2"));
@@ -628,6 +631,7 @@ mod tests {
             shm_input_size: 0,
             batch_id: Some(1),
             metrics: false,
+            received_at: None,
         });
         reg.submit(BatchRequest {
             tool: "fasttree".to_string(),
@@ -636,6 +640,7 @@ mod tests {
             shm_input_size: 0,
             batch_id: Some(2),
             metrics: false,
+            received_at: None,
         });
         for _ in 0..2 {
             let _ = rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -655,6 +660,7 @@ mod tests {
             shm_input_size: 0,
             batch_id: Some(1),
             metrics: false,
+            received_at: None,
         });
         let response = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(!response.success);
@@ -676,6 +682,7 @@ mod tests {
             shm_input_size: 0,
             batch_id: Some(1),
             metrics: false,
+            received_at: None,
         });
         let _ = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(reg.worker_count(), 1);
