@@ -365,6 +365,10 @@ advertisement:
 - **Multi-fingerprint dispatch:** every batch carries its own
   `(tool, config)` and is routed independently. Distinct fingerprints
   may complete out of order; correlate responses via `batch_id`.
+- `metrics` (optional bool, default `false`) — opt-in per-batch worker
+  telemetry. When `true` on a `bowtie2-align` batch, the response carries a
+  `metrics` object (see below). Non-opted batches pay nothing. Ignored by
+  in-process tools.
 
 **Batch response**:
 ```json
@@ -380,6 +384,49 @@ advertisement:
 - `shm_outputs` — omitted when empty. Labels match `[a-z0-9-]+`.
 - `result` — lightweight metadata; bulk data always travels in
   `shm_outputs`.
+- `metrics` — present only when the request set `metrics: true` AND the
+  batch ran in a subprocess worker (bowtie2-align). Omitted otherwise. See
+  below.
+
+**Per-batch worker telemetry (`metrics`)** — opt-in, diagnostic-only,
+purely additive (no `protocol_version` bump; older clients ignore it).
+Populated **only for subprocess workers** (bowtie2-align): `getrusage`
+aggregates a whole process, which is exactly one batch's work in a
+single-purpose worker but would mix concurrent batches in the shared daemon,
+so in-process tools never emit it. Counter fields are per-batch deltas
+(after − before, bracketing the tool call); `worker_rss_kb` is an absolute
+peak. Example:
+```json
+{"success": true, "schema_version": 2, "batch_id": 42,
+ "shm_outputs": [...], "result": {...},
+ "metrics": {
+   "worker_wall_ms": 55230, "worker_user_ms": 4100, "worker_sys_ms": 900,
+   "worker_majflt": 51234, "worker_minflt": 120000,
+   "worker_inblock": 812000, "worker_oublock": 0,
+   "worker_nvcsw": 4096, "worker_nivcsw": 12,
+   "worker_rss_kb": 410000, "worker_rss_current_kb": 398000,
+   "worker_read_bytes": 415662080, "worker_write_bytes": 0,
+   "worker_reused": false, "t_dispatch_ms": 3, "t_worker_ms": 55180}}
+```
+- `worker_majflt` (`ru_majflt` delta) is the headline metric: major page
+  faults that hit disk = the scattered cold random-index reads. Decides
+  compute-vs-cold-I/O without inference.
+- `worker_user_ms`/`worker_sys_ms` (`ru_utime`/`ru_stime` deltas): CPU time.
+  `wall ≫ user+sys` ⇒ I/O-stalled; `wall ≈ user+sys` ⇒ CPU-bound.
+- `worker_minflt`, `worker_inblock`/`worker_oublock` (512B blocks),
+  `worker_nvcsw` (voluntary ctx switches — a blocking-I/O signal),
+  `worker_nivcsw` (involuntary — CPU contention).
+- `worker_rss_kb` peak RSS (`ru_maxrss`, absolute); `worker_rss_current_kb`
+  current RSS.
+- `worker_reused` — `false` on the first batch after a worker spawns (cold
+  index), `true` once warm. An evict+respawn resets it to cold.
+- `t_dispatch_ms` daemon queue/dispatch latency (receive → worker stdin);
+  `t_worker_ms` daemon-observed worker portion (stdin write → response read,
+  brackets `worker_wall_ms` plus IPC/marshaling).
+- **Platform**: `worker_inblock`/`worker_oublock` are 0 on macOS (Darwin
+  does not track them); `worker_rss_current_kb`/`worker_read_bytes`/
+  `worker_write_bytes` are `/proc`-derived and omitted (Linux only). The
+  production target is Linux/Lustre.
 
 **Shutdown** (graceful):
 ```json
