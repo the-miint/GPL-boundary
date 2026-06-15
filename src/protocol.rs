@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 
 /// Top-level NDJSON message on stdin, in its final-shape envelope so the
@@ -67,6 +69,87 @@ pub struct BatchRequest {
     /// can be correlated.
     #[serde(default)]
     pub batch_id: Option<u64>,
+    /// Opt-in per-batch worker telemetry. When `true`, a subprocess worker
+    /// (bowtie2-align today) self-reports `getrusage` deltas and friends in
+    /// the response's `metrics` field. Defaults `false` — non-opted batches
+    /// pay nothing (no extra syscalls). Ignored by in-process tools, whose
+    /// shared-process `getrusage` would mix concurrent batches.
+    #[serde(default)]
+    pub metrics: bool,
+    /// Coordinator-receive timestamp, stamped in `main.rs` just before
+    /// `registry.submit`. Rides with the batch in-process (through the
+    /// registry and its pending queue) so a subprocess worker's reader thread
+    /// can compute `t_dispatch_ms` (queue + dispatch latency). `#[serde(skip)]`:
+    /// it never crosses the wire — the child worker doesn't need it, and
+    /// `Instant` isn't serializable regardless. Defaults to `None`.
+    #[serde(skip)]
+    pub received_at: Option<Instant>,
+}
+
+/// Per-batch worker telemetry, populated only when the request opts in with
+/// `"metrics": true` AND the batch ran in a subprocess worker (bowtie2-align).
+/// Diagnostic only; never load-bearing.
+///
+/// Counter fields are per-batch deltas (after − before, bracketing the tool
+/// call). `worker_rss_kb` is an absolute peak (a high-water mark has no
+/// meaningful delta). Linux-only `/proc`-derived fields are `None` elsewhere
+/// and omitted from JSON. The daemon-clock fields (`t_dispatch_ms`,
+/// `t_worker_ms`) are filled in by the parent's reader thread, not the worker.
+///
+/// Field names of the worker/daemon set match the duckdb-miint
+/// `REQUEST-gpl-boundary-batch-metrics` contract; fields beyond that request
+/// (`worker_oublock`, `worker_nvcsw`, `worker_nivcsw`, `worker_rss_current_kb`,
+/// `worker_read_bytes`, `worker_write_bytes`) are additive — miint ignores
+/// unknown keys.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BatchMetrics {
+    /// Wall-clock time the worker spent on this batch (ms).
+    pub worker_wall_ms: u64,
+    /// `getrusage` `ru_utime` delta (ms) — user CPU.
+    pub worker_user_ms: u64,
+    /// `getrusage` `ru_stime` delta (ms) — system CPU.
+    pub worker_sys_ms: u64,
+    /// `ru_majflt` delta — major (disk-backed) page faults. The headline
+    /// compute-vs-cold-I/O signal.
+    pub worker_majflt: u64,
+    /// `ru_minflt` delta — minor (no-I/O) page faults.
+    pub worker_minflt: u64,
+    /// `ru_inblock` delta — 512B block reads charged to the process. Always
+    /// 0 on macOS (Darwin does not track it).
+    pub worker_inblock: u64,
+    /// `ru_oublock` delta — 512B block writes. Always 0 on macOS.
+    pub worker_oublock: u64,
+    /// `ru_nvcsw` delta — voluntary context switches (a blocking-I/O signal).
+    pub worker_nvcsw: u64,
+    /// `ru_nivcsw` delta — involuntary context switches (CPU-contention signal).
+    pub worker_nivcsw: u64,
+    /// `ru_maxrss` — peak resident set size in KB (absolute, not a delta).
+    pub worker_rss_kb: u64,
+    /// `false` on the first batch after a worker spawns (cold index); `true`
+    /// once the worker has processed an earlier batch (warm/reused index).
+    pub worker_reused: bool,
+
+    /// Current RSS in KB (`/proc/self/statm`). Linux only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_rss_current_kb: Option<u64>,
+    /// `/proc/self/io` `read_bytes` delta — bytes fetched from the storage
+    /// layer (post-page-cache). Linux only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_read_bytes: Option<u64>,
+    /// `/proc/self/io` `write_bytes` delta. Linux only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_write_bytes: Option<u64>,
+
+    /// Daemon-observed dispatch queue time (batch received → written to the
+    /// worker's stdin), ms. Set by the parent's reader thread; `None` until
+    /// then (and on the worker's own copy). Populated in Phase 3.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub t_dispatch_ms: Option<u64>,
+    /// Daemon-observed worker portion (stdin write → response read), ms.
+    /// Cross-checks `worker_wall_ms`. Set by the parent's reader thread;
+    /// `None` until then. Populated in Phase 3.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub t_worker_ms: Option<u64>,
 }
 
 /// One entry of the init reply's tool-registry advertisement. Lets miint
@@ -136,6 +219,12 @@ pub struct Response {
     /// Submit.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolEntry>,
+
+    /// Opt-in per-batch worker telemetry. Present only when the request set
+    /// `metrics: true` and the batch ran in a subprocess worker; omitted
+    /// otherwise. Purely additive — clients that don't ask never see it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<BatchMetrics>,
 }
 
 impl Response {
@@ -273,6 +362,85 @@ mod tests {
         resp.batch_id = Some(42);
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["batch_id"].as_u64().unwrap(), 42);
+    }
+
+    // --- metrics opt-in flag + BatchMetrics ---
+
+    #[test]
+    fn test_batch_request_metrics_defaults_false() {
+        // A batch line without the flag must deserialize to metrics = false
+        // (so existing callers pay nothing and stay wire-compatible).
+        let s = r#"{"tool":"bowtie2-align","shm_input":"/x","shm_input_size":256}"#;
+        let b: BatchRequest = serde_json::from_str(s).unwrap();
+        assert!(!b.metrics);
+    }
+
+    #[test]
+    fn test_batch_request_metrics_opt_in() {
+        let s = r#"{"tool":"bowtie2-align","shm_input":"/x","shm_input_size":256,"metrics":true}"#;
+        let b: BatchRequest = serde_json::from_str(s).unwrap();
+        assert!(b.metrics);
+    }
+
+    #[test]
+    fn test_response_omits_metrics_when_none() {
+        // Default ok/error responses carry no metrics → key absent from JSON.
+        let resp = Response::ok(serde_json::json!({}), vec![]);
+        let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
+        assert!(json.get("metrics").is_none());
+    }
+
+    #[test]
+    fn test_response_with_metrics_serializes() {
+        let mut resp = Response::ok(serde_json::json!({}), vec![]);
+        resp.metrics = Some(BatchMetrics {
+            worker_wall_ms: 55_230,
+            worker_majflt: 51_234,
+            worker_reused: true,
+            ..Default::default()
+        });
+        let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["metrics"]["worker_wall_ms"].as_u64().unwrap(), 55_230);
+        assert_eq!(json["metrics"]["worker_majflt"].as_u64().unwrap(), 51_234);
+        assert!(json["metrics"]["worker_reused"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_batch_metrics_optional_fields_skipped_when_none() {
+        // Linux-only and daemon-clock fields are Option; when None they must
+        // be omitted (a non-Linux daemon, or the worker's pre-injection copy).
+        let m = BatchMetrics::default();
+        let json: serde_json::Value = serde_json::to_value(&m).unwrap();
+        // Always-present scalar fields:
+        assert!(json.get("worker_majflt").is_some());
+        assert!(json.get("worker_reused").is_some());
+        // Optional fields omitted when None:
+        for absent in [
+            "worker_rss_current_kb",
+            "worker_read_bytes",
+            "worker_write_bytes",
+            "t_dispatch_ms",
+            "t_worker_ms",
+        ] {
+            assert!(
+                json.get(absent).is_none(),
+                "{absent} must be omitted when None"
+            );
+        }
+    }
+
+    #[test]
+    fn test_batch_metrics_round_trip() {
+        let m = BatchMetrics {
+            worker_wall_ms: 10,
+            worker_majflt: 7,
+            worker_read_bytes: Some(4096),
+            t_worker_ms: Some(11),
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        let back: BatchMetrics = serde_json::from_str(&s).unwrap();
+        assert_eq!(m, back);
     }
 
     // --- ControlMessage parsing ---

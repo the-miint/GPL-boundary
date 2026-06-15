@@ -336,6 +336,25 @@ impl Worker for InProcessSlot {
 // SubprocessWorker
 // ---------------------------------------------------------------------------
 
+/// Per-in-flight-batch bookkeeping the reader thread needs: it matches a
+/// response to its sender (submission order, via `batch_id` on a crash drain)
+/// and, when the batch opted into metrics, computes the daemon-clock fields
+/// from the two timestamps. Pushed by `submit` at stdin-write time.
+struct InFlight {
+    batch_id: Option<u64>,
+    /// Coordinator-receive time (from `BatchRequest.received_at`). `None` if
+    /// the batch was never stamped. `dispatched_at - received_at` is the
+    /// queue/dispatch latency reported as `t_dispatch_ms`.
+    received_at: Option<Instant>,
+    /// When `submit` wrote this batch to the child's stdin. `now -
+    /// dispatched_at` at response time is the daemon-observed worker portion
+    /// reported as `t_worker_ms`.
+    dispatched_at: Instant,
+    /// Whether the caller opted into metrics — gates the clock work + the
+    /// injection into the response.
+    metrics: bool,
+}
+
 /// Subprocess worker. Spawns `gpl-boundary --worker <tool>` and feeds it
 /// batches over a pipe. The child runs the tool's streaming context against
 /// its own copy of the shared-memory input, writes Arrow IPC output to a
@@ -376,13 +395,13 @@ pub struct SubprocessWorker {
     /// the dead pipe. The plan deliberately does not auto-respawn —
     /// the user must restart gpl-boundary to recover the fingerprint.
     fingerprint_dead: Arc<AtomicBool>,
-    /// In-submission-order list of batch_ids that have been written to
-    /// the child's stdin but have not yet had a response read back.
-    /// Pushed by `submit`, popped by the reader thread on each
-    /// response. On a crash the reader drains the queue and emits error
-    /// responses for every still-pending batch_id so the coordinator's
-    /// drain loop can complete.
-    in_flight_ids: Arc<Mutex<std::collections::VecDeque<Option<u64>>>>,
+    /// In-submission-order records of batches written to the child's stdin
+    /// but not yet responded to. Pushed by `submit`, popped by the reader
+    /// thread on each response (which also uses the timestamps to compute the
+    /// daemon-clock metrics fields). On a crash the reader drains the queue
+    /// and emits error responses for every still-pending `batch_id` so the
+    /// coordinator's drain loop can complete.
+    in_flight_ids: Arc<Mutex<std::collections::VecDeque<InFlight>>>,
     /// Submitted batches not yet responded to. Incremented in `submit`
     /// before the stdin write; decremented by the reader thread *after*
     /// pushing the response onto `response_tx`. Read by the registry's
@@ -447,7 +466,7 @@ impl SubprocessWorker {
         let reader_response_tx = response_tx.clone();
         let in_flight = Arc::new(AtomicU32::new(0));
         let in_flight_for_thread = Arc::clone(&in_flight);
-        let in_flight_ids: Arc<Mutex<std::collections::VecDeque<Option<u64>>>> =
+        let in_flight_ids: Arc<Mutex<std::collections::VecDeque<InFlight>>> =
             Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let in_flight_ids_for_thread = Arc::clone(&in_flight_ids);
         let fingerprint_dead = Arc::new(AtomicBool::new(false));
@@ -507,7 +526,7 @@ fn subprocess_reader_main(
     response_tx: ResponseTx,
     tool_name: String,
     in_flight: Arc<AtomicU32>,
-    in_flight_ids: Arc<Mutex<std::collections::VecDeque<Option<u64>>>>,
+    in_flight_ids: Arc<Mutex<std::collections::VecDeque<InFlight>>>,
     fingerprint_dead: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     child_pid: u32,
@@ -523,19 +542,38 @@ fn subprocess_reader_main(
                 if trimmed.is_empty() {
                     continue;
                 }
-                let resp = serde_json::from_str::<Response>(trimmed).unwrap_or_else(|e| {
+                let mut resp = serde_json::from_str::<Response>(trimmed).unwrap_or_else(|e| {
                     Response::error(format!(
                         "Worker '{tool_name}' produced malformed response: {e}"
                     ))
                 });
-                // Pop the matching batch_id from the front of the
-                // in-flight tracker. The child processes batches
-                // serially so responses arrive in submission order;
-                // pop_front matches the response to its sender.
-                let _ = in_flight_ids
+                // Pop the matching in-flight record from the front. The child
+                // processes batches serially so responses arrive in submission
+                // order; pop_front matches the response to its sender.
+                let inflight = in_flight_ids
                     .lock()
                     .expect("in_flight_ids mutex")
                     .pop_front();
+                // Stamp the daemon-observed clocks onto the worker's metrics
+                // object (the worker leaves them None). Only when the batch
+                // opted in AND the worker actually produced metrics.
+                if let Some(inf) = inflight {
+                    if inf.metrics {
+                        if let Some(m) = resp.metrics.as_mut() {
+                            let now = Instant::now();
+                            if let Some(recv) = inf.received_at {
+                                m.t_dispatch_ms = Some(
+                                    inf.dispatched_at
+                                        .saturating_duration_since(recv)
+                                        .as_millis() as u64,
+                                );
+                            }
+                            m.t_worker_ms =
+                                Some(now.saturating_duration_since(inf.dispatched_at).as_millis()
+                                    as u64);
+                        }
+                    }
+                }
                 let send_result = response_tx.send(resp);
                 in_flight.fetch_sub(1, Ordering::AcqRel);
                 if send_result.is_err() {
@@ -558,23 +596,35 @@ fn subprocess_reader_main(
     //   coordinator's drain loop counts on these landing), and sweep
     //   the child's orphan shm.
     let was_closed_by_parent = closed.load(Ordering::Acquire);
-    let pending_ids: Vec<Option<u64>> = {
+    let pending: Vec<InFlight> = {
         let mut q = in_flight_ids.lock().expect("in_flight_ids mutex");
         q.drain(..).collect()
     };
     if !was_closed_by_parent {
         fingerprint_dead.store(true, Ordering::Release);
-        for batch_id in pending_ids {
+        for inf in pending {
             let mut r = Response::error(format!(
                 "Worker '{tool_name}' subprocess (pid {child_pid}) exited \
                  unexpectedly mid-batch; restart gpl-boundary to recover \
                  this fingerprint"
             ));
-            r.batch_id = batch_id;
+            r.batch_id = inf.batch_id;
             let _ = response_tx.send(r);
             in_flight.fetch_sub(1, Ordering::AcqRel);
         }
         sweep_orphan_shm_for_pid(child_pid);
+    } else {
+        // Graceful EOF: the reader consumed every response line before the
+        // child exited on stdin-EOF, so nothing should remain in flight. A
+        // non-empty queue here means a response went missing — a bug, not a
+        // normal state — which would leave `in_flight` positive and wedge the
+        // eviction sweeper. Catch it in debug/test builds; in release the
+        // worker is being torn down anyway, so we don't panic the reader.
+        debug_assert!(
+            pending.is_empty(),
+            "graceful shutdown left {} batch(es) unanswered in flight",
+            pending.len()
+        );
     }
 }
 
@@ -656,10 +706,18 @@ impl Worker for SubprocessWorker {
         // response (or a crash drain) processes it.
         self.in_flight.fetch_add(1, Ordering::AcqRel);
         let batch_id = batch.batch_id;
+        let inflight = InFlight {
+            batch_id,
+            received_at: batch.received_at,
+            // Stamped here, immediately before the stdin write below, so
+            // t_worker_ms measures from hand-off to the child.
+            dispatched_at: Instant::now(),
+            metrics: batch.metrics,
+        };
         self.in_flight_ids
             .lock()
             .expect("in_flight_ids mutex")
-            .push_back(batch_id);
+            .push_back(inflight);
 
         let send_result = {
             let mut guard = self
@@ -806,6 +864,8 @@ mod tests {
             shm_input: "/gb-does-not-exist".to_string(),
             shm_input_size: 0,
             batch_id: Some(99),
+            metrics: false,
+            received_at: None,
         });
 
         let response = rx
@@ -842,6 +902,8 @@ mod tests {
             shm_input: "/gb-does-not-exist".to_string(),
             shm_input_size: 0,
             batch_id: Some(7),
+            metrics: false,
+            received_at: None,
         });
         let response = rx
             .recv_timeout(std::time::Duration::from_secs(2))

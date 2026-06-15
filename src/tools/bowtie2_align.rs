@@ -701,17 +701,19 @@ fn build_config(
         bt2.reorder = if v { 1 } else { 0 };
     }
 
-    // Index loading: always memory-map (--mm), not a caller-facing knob.
-    // GPL-boundary's daemon reuses one context across many batches against a
-    // stable, caller-owned on-disk index, so mmap is strictly beneficial here:
-    // it replaces the per-batch whole-index read-copy (and its RSS churn +
-    // major page faults) with shared page-cache-backed mmap (cheap minor
-    // faults). There is no miint scenario that benefits from turning it off, so
-    // it is set unconditionally rather than exposed as a config param (keeps
-    // the --describe surface and describe_version unchanged). The upstream C
-    // API caps the win here — see the Bowtie2StreamingContext note and
-    // localdocs/REQUEST-bowtie2-index-reload-fix-and-mm.md.
+    // Index loading: memory-map the index (--mm). GPL-boundary's daemon reuses
+    // one context across many batches against a stable, caller-owned on-disk
+    // index, so mmap is strictly beneficial in the common case: it replaces the
+    // per-batch whole-index read-copy (and its RSS churn + major page faults)
+    // with shared page-cache-backed mmap (cheap minor faults). It therefore
+    // defaults to on. It is exposed as a caller knob so a diagnostic run can
+    // turn it off and contrast the fault/RSS profile (the upstream C API caps
+    // the win — see the Bowtie2StreamingContext note and
+    // localdocs/REQUEST-bowtie2-index-reload-fix-and-mm.md).
     bt2.memory_mapped = 1;
+    if let Some(v) = config.get("memory_mapped").and_then(|v| v.as_bool()) {
+        bt2.memory_mapped = if v { 1 } else { 0 };
+    }
 
     // Log callback
     bt2.quiet = 1;
@@ -736,12 +738,13 @@ fn build_config(
 /// batch. The reuse above only amortizes process spawn + config-string
 /// ownership, not the index load itself.
 ///
-/// We mitigate this by always passing `--mm` (`build_config` sets
-/// `memory_mapped = 1`): the per-batch reload becomes a memory-map + minor
-/// faults against shared page-cache pages instead of a full whole-index
-/// read-copy, which removed the bulk of the ~30-40% reload tax. A fully
-/// resident index would need the upstream persistent-`Ebwt` refactor, declined
-/// as too complex (the `driver<T>()` surgery). Background:
+/// We mitigate this with `--mm`, which `build_config` enables by default
+/// (`memory_mapped = 1` unless the caller passes `"memory_mapped": false`):
+/// the per-batch reload becomes a memory-map + minor faults against shared
+/// page-cache pages instead of a full whole-index read-copy, which removed the
+/// bulk of the ~30-40% reload tax. A fully resident index would need the
+/// upstream persistent-`Ebwt` refactor, declined as too complex (the
+/// `driver<T>()` surgery). Background:
 /// `localdocs/REQUEST-bowtie2-index-reload-fix-and-mm.md`.
 struct Bowtie2StreamingContext {
     ctx: *mut bt2_align_ctx_t,
@@ -1248,10 +1251,12 @@ impl GplTool for Bowtie2AlignTool {
             // MAX,MIN; bt2 C API commit 3a6ba62).
             // v4: exposed `lowseeds`, `no_exact_upfront`, `no_1mm_upfront`,
             // `deterministic_seeds` config params (bt2 C API v0.4, commit
-            // d35e377). `--mm` is set implicitly and is intentionally NOT a
-            // config param, so it does not appear here. schema_version
-            // unchanged throughout — no output columns affected.
-            describe_version: 4,
+            // d35e377).
+            // v5: exposed `memory_mapped` (--mm) as a caller-controllable knob
+            // (default true), reversing its prior implicit-only status. Lets a
+            // diagnostic run toggle mmap to contrast the page-fault/RSS profile.
+            // schema_version unchanged throughout — no output columns affected.
+            describe_version: 5,
             description: "Short read alignment against a bowtie2 index",
             config_params: vec![
                 // Core
@@ -1576,6 +1581,18 @@ impl GplTool for Bowtie2AlignTool {
                     param_type: "boolean",
                     default: serde_json::json!(false),
                     description: "Write tool log output to stderr for diagnostics",
+                    allowed_values: vec![],
+                },
+                // Index loading
+                ConfigParam {
+                    name: "memory_mapped",
+                    param_type: "boolean",
+                    default: serde_json::json!(true),
+                    description: "Memory-map the index files (--mm) instead of reading them into \
+                                  a private buffer. Defaults to true: it turns the per-batch \
+                                  index reload into a page-cache mmap (minor faults) rather than \
+                                  a whole-index read-copy. Set false to contrast the fault/RSS \
+                                  profile for diagnostics",
                     allowed_values: vec![],
                 },
             ],
@@ -2389,15 +2406,40 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
     }
 
     #[test]
-    fn test_config_memory_mapped_always_on() {
-        // gpl-boundary always passes --mm (memory-mapped index). It is implicit
-        // behavior, not a JSON knob, so any config must yield memory_mapped = 1.
-        let config_json = serde_json::json!({"index_path": "target/scratch/idx"});
-        let (bt2, _cstrings) = build_config(&config_json, false).unwrap();
+    fn test_config_memory_mapped_knob() {
+        // --mm (memory-mapped index) is a caller-controllable knob defaulting to
+        // true. Omitted => 1 (preserves the historical always-on behavior);
+        // explicit true/false map to 1/0.
+        let omitted = serde_json::json!({"index_path": "target/scratch/idx"});
+        let (bt2, _c) = build_config(&omitted, false).unwrap();
         assert_eq!(
             bt2.memory_mapped, 1,
-            "build_config must unconditionally enable --mm (memory_mapped)"
+            "memory_mapped must default to 1 (--mm on) when the knob is omitted"
         );
+
+        let on = serde_json::json!({"index_path": "target/scratch/idx", "memory_mapped": true});
+        let (bt2_on, _c) = build_config(&on, false).unwrap();
+        assert_eq!(bt2_on.memory_mapped, 1, "memory_mapped:true must map to 1");
+
+        let off = serde_json::json!({"index_path": "target/scratch/idx", "memory_mapped": false});
+        let (bt2_off, _c) = build_config(&off, false).unwrap();
+        assert_eq!(
+            bt2_off.memory_mapped, 0,
+            "memory_mapped:false must map to 0"
+        );
+    }
+
+    #[test]
+    fn test_describe_memory_mapped_param() {
+        // The knob is advertised as a boolean defaulting to true.
+        let desc = Bowtie2AlignTool.describe();
+        let p = desc
+            .config_params
+            .iter()
+            .find(|p| p.name == "memory_mapped")
+            .expect("describe() must advertise the memory_mapped config param");
+        assert_eq!(p.param_type, "boolean");
+        assert_eq!(p.default, serde_json::json!(true));
     }
 
     #[test]
@@ -3302,8 +3344,8 @@ CGATCATGCATGCAGGTACGATCAGACAGGCTAGCATCGATCAGC";
         assert!(param_names.contains(&"no_exact_upfront"));
         assert!(param_names.contains(&"no_1mm_upfront"));
         assert!(param_names.contains(&"deterministic_seeds"));
-        // --mm is implicit, never advertised as a config param
-        assert!(!param_names.contains(&"memory_mapped"));
+        // --mm is a caller-controllable knob (advertised as `memory_mapped`).
+        assert!(param_names.contains(&"memory_mapped"));
         assert!(!param_names.contains(&"mm"));
         assert!(param_names.contains(&"no_unal"));
         assert!(param_names.contains(&"xeq"));

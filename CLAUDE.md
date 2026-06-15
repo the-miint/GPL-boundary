@@ -232,7 +232,7 @@ distinct bump policies and are NOT substitutes for each other:
   protocol checks this.
 
 Current landmark values (see `src/tools/mod.rs::tests::test_describe_version_landmarks`):
-fasttree=3, bowtie2-align=4, prodigal/sortmerna/bowtie2-build=1.
+fasttree=3, bowtie2-align=5, prodigal/sortmerna/bowtie2-build=1.
 fasttree's history is documented in a CHANGELOG block above its
 `describe()` method. When you intentionally edit a `--describe`
 surface, bump the version in that tool's `describe()` AND update
@@ -365,6 +365,10 @@ advertisement:
 - **Multi-fingerprint dispatch:** every batch carries its own
   `(tool, config)` and is routed independently. Distinct fingerprints
   may complete out of order; correlate responses via `batch_id`.
+- `metrics` (optional bool, default `false`) — opt-in per-batch worker
+  telemetry. When `true` on a `bowtie2-align` batch, the response carries a
+  `metrics` object (see below). Non-opted batches pay nothing. Ignored by
+  in-process tools.
 
 **Batch response**:
 ```json
@@ -380,6 +384,49 @@ advertisement:
 - `shm_outputs` — omitted when empty. Labels match `[a-z0-9-]+`.
 - `result` — lightweight metadata; bulk data always travels in
   `shm_outputs`.
+- `metrics` — present only when the request set `metrics: true` AND the
+  batch ran in a subprocess worker (bowtie2-align). Omitted otherwise. See
+  below.
+
+**Per-batch worker telemetry (`metrics`)** — opt-in, diagnostic-only,
+purely additive (no `protocol_version` bump; older clients ignore it).
+Populated **only for subprocess workers** (bowtie2-align): `getrusage`
+aggregates a whole process, which is exactly one batch's work in a
+single-purpose worker but would mix concurrent batches in the shared daemon,
+so in-process tools never emit it. Counter fields are per-batch deltas
+(after − before, bracketing the tool call); `worker_rss_kb` is an absolute
+peak. Example:
+```json
+{"success": true, "schema_version": 2, "batch_id": 42,
+ "shm_outputs": [...], "result": {...},
+ "metrics": {
+   "worker_wall_ms": 55230, "worker_user_ms": 4100, "worker_sys_ms": 900,
+   "worker_majflt": 51234, "worker_minflt": 120000,
+   "worker_inblock": 812000, "worker_oublock": 0,
+   "worker_nvcsw": 4096, "worker_nivcsw": 12,
+   "worker_rss_kb": 410000, "worker_rss_current_kb": 398000,
+   "worker_read_bytes": 415662080, "worker_write_bytes": 0,
+   "worker_reused": false, "t_dispatch_ms": 3, "t_worker_ms": 55180}}
+```
+- `worker_majflt` (`ru_majflt` delta) is the headline metric: major page
+  faults that hit disk = the scattered cold random-index reads. Decides
+  compute-vs-cold-I/O without inference.
+- `worker_user_ms`/`worker_sys_ms` (`ru_utime`/`ru_stime` deltas): CPU time.
+  `wall ≫ user+sys` ⇒ I/O-stalled; `wall ≈ user+sys` ⇒ CPU-bound.
+- `worker_minflt`, `worker_inblock`/`worker_oublock` (512B blocks),
+  `worker_nvcsw` (voluntary ctx switches — a blocking-I/O signal),
+  `worker_nivcsw` (involuntary — CPU contention).
+- `worker_rss_kb` peak RSS (`ru_maxrss`, absolute); `worker_rss_current_kb`
+  current RSS.
+- `worker_reused` — `false` on the first batch after a worker spawns (cold
+  index), `true` once warm. An evict+respawn resets it to cold.
+- `t_dispatch_ms` daemon queue/dispatch latency (receive → worker stdin);
+  `t_worker_ms` daemon-observed worker portion (stdin write → response read,
+  brackets `worker_wall_ms` plus IPC/marshaling).
+- **Platform**: `worker_inblock`/`worker_oublock` are 0 on macOS (Darwin
+  does not track them); `worker_rss_current_kb`/`worker_read_bytes`/
+  `worker_write_bytes` are `/proc`-derived and omitted (Linux only). The
+  production target is Linux/Lustre.
 
 **Shutdown** (graceful):
 ```json
@@ -545,18 +592,21 @@ sets MIN. An unset side defaults to bowtie2's compiled-in value (MAX=6,
 MIN=2); set both equal for a symmetric penalty (e.g. woltka's `1,1`). The
 adapter rejects MIN > MAX before the C library sees it.
 
-**Index is always memory-mapped (`--mm`), implicitly.** `build_config` sets
-the C API's `memory_mapped = 1` on every alignment; it is deliberately NOT a
-JSON knob and NOT in the `--describe` surface (so it does not affect
-`describe_version`). The bowtie2 C API (v0.4, commit `d35e377`) reconstructs
+**Index memory-mapping (`--mm`) defaults on; caller-controllable since
+`describe_version=5`.** `build_config` sets the C API's `memory_mapped = 1`
+unless the request supplies `"memory_mapped": false`, and the knob is in the
+`--describe` surface. The bowtie2 C API (v0.4, commit `d35e377`) reconstructs
 the FM-index per `bt2_align_run` rather than holding it resident — the
 persistent-`Ebwt` fix was declined upstream as too complex — so `--mm` is the
 mitigation: the per-batch reload becomes a page-cache mmap (minor faults)
-instead of a whole-index read-copy. Requires the `.bt2` files to stay on disk
-unmodified for the worker's lifetime (caller-owned, already true).
+instead of a whole-index read-copy. It defaults to on for that reason;
+turning it off is a diagnostic lever (contrast the page-fault/RSS profile, e.g.
+alongside the opt-in `metrics` object below). Requires the `.bt2` files to stay
+on disk unmodified for the worker's lifetime (caller-owned, already true).
 
 Commit `d35e377` (bt2 C API v0.4) also added four seeding knobs, now exposed
-as config params (`describe_version=4`): `lowseeds` (string, `-l/--lowseeds`),
+as config params (`describe_version=4`, later bumped to 5 — see below):
+`lowseeds` (string, `-l/--lowseeds`),
 `no_exact_upfront`, `no_1mm_upfront`, and `deterministic_seeds`
 (`-d/--deterministic-seeds`). `deterministic_seeds` is the reproducible-seed
 path: bowtie2 couples it with `report_all` + both upfront-disable flags and
