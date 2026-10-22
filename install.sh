@@ -57,9 +57,19 @@ esac
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
+# --retry covers the transient failures a release download hits (timeouts,
+# HTTP 408/429/5xx), backing off 1+2+4+8+16 s. --retry-all-errors also covers
+# a dropped connection (curl error 56), but needs curl 7.71, newer than
+# RHEL 8's, so it is added only where curl has it. The script takes no
+# arguments, so "$@" holds these options.
+set -- --retry 5
+if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then
+    set -- "$@" --retry-all-errors
+fi
+
 printf 'Downloading %s...\n' "$asset"
-curl --proto '=https' --tlsv1.2 -fSL "$base_url/$asset"        -o "$tmpdir/$asset"
-curl --proto '=https' --tlsv1.2 -fSL "$base_url/SHA256SUMS"    -o "$tmpdir/SHA256SUMS"
+curl --proto '=https' --tlsv1.2 "$@" -fSL "$base_url/$asset"        -o "$tmpdir/$asset"
+curl --proto '=https' --tlsv1.2 "$@" -fSL "$base_url/SHA256SUMS"    -o "$tmpdir/SHA256SUMS"
 
 # --- Verify checksum ------------------------------------------------------
 expected="$(grep " $asset\$" "$tmpdir/SHA256SUMS" | cut -d' ' -f1 || true)"
