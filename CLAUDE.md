@@ -232,7 +232,7 @@ distinct bump policies and are NOT substitutes for each other:
   protocol checks this.
 
 Current landmark values (see `src/tools/mod.rs::tests::test_describe_version_landmarks`):
-fasttree=3, bowtie2-align=5, prodigal/sortmerna/bowtie2-build=1.
+fasttree=3, bowtie2-align=5, prodigal=2, sortmerna/bowtie2-build=1.
 fasttree's history is documented in a CHANGELOG block above its
 `describe()` method. When you intentionally edit a `--describe`
 surface, bump the version in that tool's `describe()` AND update
@@ -271,6 +271,10 @@ thread.
   Structs must match C headers exactly. Each config struct must have an ABI
   size-check test. Size checks catch added/removed fields but not reordering;
   manual review against the C header is still required when fields change.
+  Prodigal's mirrors go further: `test_abi_layout_matches_c` compares every
+  field's offset and size with the library's `prodigal_abi_layout()`, which
+  catches reordering too, but not a wrong type of the same size: review the
+  types against the header.
 - **Error handling**: tools return `Response::error(msg)`. Never panic across
   FFI.
 - **Tool registration**: tools self-register via `inventory::submit!`. No

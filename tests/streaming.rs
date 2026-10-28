@@ -676,8 +676,8 @@ fn test_two_fingerprints_in_one_session() {
     // batches with distinct (tool, config) fingerprints must each succeed
     // — the registry creates one InProcessSlot per fingerprint and routes
     // batches accordingly. Both prodigal contexts use meta_mode=true (so
-    // both can stream) but distinct trans_table values to force different
-    // fingerprints.
+    // both can stream) but distinct closed_ends values to force different
+    // fingerprints (metagenomic mode takes translation table 11 only).
     let shm1 =
         ShmGuard::create_with_batch("ph4-fp-a", &make_prodigal_batch(&["c1"], &[TEST_SEQ_1]));
     let shm2 =
@@ -703,7 +703,7 @@ fn test_two_fingerprints_in_one_session() {
             .write_all(
                 format!(
                     "{{\"tool\":\"prodigal\",\
-                     \"config\":{{\"meta_mode\":true,\"trans_table\":4}},\
+                     \"config\":{{\"meta_mode\":true,\"closed_ends\":true}},\
                      \"shm_input\":\"{}\",\"shm_input_size\":{},\"batch_id\":2}}\n",
                     shm2.name(),
                     shm2.size()

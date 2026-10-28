@@ -372,7 +372,7 @@ mod tests {
     fn test_describe_version_landmarks() {
         let cases: &[(&str, u32)] = &[
             ("fasttree", 3),
-            ("prodigal", 1),
+            ("prodigal", 2),
             ("sortmerna", 1),
             ("bowtie2-align", 5),
             ("bowtie2-build", 1),
