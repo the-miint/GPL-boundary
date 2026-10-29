@@ -217,7 +217,8 @@ fn test_init_reply_carries_tool_registry() {
 
 #[test]
 fn test_shutdown_message_exits_cleanly() {
-    let shm1 = ShmGuard::create_with_batch("ph3-sd", &make_prodigal_batch(&["c1"], &[TEST_SEQ_1]));
+    let shm1 =
+        ShmGuard::create_with_batch("shutdown", &make_prodigal_batch(&["c1"], &[TEST_SEQ_1]));
     let mut child = spawn_daemon();
     {
         let stdin = child.stdin.as_mut().unwrap();
@@ -302,9 +303,9 @@ fn test_idle_timeout_self_exits() {
 #[test]
 fn test_idle_timeout_disabled_stays_alive() {
     let shm1 =
-        ShmGuard::create_with_batch("ph3-noidle-1", &make_prodigal_batch(&["c1"], &[TEST_SEQ_1]));
+        ShmGuard::create_with_batch("no-idle-1", &make_prodigal_batch(&["c1"], &[TEST_SEQ_1]));
     let shm2 =
-        ShmGuard::create_with_batch("ph3-noidle-2", &make_prodigal_batch(&["c2"], &[TEST_SEQ_2]));
+        ShmGuard::create_with_batch("no-idle-2", &make_prodigal_batch(&["c2"], &[TEST_SEQ_2]));
 
     let mut child = spawn_daemon();
     {
@@ -378,7 +379,7 @@ fn test_indefinite_batch_count() {
         stdin.write_all(init_line(None).as_bytes()).unwrap();
         for i in 0..25 {
             let g = ShmGuard::create_with_batch(
-                "ph3-many",
+                "pd-many",
                 &make_prodigal_batch(
                     &[&format!("c{i}")],
                     &[if i % 2 == 0 { TEST_SEQ_1 } else { TEST_SEQ_2 }],
@@ -428,9 +429,9 @@ fn test_indefinite_batch_count() {
 #[test]
 fn test_streaming_prodigal_two_batches() {
     let shm1 =
-        ShmGuard::create_with_batch("ph3-pd-1", &make_prodigal_batch(&["c1"], &[TEST_SEQ_1]));
+        ShmGuard::create_with_batch("pd-stream-1", &make_prodigal_batch(&["c1"], &[TEST_SEQ_1]));
     let shm2 =
-        ShmGuard::create_with_batch("ph3-pd-2", &make_prodigal_batch(&["c2"], &[TEST_SEQ_2]));
+        ShmGuard::create_with_batch("pd-stream-2", &make_prodigal_batch(&["c2"], &[TEST_SEQ_2]));
 
     let mut child = spawn_daemon();
     {
@@ -475,7 +476,8 @@ fn test_streaming_prodigal_two_batches() {
 fn test_streaming_error_recovery() {
     // Batch 1: valid prodigal input. Batch 2: bad shm — must error but
     // session continues until shutdown.
-    let shm1 = ShmGuard::create_with_batch("ph3-err", &make_prodigal_batch(&["c1"], &[TEST_SEQ_1]));
+    let shm1 =
+        ShmGuard::create_with_batch("err-recovery", &make_prodigal_batch(&["c1"], &[TEST_SEQ_1]));
 
     let mut child = spawn_daemon();
     {
@@ -536,8 +538,7 @@ fn test_streaming_error_recovery() {
 fn test_first_message_must_be_init() {
     // Sending a batch as the first message should produce an error and
     // a non-zero exit code.
-    let shm =
-        ShmGuard::create_with_batch("ph3-noinit", &make_prodigal_batch(&["c1"], &[TEST_SEQ_1]));
+    let shm = ShmGuard::create_with_batch("no-init", &make_prodigal_batch(&["c1"], &[TEST_SEQ_1]));
     let mut child = spawn_daemon();
     {
         let stdin = child.stdin.as_mut().unwrap();
@@ -607,10 +608,14 @@ fn test_fingerprint_ignores_config_key_order() {
     // Two batches with the same prodigal config but different JSON key
     // ordering must NOT trigger the single-fingerprint mismatch error.
     // The fingerprint check canonicalizes keys before comparison.
-    let shm1 =
-        ShmGuard::create_with_batch("ph3-fp-key-1", &make_prodigal_batch(&["c1"], &[TEST_SEQ_1]));
-    let shm2 =
-        ShmGuard::create_with_batch("ph3-fp-key-2", &make_prodigal_batch(&["c2"], &[TEST_SEQ_2]));
+    let shm1 = ShmGuard::create_with_batch(
+        "fp-key-order-1",
+        &make_prodigal_batch(&["c1"], &[TEST_SEQ_1]),
+    );
+    let shm2 = ShmGuard::create_with_batch(
+        "fp-key-order-2",
+        &make_prodigal_batch(&["c2"], &[TEST_SEQ_2]),
+    );
 
     let mut child = spawn_daemon();
     {
@@ -680,9 +685,9 @@ fn test_two_fingerprints_in_one_session() {
     // both can stream) but distinct closed_ends values to force different
     // fingerprints (metagenomic mode takes translation table 11 only).
     let shm1 =
-        ShmGuard::create_with_batch("ph4-fp-a", &make_prodigal_batch(&["c1"], &[TEST_SEQ_1]));
+        ShmGuard::create_with_batch("two-fp-a", &make_prodigal_batch(&["c1"], &[TEST_SEQ_1]));
     let shm2 =
-        ShmGuard::create_with_batch("ph4-fp-b", &make_prodigal_batch(&["c2"], &[TEST_SEQ_2]));
+        ShmGuard::create_with_batch("two-fp-b", &make_prodigal_batch(&["c2"], &[TEST_SEQ_2]));
 
     let mut child = spawn_daemon();
     {
@@ -783,7 +788,7 @@ fn anthus_batch() -> (RecordBatch, usize) {
 #[test]
 fn test_prodigal_single_mode_routes() {
     let (batch, n_genes) = anthus_batch();
-    let shm = ShmGuard::create_with_batch("g2-single", &batch);
+    let shm = ShmGuard::create_with_batch("pd-single-route", &batch);
     let trains = serde_json::json!({"meta_mode": false, "train_on_batch": true});
     let responses = run_session(
         &shm,
@@ -864,7 +869,7 @@ fn run_session(shm: &ShmGuard, batches: &[(&str, serde_json::Value)]) -> Vec<ser
 fn test_prodigal_survives_low_complexity_input() {
     let repeat = "ATG".repeat(12_000);
     let batch = make_prodigal_batch(&["atg", "c1"], &[&repeat, TEST_SEQ_1]);
-    let shm = ShmGuard::create_with_batch("g5-atg", &batch);
+    let shm = ShmGuard::create_with_batch("pd-atg-repeat", &batch);
     // run_session checks the daemon's exit status
     let responses = run_session(&shm, &[("prodigal", serde_json::json!({}))]);
     assert!(
@@ -880,7 +885,7 @@ fn test_prodigal_survives_low_complexity_input() {
 #[test]
 fn test_prodigal_train_then_predict() {
     let (batch, n_genes) = anthus_batch();
-    let shm = ShmGuard::create_with_batch("g3-train", &batch);
+    let shm = ShmGuard::create_with_batch("pd-train", &batch);
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let path = dir.path().join("anthus.bin");
 

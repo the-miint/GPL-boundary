@@ -1,5 +1,6 @@
-//! Prodigal adapter: reads Arrow IPC from shared memory, runs prodigal
-//! gene prediction, writes SOA genes as Arrow IPC back to shared memory.
+//! Prodigal adapter: reads contigs as Arrow IPC from shared memory, runs
+//! prodigal gene prediction, and writes the genes and a table of the contigs
+//! as Arrow IPC back to shared memory.
 
 use crate::arrow_ipc::ShmOutputs;
 use crate::protocol::Response;
@@ -12,6 +13,7 @@ use arrow::array::{
 };
 use arrow::record_batch::RecordBatch;
 use std::ffi::CStr;
+use std::io::Read;
 use std::os::raw::{c_char, c_double, c_int, c_void};
 use std::path::PathBuf;
 use std::ptr;
@@ -257,8 +259,9 @@ pub(super) const INPUT_FIELDS: &[FieldDescription] = &[
         "sequence",
         "Utf8",
         false,
-        "Nucleotide sequence (sequences may have different lengths); a character \
-         outside 'A'..'z', which Prodigal would drop, is an error",
+        "Nucleotide sequence (sequences may have different lengths); an empty \
+         sequence, or a character outside 'A'..'z', which Prodigal would drop, is \
+         an error",
     ),
 ];
 
@@ -459,8 +462,9 @@ impl GeneColumns {
         seq_name: &str,
         soa: &ProdigalGenesSoa,
     ) -> Result<(), String> {
+        let n = usize::try_from(soa.n_genes)
+            .map_err(|_| format!("the library returned a gene count of {}", soa.n_genes))?;
         // With no genes the arrays may be NULL
-        let n = usize::try_from(soa.n_genes).unwrap_or(0);
         if n == 0 {
             return Ok(());
         }
@@ -714,14 +718,17 @@ impl Settings {
                     "training_path needs training_sha256, the model's SHA-256 \
                      (prodigal-train reports it)",
                 )?;
-                if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+                // One spelling, prodigal-train's, not one fingerprint per case
+                let lower_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+                if sha256.len() != 64 || !sha256.bytes().all(lower_hex) {
                     return Err(format!(
-                        "training_sha256 must be 64 hexadecimal digits, got {sha256:?}"
+                        "training_sha256 must be 64 lowercase hexadecimal digits, as \
+                         prodigal-train reports it, got {sha256:?}"
                     ));
                 }
                 Some(Model {
                     path: path.into(),
-                    sha256: sha256.to_ascii_lowercase(),
+                    sha256: sha256.into(),
                 })
             }
         };
@@ -795,8 +802,8 @@ pub(super) fn training_info(blob: &[u8]) -> Result<ProdigalTrainingInfo, String>
 }
 
 /// A batch's contigs, read in place from the input mapping: its (name,
-/// sequence) columns, which hold no nulls and no character the library
-/// drops.
+/// sequence) columns, which hold no nulls, no empty sequence and no
+/// character the library drops.
 pub(super) struct Contigs(Vec<(StringArray, StringArray)>);
 
 impl Contigs {
@@ -824,7 +831,11 @@ impl Contigs {
                 if seqs.is_null(i) {
                     return Err(format!("contig '{name}' (input row {row}): null sequence"));
                 }
-                if let Some(why) = dropped_character(seqs.value(i)) {
+                let seq = seqs.value(i);
+                if seq.is_empty() {
+                    return Err(format!("contig '{name}' (input row {row}): empty sequence"));
+                }
+                if let Some(why) = dropped_character(seq) {
                     return Err(format!("contig '{name}': {why}"));
                 }
             }
@@ -857,8 +868,8 @@ fn dropped_character(seq: &str) -> Option<String> {
     // Every byte before it is ASCII, so it starts a character
     let c = seq[at..].chars().next().unwrap();
     Some(format!(
-        "{c:?} at position {} is not a base or an ambiguity code (Prodigal \
-         would drop it, shifting every coordinate after it)",
+        "{c:?} at position {} is outside 'A'..'z' (Prodigal would drop it, \
+         shifting every coordinate after it)",
         at + 1
     ))
 }
@@ -907,18 +918,16 @@ impl Context {
             .map(|(_, s)| (s.as_ptr().cast(), c_len(s)))
             .unzip();
         let n = i32::try_from(seqs.len()).map_err(|_| "too many contigs to train on")?;
-        unsafe {
-            let rc = prodigal_set_training_sequences(
-                self.0,
-                seqs.as_ptr(),
-                ptr::null(),
-                lens.as_ptr(),
-                n,
-            );
-            self.check(rc)
-                .and_then(|()| self.check(prodigal_train(self.0)))
-        }
-        .map_err(|e| format!("training on the batch: {e}"))
+        // With several contigs, a 12-base spacer follows each
+        let spacers = if n > 1 { 12 * i64::from(n) } else { 0 };
+        let length = lens.iter().map(|&len| i64::from(len)).sum::<i64>() + spacers;
+        let rc = unsafe {
+            prodigal_set_training_sequences(self.0, seqs.as_ptr(), ptr::null(), lens.as_ptr(), n)
+        };
+        self.check(rc)
+            .and_then(|()| self.check_kept(length))
+            .and_then(|()| self.check(unsafe { prodigal_train(self.0) }))
+            .map_err(|e| format!("training on the batch: {e}"))
     }
 
     /// The model, as the CLI's -t writes it.
@@ -938,15 +947,23 @@ impl Context {
     /// for: a file retrained since is not served. Returns its settings.
     fn load_model(&mut self, model: &Model) -> Result<ProdigalTrainingInfo, String> {
         // Larger than any model (558,392 bytes on 64-bit builds), so a wrong
-        // file is refused before it is read
+        // file is read no further
         const MAX_MODEL_BYTES: u64 = 1 << 20;
+        let not_a_model =
+            || format!("not a Prodigal model (a file of at most {MAX_MODEL_BYTES} bytes)");
+        // Refused unopened: opening a FIFO or a device waits or acts
         let meta = std::fs::metadata(&model.path).map_err(|e| e.to_string())?;
-        if !meta.is_file() || meta.len() > MAX_MODEL_BYTES {
-            return Err(format!(
-                "not a Prodigal model (a file of at most {MAX_MODEL_BYTES} bytes)"
-            ));
+        if !meta.is_file() {
+            return Err(not_a_model());
         }
-        let blob = std::fs::read(&model.path).map_err(|e| e.to_string())?;
+        let file = std::fs::File::open(&model.path).map_err(|e| e.to_string())?;
+        let mut blob = Vec::new();
+        file.take(MAX_MODEL_BYTES + 1)
+            .read_to_end(&mut blob)
+            .map_err(|e| e.to_string())?;
+        if blob.len() as u64 > MAX_MODEL_BYTES {
+            return Err(not_a_model());
+        }
         let sha256 = sha256_hex(&blob);
         if sha256 != model.sha256 {
             return Err(format!(
@@ -961,22 +978,24 @@ impl Context {
 
     /// Load a contig, checking the library kept all of it.
     fn load(&mut self, seq: &str) -> Result<(), String> {
-        unsafe {
-            let rc = prodigal_set_sequence(self.0, seq.as_ptr().cast(), c_len(seq), ptr::null());
-            self.check(rc)?;
-            let mut info: ProdigalSeqInfo = std::mem::zeroed();
-            if prodigal_get_seq_info(self.0, &mut info) != PRODIGAL_OK {
-                return Err("prodigal_get_seq_info failed".into());
-            }
-            // Contigs::read refused what the library drops: this catches a
-            // change in that rule
-            if info.length != c_len(seq) {
-                let kept = info.length;
-                return Err(format!(
-                    "Prodigal kept {kept} of its {} characters",
-                    seq.len()
-                ));
-            }
+        let rc =
+            unsafe { prodigal_set_sequence(self.0, seq.as_ptr().cast(), c_len(seq), ptr::null()) };
+        self.check(rc)?;
+        self.check_kept(c_len(seq).into())
+    }
+
+    /// Check the loaded sequence is `length` characters long. Contigs::read
+    /// refused what the library drops: this catches a change in that rule.
+    fn check_kept(&self, length: i64) -> Result<(), String> {
+        let mut info: ProdigalSeqInfo = unsafe { std::mem::zeroed() };
+        if unsafe { prodigal_get_seq_info(self.0, &mut info) } != PRODIGAL_OK {
+            return Err("prodigal_get_seq_info failed".into());
+        }
+        if i64::from(info.length) != length {
+            return Err(format!(
+                "Prodigal kept {} of {length} characters",
+                info.length
+            ));
         }
         Ok(())
     }
@@ -999,11 +1018,13 @@ impl Context {
             unsafe {
                 let rc = prodigal_find_genes(self.0, &mut soa, &mut stats);
                 self.check(rc).map_err(contig)?;
-                if !soa.is_null() {
-                    let appended = genes.append(seq_index, name, &*soa);
-                    prodigal_genes_free(soa);
-                    appended.map_err(contig)?;
+                // A successful call returns one, with or without genes
+                if soa.is_null() {
+                    return Err(contig("prodigal_find_genes returned no genes table".into()));
                 }
+                let appended = genes.append(seq_index, name, &*soa);
+                prodigal_genes_free(soa);
+                appended.map_err(contig)?;
             }
             table.append(seq_index, name, c_len(seq), &stats);
         }
@@ -1134,8 +1155,8 @@ impl GplTool for ProdigalTool {
                     name: "training_sha256",
                     param_type: "string",
                     default: serde_json::Value::Null,
-                    description: "The SHA-256 of training_path's model, in hexadecimal \
-                                  as prodigal-train reports it. A worker loads the file only \
+                    description: "The SHA-256 of training_path's model, in lowercase \
+                                  hexadecimal as prodigal-train reports it. A worker loads the file only \
                                   if its hash matches, and then serves that model for this \
                                   hash",
                     allowed_values: vec![],
@@ -1250,9 +1271,9 @@ impl GplTool for ProdigalTool {
 mod tests {
     use super::*;
     use crate::test_util::{
-        anthus, anthus_batch, assert_anthus_model, column, fasta_records, gene_coordinates,
-        gff_coordinates, gff_genes, gff_sequences, prediction_of, prodigal_batch, prodigal_truth,
-        scratch_dir, unique_shm_name, write_arrow_to_shm, Prediction,
+        anthus, anthus_batch, assert_anthus_model, column, contigs_batch, fasta_records,
+        gene_coordinates, gff_coordinates, gff_genes, gff_sequences, prediction_of, prodigal_batch,
+        prodigal_truth, scratch_dir, unique_shm_name, write_arrow_to_shm, Prediction,
         PRODIGAL_REF_TRAIN as REF_TRAIN, PRODIGAL_REF_TRAIN_SHA256 as REF_TRAIN_SHA256,
     };
     use arrow::array::{BooleanArray, Float64Array, Int32Array};
@@ -1426,10 +1447,10 @@ mod tests {
         }
     }
 
-    /// Protein offsets that don't start at 0 or go backwards are an error,
-    /// not a slice out of bounds.
+    /// A negative gene count, or protein offsets that don't start at 0 or
+    /// go backwards, are an error, not no genes or a slice out of bounds.
     #[test]
-    fn test_malformed_protein_offsets_are_an_error() {
+    fn test_malformed_genes_are_an_error() {
         let (ints, floats) = ([1i32; 2], [0.0f64; 2]);
         let none = c"None".as_ptr();
         let texts = [none; 2];
@@ -1462,6 +1483,12 @@ mod tests {
             let err = append(&bad).unwrap_err();
             assert!(err.contains("protein offsets"), "{bad:?}: {err}");
         }
+        let negative = ProdigalGenesSoa {
+            n_genes: -1,
+            ..soa(&[0, 4, 7])
+        };
+        let err = unsafe { GeneColumns::default().append(1, "c", &negative) }.unwrap_err();
+        assert!(err.contains("gene count"), "{err}");
     }
 
     /// One contigs row per input contig, in order, with the CLI's
@@ -1974,7 +2001,7 @@ mod tests {
                 .run_batch(&input_name, input.len())
                 .error
                 .expect("refused");
-            let wanted = format!("{c:?} at position {}", at + 1);
+            let wanted = format!("{c:?} at position {} is outside 'A'..'z'", at + 1);
             assert!(err.contains("'c2'") && err.contains(&wanted), "{err}");
         }
         // The context is still usable
@@ -1983,11 +2010,9 @@ mod tests {
         // Single-genome mode
         let mut contigs = anthus();
         contigs[5].1 = with(&contigs[5].1, 42, '.');
-        let names: Vec<&str> = contigs.iter().map(|c| c.0.as_str()).collect();
-        let seqs: Vec<&str> = contigs.iter().map(|c| c.1.as_str()).collect();
         let config = serde_json::json!({"meta_mode": false, "train_on_batch": true});
-        let err = predict(config, &names, &seqs).unwrap_err();
-        let wanted = format!("'{}'", names[5]);
+        let err = predict_batch(config, &contigs_batch(&contigs)).unwrap_err();
+        let wanted = format!("'{}'", contigs[5].0);
         assert!(
             err.contains(&wanted) && err.contains("'.' at position 43"),
             "{err}"
@@ -1998,14 +2023,45 @@ mod tests {
         assert!(result.is_ok(), "{:?}", result.err());
     }
 
-    /// Any other error a contig causes names the contig.
+    /// A contig with an empty sequence is refused, naming it, on both
+    /// routes: Prodigal finds nothing in it (the CLI stops on one), and
+    /// training would count it but add only a spacer.
     #[test]
-    fn test_contig_errors_name_the_contig() {
-        for bad in ["", "0123456789"] {
-            let err = predict(serde_json::json!({}), &["c1", "c2"], &[TEST_SEQ_1, bad]);
-            let err = err.unwrap_err();
-            assert!(err.contains("'c2'"), "{bad:?}: {err}");
+    fn test_empty_contig_is_refused() {
+        let mut contigs = anthus();
+        contigs.insert(3, ("empty".into(), String::new()));
+        let batch = contigs_batch(&contigs);
+        for config in [
+            serde_json::json!({}),
+            serde_json::json!({"meta_mode": false, "train_on_batch": true}),
+        ] {
+            let err = predict_batch(config.clone(), &batch).unwrap_err();
+            assert!(
+                err.contains("'empty' (input row 4): empty sequence"),
+                "{config}: {err}"
+            );
         }
+    }
+
+    /// Contigs::read refuses what the library drops. Should the library's
+    /// rule change, a contig it doesn't keep whole is an error, when
+    /// predicting and when training, not shifted coordinates or a model of
+    /// other bases.
+    #[test]
+    fn test_kept_length_is_checked() {
+        let config = serde_json::json!({"meta_mode": false, "train_on_batch": true});
+        let mut ctx = Context::new(&Settings::parse(&config).unwrap().config).unwrap();
+        let dropped = format!("{TEST_SEQ_2}-");
+        let err = ctx.load(&dropped).unwrap_err();
+        assert!(err.contains("kept"), "{err}");
+
+        // As Contigs::read would never return them
+        let mut contigs = anthus();
+        contigs[5].1.push('-');
+        let names = StringArray::from_iter_values(contigs.iter().map(|c| &c.0));
+        let seqs = StringArray::from_iter_values(contigs.iter().map(|c| &c.1));
+        let err = ctx.train(&Contigs(vec![(names, seqs)])).unwrap_err();
+        assert!(err.contains("kept"), "{err}");
     }
 
     /// Each contig is read in place, within its own bounds: a contig's
@@ -2063,8 +2119,9 @@ mod tests {
         assert_eq!(got, expected);
     }
 
-    /// training_path needs training_sha256, the file's (in either case), so
-    /// a model retrained in place is refused rather than served.
+    /// training_path needs training_sha256, the file's, spelt as
+    /// prodigal-train reports it (lowercase: one model, one worker), so a
+    /// model retrained in place is refused rather than served.
     #[test]
     fn test_training_path_checks_the_sha256() {
         let tool = ProdigalTool;
@@ -2091,13 +2148,14 @@ mod tests {
         );
 
         let upper = REF_TRAIN_SHA256.to_uppercase();
-        let upper = from_model(serde_json::json!({"training_sha256": upper}));
-        assert!(tool.create_streaming_context(&upper).is_ok());
+        let err = refused(from_model(serde_json::json!({"training_sha256": upper})));
+        assert!(err.contains("lowercase"), "{err}");
     }
 
-    /// A model file that cannot be read, is not a file, is too large to be a
-    /// model (refused before it is read) or that the library refuses is an
-    /// error naming the path.
+    /// A model file that cannot be read, is not a regular file (refused
+    /// unopened: a FIFO doesn't block), is too large to be a model (read no
+    /// further: a sparse terabyte is refused at once) or that the library
+    /// refuses is an error naming the path.
     #[test]
     fn test_training_path_refused_model() {
         let dir = scratch_dir();
@@ -2106,17 +2164,24 @@ mod tests {
         std::fs::write(&short, &bytes[..1000]).unwrap();
         let sha = sha256_hex(&bytes[..1000]);
         let large = dir.path().join("large.bin");
-        std::fs::write(&large, vec![0u8; 2 << 20]).unwrap();
+        std::fs::File::create(&large)
+            .unwrap()
+            .set_len(1 << 40)
+            .unwrap();
         let missing = dir.path().join("missing.bin");
         let not_a_file = dir.path().to_path_buf();
-        for path in [&short, &large, &missing, &not_a_file] {
+        let fifo = dir.path().join("fifo.bin");
+        let c_fifo = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        let endless = PathBuf::from("/dev/zero");
+        for path in [&short, &large, &missing, &not_a_file, &fifo, &endless] {
             let config =
                 from_model(serde_json::json!({"training_path": path, "training_sha256": sha}));
             let err = ProdigalTool.create_streaming_context(&config).err();
             let err = err.expect("refused");
             assert!(err.contains(path.to_str().unwrap()), "{err}");
-            let unread = path == &large || path == &not_a_file;
-            assert_eq!(err.contains("not a Prodigal model"), unread, "{err}");
+            let not_a_model = [&large, &not_a_file, &fifo, &endless].contains(&path);
+            assert_eq!(err.contains("not a Prodigal model"), not_a_model, "{err}");
         }
     }
 

@@ -210,7 +210,9 @@ fn model_target(path: &Path) -> Result<String, String> {
 
 /// Write `blob` to `target` (a model_target) atomically: a temporary file
 /// in the same directory, synced, renamed over it, and the rename synced.
-/// The file's mode is the CLI's: 0666 less the umask.
+/// It is a new file, with a new file's mode (0666 less the umask, as the
+/// CLI creates one), also where the CLI would overwrite an existing file in
+/// place, keeping its inode, mode and owner.
 fn write_atomically(target: &str, blob: &[u8]) -> std::io::Result<()> {
     let dir = Path::new(target).parent().expect("a canonical file path");
     let mut file = tempfile::Builder::new()
@@ -228,9 +230,10 @@ mod tests {
     use super::ProdigalTrainTool;
     use crate::protocol::{BatchRequest, Response};
     use crate::test_util::{
-        anthus_batch, assert_anthus_model, gene_coordinates, gff_coordinates, prediction_of,
-        prodigal_truth, scratch_dir, unique_shm_name, write_arrow_to_shm,
-        PRODIGAL_REF_TRAIN as REF_TRAIN, PRODIGAL_REF_TRAIN_SHA256 as REF_TRAIN_SHA256,
+        anthus, anthus_batch, assert_anthus_model, contigs_batch, gene_coordinates,
+        gff_coordinates, prediction_of, prodigal_truth, scratch_dir, unique_shm_name,
+        write_arrow_to_shm, PRODIGAL_REF_TRAIN as REF_TRAIN,
+        PRODIGAL_REF_TRAIN_SHA256 as REF_TRAIN_SHA256,
     };
     use crate::tools::prodigal::{sha256_hex, ProdigalTool};
     use crate::tools::GplTool;
@@ -405,6 +408,27 @@ mod tests {
         assert!(err.contains("training"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), b"old");
         assert_eq!(files(dir.path()), ["model.bin"]);
+    }
+
+    /// A contig with an empty sequence is refused, naming it, and nothing
+    /// is written: training would count it but add only a spacer.
+    #[test]
+    fn test_empty_contig_is_refused() {
+        let dir = scratch_dir();
+        let path = dir.path().join("model.bin");
+        let mut contigs = anthus();
+        contigs.push(("empty".into(), String::new()));
+        let response = run(
+            "prodigal-train",
+            serde_json::json!({"training_path": path}),
+            &contigs_batch(&contigs),
+        );
+        let err = response.error.expect("refused");
+        assert!(
+            err.contains("'empty' (input row 23): empty sequence"),
+            "{err}"
+        );
+        assert!(files(dir.path()).is_empty());
     }
 
     /// The config is strict, as prodigal's: training_path is required and a

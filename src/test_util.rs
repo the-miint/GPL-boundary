@@ -63,14 +63,18 @@ pub fn anthus() -> Vec<(String, String)> {
     )))
 }
 
-/// anthus as one prodigal input batch.
-pub fn anthus_batch() -> RecordBatch {
-    let contigs = anthus();
+/// (name, sequence) contigs as one prodigal input batch.
+pub fn contigs_batch(contigs: &[(String, String)]) -> RecordBatch {
     let (names, seqs): (Vec<&str>, Vec<&str>) = contigs
         .iter()
         .map(|(name, seq)| (name.as_str(), seq.as_str()))
         .unzip();
     prodigal_batch(&names, &seqs)
+}
+
+/// anthus as one prodigal input batch.
+pub fn anthus_batch() -> RecordBatch {
+    contigs_batch(&anthus())
 }
 
 /// A file of the fork's testdata/ground_truth (the CLI's output on anthus).

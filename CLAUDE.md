@@ -389,8 +389,8 @@ advertisement:
  "result": {"n_nodes": 7, "n_leaves": 4, "root": 6}}
 ```
 - `schema_version` — per-tool (FastTree=2, Prodigal=2, SortMeRNA=2,
-  Bowtie2=2, Bowtie2-build=1 as of writing); bumped on breaking
-  output-schema changes.
+  Bowtie2=2, Bowtie2-build=1, Prodigal-train=1 as of writing); bumped on
+  breaking output-schema changes.
 - `shm_outputs` — omitted when empty. Labels match `[a-z0-9-]+`.
 - `result` — lightweight metadata; bulk data always travels in
   `shm_outputs`.
@@ -563,18 +563,19 @@ null means the default):
 |---|---|---|---|
 | `meta_mode` | bool | `true` | Metagenomic bins; `false` = single-genome mode, which needs a model route below |
 | `training_path` | string | – | Single-genome: a model file `prodigal-train` wrote, loaded once per worker; needs `training_sha256`; refuses `trans_table`/`start_weight`/`force_nonsd` (the model has them) |
-| `training_sha256` | string | – | The model's SHA-256 (64 hex digits, as `prodigal-train` reports it: lowercase); checked on load, part of the fingerprint (an uppercase spelling is accepted but gets its own worker) |
+| `training_sha256` | string | – | The model's SHA-256, as `prodigal-train` reports it (64 lowercase hex digits; uppercase is refused rather than given its own fingerprint); checked on load, part of the fingerprint |
 | `train_on_batch` | bool | `false` | Single-genome without a model: train on each batch, which must hold a whole genome |
 | `trans_table` | int | `11` | 4, 5, 9, 11, 13, 15, 21, 25, 26, 32 (NCBI codes Prodigal uses as NCBI defines them); metagenomic mode takes 11 only |
-| `closed_ends` | bool | `false` | No genes off the edges; not stored in a model, so pass the value it was trained with |
+| `closed_ends` | bool | `false` | No genes off the edges; not stored in a model (nor by the CLI's `-t`): pass the value it was trained with to predict as the CLI does with `-c` |
 | `mask_regions` | bool | `false` | Don't build genes across runs of N; not stored in a model either |
 | `force_nonsd` | bool | `false` | Single-genome only |
 | `start_weight` | float | `4.35` | Single-genome only (metagenomic mode takes the default) |
 | `verbose` | bool | `false` | Library log to stderr |
 
 The input is refused for an empty batch, a null name (naming the input
-row), and, naming the contig, a null sequence or a character outside
-`A`..`z` (Prodigal would drop it, shifting every coordinate after it).
+row), and, naming the contig, a null or empty sequence or a character
+outside `A`..`z` (Prodigal would drop it, shifting every coordinate after
+it).
 
 **prodigal-train** (input as Prodigal's; no Arrow output): trains a
 single-genome model on the batch's contigs (one whole genome) and writes it
