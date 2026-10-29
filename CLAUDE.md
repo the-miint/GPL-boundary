@@ -22,14 +22,11 @@ spawns it as a long-lived daemon (one per DuckDB instance).
 - **WASM is a future goal**, not currently targeted
 
 **Batched streaming**: Tools with expensive context creation (bowtie2: index
-loading, sortmerna: reference indexing, prodigal: metagenomic bin
-initialization) support batched streaming. The `StreamingContext` trait
-provides `run_batch()` for per-batch work against a pre-loaded context.
-Single-genome prodigal needs a model: `training_path` + `training_sha256`
-(a file `prodigal-train` wrote, loaded once per worker; the hash is part of
-the fingerprint and is checked on load), or `train_on_batch: true`, which
-trains a fresh context on each batch's contigs (each batch must hold a
-whole genome).
+loading, sortmerna: reference indexing, prodigal: metagenomic bins or a
+single-genome model) support batched streaming. The `StreamingContext`
+trait provides `run_batch()` for per-batch work against a pre-loaded
+context. Single-genome prodigal needs a model route (`training_path` or
+`train_on_batch`: see "Prodigal config knobs").
 
 **Per-fingerprint dispatch**: every batch carries its own `(tool, config)`
 pair. The coordinator computes a canonical-config fingerprint and routes to
@@ -557,6 +554,42 @@ Label "contigs", one row per input contig, including contigs with no genes:
 The `result` JSON carries `n_genes`, `n_sequences` and, in single-genome
 mode, `model` (`translation_table`, `uses_sd`, `gc_content`,
 `start_weight`), as `prodigal-train` reports it.
+
+**Prodigal config knobs** (`describe_version=5`; parsed strictly: an
+unknown knob, a wrong JSON type or an integer outside C int is an error;
+null means the default):
+
+| Knob | Type | Default | Notes |
+|---|---|---|---|
+| `meta_mode` | bool | `true` | Metagenomic bins; `false` = single-genome mode, which needs a model route below |
+| `training_path` | string | – | Single-genome: a model file `prodigal-train` wrote, loaded once per worker; needs `training_sha256`; refuses `trans_table`/`start_weight`/`force_nonsd` (the model has them) |
+| `training_sha256` | string | – | The model's SHA-256 (64 hex digits, as `prodigal-train` reports it: lowercase); checked on load, part of the fingerprint (an uppercase spelling is accepted but gets its own worker) |
+| `train_on_batch` | bool | `false` | Single-genome without a model: train on each batch, which must hold a whole genome |
+| `trans_table` | int | `11` | 4, 5, 9, 11, 13, 15, 21, 25, 26, 32 (NCBI codes Prodigal uses as NCBI defines them); metagenomic mode takes 11 only |
+| `closed_ends` | bool | `false` | No genes off the edges; not stored in a model, so pass the value it was trained with |
+| `mask_regions` | bool | `false` | Don't build genes across runs of N; not stored in a model either |
+| `force_nonsd` | bool | `false` | Single-genome only |
+| `start_weight` | float | `4.35` | Single-genome only (metagenomic mode takes the default) |
+| `verbose` | bool | `false` | Library log to stderr |
+
+The input is refused for an empty batch, a null name (naming the input
+row), and, naming the contig, a null sequence or a character outside
+`A`..`z` (Prodigal would drop it, shifting every coordinate after it).
+
+**prodigal-train** (input as Prodigal's; no Arrow output): trains a
+single-genome model on the batch's contigs (one whole genome) and writes it
+to `training_path` in the CLI's `-t` format (byte-equal to the CLI's on
+Linux; on macOS arm64 the bytes differ, the settings and predictions
+don't). The write is atomic (temp file + rename in the same directory) and
+follows a symlink to an existing file (a symlink to nothing is refused);
+the file gets a new file's mode (0666 less the umask), also when it
+replaces one; the directory must exist.
+Knobs: `training_path` (required), `trans_table`, `closed_ends`,
+`mask_regions`, `force_nonsd`, `start_weight`, `verbose` (as Prodigal's).
+The `result` JSON: `training_path` (canonical), `training_sha256` (pass it
+to `prodigal`), `model` (as Prodigal's result), `closed_ends` and
+`mask_regions` as trained (pass `prodigal` the same), `n_sequences`,
+`n_bases`, `elapsed_ms`.
 
 **SortMeRNA input** (written by miint to shm_input):
 - `read_id: Utf8` -- sequence identifier

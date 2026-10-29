@@ -57,9 +57,11 @@ fn build_newtool() {
         .include(&dir)
         .define("NEWTOOL_NO_MAIN", None)
         .flag("-fvisibility=hidden")
+        // The submodule's own release-build flags (its Makefile's, or
+        // CMake Release's), nothing else: extra optimisation flags can cost
+        // (-funroll-loops made Prodigal 46% slower) and FP flags can change
+        // results
         .opt_level(3)
-        .flag_if_supported("-finline-functions")
-        .flag_if_supported("-funroll-loops")
         .warnings(false);
 
     // C++ builds also need -fvisibility-inlines-hidden
@@ -231,7 +233,12 @@ impl GplTool for NewTool {
         }
     }
 
-    fn execute(&self, config: &serde_json::Value, shm_input: &str) -> Response {
+    fn execute(
+        &self,
+        config: &serde_json::Value,
+        shm_input: &str,
+        shm_input_size: usize,
+    ) -> Response {
         // See below
     }
 }
@@ -239,7 +246,8 @@ impl GplTool for NewTool {
 
 **`execute()` follows this pattern:**
 
-1. Read Arrow input: `crate::arrow_ipc::read_batches_from_shm(shm_input)?`
+1. Read Arrow input: `crate::arrow_ipc::read_batches_from_shm(shm_input, shm_input_size)?`
+   (the size comes from the request; `fstat` is not used)
 2. Extract columns, validate, convert to C types (`Vec<CString>` etc.)
 3. Initialize C config via FFI: `zeroed()` + `config_init()` + apply JSON
    config values
@@ -296,11 +304,11 @@ Three required tests in a `#[cfg(test)] mod tests` block:
 fn test_newtool_roundtrip() {
     let input_name = unique_shm_name("nt-in");
     let batch = make_input_batch(/* test data */);
-    let _input_shm = write_arrow_to_shm(&input_name, &batch);
+    let input_shm = write_arrow_to_shm(&input_name, &batch);
 
     let tool = NewTool;
     let config = serde_json::json!({ "seed": 42 });
-    let response = tool.execute(&config, &input_name);
+    let response = tool.execute(&config, &input_name, input_shm.len());
 
     assert!(response.success, "Failed: {:?}", response.error);
     assert_eq!(response.shm_outputs.len(), 1);
@@ -311,7 +319,8 @@ fn test_newtool_roundtrip() {
     let result = response.result.unwrap();
     // ... assert expected metadata fields ...
 
-    let out_batches = read_arrow_from_shm(&response.shm_outputs[0].name);
+    let out = &response.shm_outputs[0];
+    let out_batches = read_arrow_from_shm(&out.name, out.size);
     assert_eq!(out_batches.len(), 1);
     // ... assert schema, row count, column values ...
 
@@ -319,7 +328,7 @@ fn test_newtool_roundtrip() {
 }
 ```
 
-Key: keep `_input_shm` alive until after `execute()` returns.
+Key: keep `input_shm` alive until after `execute()` returns.
 
 **2. Bad shm name:**
 
@@ -328,7 +337,7 @@ Key: keep `_input_shm` alive until after `execute()` returns.
 fn test_newtool_bad_input_shm() {
     let tool = NewTool;
     let config = serde_json::json!({});
-    let response = tool.execute(&config, "/nonexistent-shm-name");
+    let response = tool.execute(&config, "/nonexistent-shm-name", 0);
     assert!(!response.success);
     assert!(response.error.unwrap().contains("Failed to open shm"));
 }
@@ -391,11 +400,14 @@ FastTree) do not need streaming.
 
 ### What to implement
 
-1. A `<Tool>StreamingContext` struct holding the C context pointer and any
-   session-lived state. Implement `Drop` to call the C `destroy()` function.
+1. A `<Tool>StreamingContext` type holding the session's state: usually
+   the C context pointer, whose owner's `Drop` calls the C `destroy()`
+   function.
 2. Override `create_streaming_context()` on the `GplTool` impl. Parse config,
-   call C `create()`, return the context. Validate streaming is supported
-   (e.g., prodigal only supports streaming in meta mode).
+   call C `create()`, return the context. A config whose batches can't
+   share one context still gets a context that does the per-batch work
+   (e.g., prodigal's `train_on_batch` trains a fresh one on each batch), so
+   execute() and the session run the same code.
 3. Implement `StreamingContext::run_batch()`. Read input from shm, call C
    `run()`, convert output, write to output shm, return Response.
 
@@ -412,15 +424,15 @@ fn test_newtool_streaming_two_batches() {
 
     // Batch 1
     let input1 = unique_shm_name("nt-str-1");
-    let _shm1 = write_arrow_to_shm(&input1, &make_input_batch(/* data */));
-    let resp1 = ctx.run_batch(&input1);
+    let shm1 = write_arrow_to_shm(&input1, &make_input_batch(/* data */));
+    let resp1 = ctx.run_batch(&input1, shm1.len());
     assert!(resp1.success, "Batch 1 failed: {:?}", resp1.error);
     let _ = SharedMemory::unlink(&resp1.shm_outputs[0].name);
 
     // Batch 2
     let input2 = unique_shm_name("nt-str-2");
-    let _shm2 = write_arrow_to_shm(&input2, &make_input_batch(/* data */));
-    let resp2 = ctx.run_batch(&input2);
+    let shm2 = write_arrow_to_shm(&input2, &make_input_batch(/* data */));
+    let resp2 = ctx.run_batch(&input2, shm2.len());
     assert!(resp2.success, "Batch 2 failed: {:?}", resp2.error);
     let _ = SharedMemory::unlink(&resp2.shm_outputs[0].name);
 }
@@ -606,7 +618,7 @@ change. List every `.c` and `.h` file used by the build.
 
 In tests, the `SharedMemory` returned by `write_arrow_to_shm` unlinks the
 segment on drop. If you don't bind it to a variable (or bind it to `_`
-instead of `_input_shm`), the segment is unlinked immediately and the tool
+instead of `input_shm`), the segment is unlinked immediately and the tool
 gets a "Failed to open shm" error.
 
 ### Not cleaning up output shm in tests

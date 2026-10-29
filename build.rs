@@ -212,9 +212,11 @@ fn build_prodigal() {
         // As the fork's Makefile: without it aarch64 fuses multiply-adds and
         // prints some scores differently from x86-64 in the last digit.
         .flag("-ffp-contract=off")
+        // -O3 alone, as the fork's Makefile: -funroll-loops (with
+        // -finline-functions, FastTree's flags, copied here once) made
+        // metagenomic mode 46% slower (E. coli 12.4 s → 18.1 s, the same
+        // output; -finline-functions alone changes nothing at -O3).
         .opt_level(3)
-        .flag_if_supported("-finline-functions")
-        .flag_if_supported("-funroll-loops")
         .warnings(false)
         .compile("prodigal_c");
 

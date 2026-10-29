@@ -63,8 +63,8 @@ impl GplTool for ProdigalTrainTool {
                     param_type: "string",
                     default: serde_json::Value::Null,
                     description: "Required: the file to write the model to (the CLI's -t \
-                                  format), replaced atomically through any symlinks; its \
-                                  directory must exist",
+                                  format), replaced atomically through any symlinks (a \
+                                  symlink to nothing is refused); its directory must exist",
                     allowed_values: vec![],
                 },
                 ConfigParam {
@@ -188,6 +188,11 @@ fn model_target(path: &Path) -> Result<String, String> {
     let target = match std::fs::canonicalize(path) {
         Ok(target) if target.is_dir() => return Err(fail(&"is a directory")),
         Ok(target) => target,
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(fail(&e)),
+        // Renaming over it would replace the link, not write where it leads
+        Err(_) if path.is_symlink() => {
+            return Err(fail(&"is a symlink to a file that doesn't exist"));
+        }
         // A new file
         Err(_) => {
             let name = path.file_name().ok_or_else(|| fail(&"names no file"))?;
@@ -335,6 +340,16 @@ mod tests {
         assert_eq!(result["training_path"], target.to_str().unwrap());
         let written = std::fs::read(&target).unwrap();
         assert_eq!(result["training_sha256"], sha256_hex(&written));
+
+        // A link to nothing is refused, and left as it is
+        let dangling = dir.path().join("dangling.bin");
+        std::os::unix::fs::symlink(dir.path().join("none.bin"), &dangling).unwrap();
+        let config = serde_json::json!({"training_path": dangling});
+        let err = run("prodigal-train", config, &anthus_batch())
+            .error
+            .unwrap();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(dangling.is_symlink());
     }
 
     /// The model's mode is a new file's (0666 less the umask), as the CLI

@@ -856,6 +856,25 @@ fn run_session(shm: &ShmGuard, batches: &[(&str, serde_json::Value)]) -> Vec<ser
         .collect()
 }
 
+/// An ATG repeat, whose start/stop nodes outgrow the library's node array
+/// (src/tools/prodigal.rs test_low_complexity_contig_changes_no_other_genes
+/// checks the genes), is predicted, and the daemon exits cleanly: Prodigal
+/// 2.6.4 overflowed the heap and aborted it after responding.
+#[test]
+fn test_prodigal_survives_low_complexity_input() {
+    let repeat = "ATG".repeat(12_000);
+    let batch = make_prodigal_batch(&["atg", "c1"], &[&repeat, TEST_SEQ_1]);
+    let shm = ShmGuard::create_with_batch("g5-atg", &batch);
+    // run_session checks the daemon's exit status
+    let responses = run_session(&shm, &[("prodigal", serde_json::json!({}))]);
+    assert!(
+        responses[0]["success"].as_bool().unwrap(),
+        "{}",
+        responses[0]
+    );
+    assert_eq!(responses[0]["result"]["n_sequences"], 2);
+}
+
 /// prodigal-train writes a model; prodigal predicts from it, given its
 /// SHA-256, in another session, and refuses it with any other hash.
 #[test]

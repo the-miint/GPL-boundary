@@ -1256,6 +1256,7 @@ mod tests {
         PRODIGAL_REF_TRAIN as REF_TRAIN, PRODIGAL_REF_TRAIN_SHA256 as REF_TRAIN_SHA256,
     };
     use arrow::array::{BooleanArray, Float64Array, Int32Array};
+    use arrow::compute::{filter_record_batch, kernels::cmp::eq};
     use arrow::datatypes::{DataType, Field, Schema};
 
     // Test sequences from Prodigal's anthus_aco.fas (960 bp each)
@@ -1317,12 +1318,14 @@ mod tests {
         predict_batch(config, &prodigal_batch(names, sequences))
     }
 
-    /// anthus's genes and contigs in metagenomic mode, and from the CLI's
-    /// model of anthus, with the CLI's output for each: (config, GFF,
-    /// proteins).
-    fn cli_runs() -> [(serde_json::Value, &'static str, &'static str); 2] {
+    /// anthus's genes and contigs in metagenomic mode, trained on the batch,
+    /// and from the CLI's model of anthus, with the CLI's output for each:
+    /// (config, GFF, proteins).
+    fn cli_runs() -> [(serde_json::Value, &'static str, &'static str); 3] {
+        let trained = serde_json::json!({"meta_mode": false, "train_on_batch": true});
         [
             (serde_json::json!({}), "ref_meta.gff", "ref_meta.proteins"),
+            (trained, "ref_single.gff", "ref_single.proteins"),
             // ref_trained.gff's genes are ref_single.gff's
             (
                 from_model(serde_json::json!({})),
@@ -1377,8 +1380,9 @@ mod tests {
             ("gc_cont", "gc_cont", 0.0005),
         ];
         for (config, gff, proteins) in cli_runs() {
-            let genes = predict_batch(config, &anthus_batch()).unwrap().genes;
+            let Prediction { result, genes, .. } = predict_batch(config, &anthus_batch()).unwrap();
             let expected = gff_genes(&prodigal_truth(gff));
+            assert_eq!(result["n_genes"], expected.len(), "{gff}");
             let proteins = fasta_records(&prodigal_truth(proteins));
             assert_eq!(genes.num_rows(), expected.len(), "{gff}");
             assert_eq!(proteins.len(), expected.len(), "{gff}");
@@ -1544,6 +1548,47 @@ mod tests {
                 assert_eq!(outputs.result["n_sequences"], names.len(), "{at}");
                 assert_eq!(outputs.result["n_genes"], genes.num_rows(), "{at}");
             }
+        }
+    }
+
+    /// A contig whose start/stop nodes outgrow the library's node array (an
+    /// ATG repeat: one node per codon, past the 4096-node floor and the
+    /// slen/8 budget, so the array doubles and shrinks back) changes no
+    /// other contig's genes, in the batch or after it, in either mode. The
+    /// model run uses Prodigal 2.6.4's scale (110,000 nodes, past the
+    /// 100,000 it held and overflowed); it costs 0.2 s there.
+    #[test]
+    fn test_low_complexity_contig_changes_no_other_genes() {
+        let alone = prodigal_batch(&["c1"], &[TEST_SEQ_1]);
+        // A contig's genes, every column but seq_index (c1's is 2 after the
+        // repeat)
+        let genes_of = |genes: &RecordBatch, name: &str| {
+            let names = column::<StringArray>(genes, "seq_name");
+            let mask = eq(names, &StringArray::new_scalar(name)).unwrap();
+            let mut genes = filter_record_batch(genes, &mask).unwrap();
+            genes.remove_column(genes.schema().index_of("seq_index").unwrap());
+            genes
+        };
+        for (config, codons) in [
+            (serde_json::json!({}), 12_000),
+            (from_model(serde_json::json!({})), 110_000),
+        ] {
+            let repeat = "ATG".repeat(codons);
+            let after = prodigal_batch(&["atg", "c1"], &[&repeat, TEST_SEQ_1]);
+            let mut session = ProdigalTool
+                .create_streaming_context(&config)
+                .unwrap()
+                .unwrap();
+            let before = predict_in(&mut session, &alone).unwrap().genes;
+            let mixed = predict_in(&mut session, &after).unwrap();
+            let again = predict_in(&mut session, &alone).unwrap().genes;
+            let expected = genes_of(&before, "c1");
+            assert!(expected.num_rows() > 0, "{config}");
+            assert_eq!(genes_of(&mixed.genes, "c1"), expected, "{config}");
+            assert_eq!(genes_of(&again, "c1"), expected, "{config}");
+            let n_genes = column::<Int32Array>(&mixed.contigs, "n_genes");
+            let atg_genes = genes_of(&mixed.genes, "atg").num_rows();
+            assert_eq!(n_genes.value(0) as usize, atg_genes, "{config}");
         }
     }
 
@@ -1858,8 +1903,8 @@ mod tests {
     }
 
     /// Single-genome mode trains on the batch only when asked to: a
-    /// batch may hold part of a genome. With train_on_batch there is no
-    /// shared context, so the daemon runs each batch through execute().
+    /// batch may hold part of a genome. With train_on_batch the session
+    /// trains a fresh context on each batch.
     #[test]
     fn test_single_mode_needs_train_on_batch() {
         let tool = ProdigalTool;
@@ -1886,18 +1931,6 @@ mod tests {
             err.contains("train_on_batch") && err.contains("meta_mode"),
             "{err}"
         );
-    }
-
-    /// Trained on the whole batch, single-genome mode calls the CLI's genes
-    /// (the fork's ref_single.gff: `prodigal -p single` on anthus).
-    #[test]
-    fn test_single_mode_trains_on_the_batch() {
-        let config = serde_json::json!({"meta_mode": false, "train_on_batch": true});
-        let Prediction { result, genes, .. } = predict_batch(config, &anthus_batch()).unwrap();
-
-        let expected = gff_coordinates(&prodigal_truth("ref_single.gff"));
-        assert_eq!(gene_coordinates(&genes), expected);
-        assert_eq!(result["n_genes"], expected.len());
     }
 
     /// A null name or sequence is an error naming the row or the contig.
@@ -2009,18 +2042,15 @@ mod tests {
         }
     }
 
-    /// From a model file, single-genome mode calls the CLI's genes
-    /// (ref_trained.gff: `prodigal -t ref_train.bin` on anthus). A session
-    /// loads the model once and predicts every batch from it: half of
-    /// anthus is too short to train on.
+    /// From a model file, a session loads the model once and predicts every
+    /// batch from it, as the CLI (ref_trained.gff: `prodigal -t
+    /// ref_train.bin` on anthus): half of anthus is too short to train on.
+    /// (test_genes_are_the_clis checks a whole-file batch column by column.)
     #[test]
     fn test_training_path_predicts_as_the_cli() {
         let expected = gff_coordinates(&prodigal_truth("ref_trained.gff"));
         let batch = anthus_batch();
         let config = from_model(serde_json::json!({}));
-        let genes = predict_batch(config.clone(), &batch).unwrap().genes;
-        assert_eq!(gene_coordinates(&genes), expected);
-
         let mut session = ProdigalTool
             .create_streaming_context(&config)
             .unwrap()
