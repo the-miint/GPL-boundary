@@ -7,15 +7,52 @@ pub mod prodigal_train;
 pub mod sortmerna;
 
 use crate::protocol::{BatchRequest, Response};
+use arrow::datatypes::{DataType, Field, Schema};
 use std::os::raw::c_int;
 
 /// Description of an Arrow schema field for introspection.
-#[derive(serde::Serialize)]
+#[derive(Clone, Copy, serde::Serialize)]
 pub struct FieldDescription {
     pub name: &'static str,
     pub arrow_type: &'static str,
     pub nullable: bool,
     pub description: &'static str,
+}
+
+impl FieldDescription {
+    pub const fn new(
+        name: &'static str,
+        arrow_type: &'static str,
+        nullable: bool,
+        description: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            arrow_type,
+            nullable,
+            description,
+        }
+    }
+}
+
+/// The Arrow schema of an output's described columns (`arrow_type` in
+/// Arrow's notation, e.g. "Int32", "Utf8"), so a tool lists them once.
+pub(crate) fn arrow_schema(fields: &[FieldDescription]) -> Result<Schema, String> {
+    let field = |f: &FieldDescription| {
+        let data_type = f.arrow_type.parse::<DataType>();
+        let data_type = data_type.map_err(|e| format!("column {}: {e}", f.name))?;
+        Ok(Field::new(f.name, data_type, f.nullable))
+    };
+    let fields: Result<Vec<Field>, String> = fields.iter().map(field).collect();
+    Ok(Schema::new(fields?))
+}
+
+/// Description of one of a tool's shm outputs: its label (as the response's
+/// `shm_outputs` carry it) and its Arrow schema.
+#[derive(serde::Serialize)]
+pub struct OutputDescription {
+    pub label: &'static str,
+    pub schema: &'static [FieldDescription],
 }
 
 /// Description of a config parameter for introspection.
@@ -124,14 +161,14 @@ pub(crate) fn config_cint(config: &serde_json::Value, name: &str) -> Result<Opti
 ///   columns change name/type/nullability or when null-translation
 ///   semantics change. Lets a caller's columnar reader fail fast
 ///   on mismatched expectations. Adding/removing/renaming entries
-///   in `input_schema` or `output_schema` always implies an Arrow
+///   in `input_schema` or `outputs` always implies an Arrow
 ///   schema change, so those changes bump `schema_version` (and
 ///   `describe_version` — they're not mutually exclusive).
 /// - **`describe_version`** — `--describe` introspection surface.
 ///   Bump on any change to `config_params` (add/rename/remove,
 ///   type/default/allowed-values edit) OR to `response_metadata`
 ///   (which is documentation-only — it does not affect the Arrow
-///   output schema). `input_schema` / `output_schema` changes also
+///   output schema). `input_schema` / `outputs` changes also
 ///   bump this, but they always co-bump `schema_version`.
 /// - **`protocol_version`** — wire envelope (init/batch/shutdown
 ///   shape). Lives on the init reply, not here. Bump on any
@@ -150,14 +187,15 @@ pub struct ToolDescription {
     pub schema_version: u32,
     /// Bumped on any `--describe` surface change: `config_params`
     /// edits, `response_metadata` edits, or `input_schema` /
-    /// `output_schema` edits (the last two also co-bump
+    /// `outputs` edits (the last two also co-bump
     /// `schema_version`, since they imply Arrow schema changes).
     /// See the struct doc-comment for the full bump policy.
     pub describe_version: u32,
     pub description: &'static str,
     pub config_params: Vec<ConfigParam>,
     pub input_schema: Vec<FieldDescription>,
-    pub output_schema: Vec<FieldDescription>,
+    /// Every shm output a successful batch carries, in response order.
+    pub outputs: Vec<OutputDescription>,
     pub response_metadata: Vec<FieldDescription>,
 }
 
@@ -423,7 +461,7 @@ mod tests {
         assert_eq!(desc.name, "fasttree");
         assert!(!desc.config_params.is_empty());
         assert!(!desc.input_schema.is_empty());
-        assert!(!desc.output_schema.is_empty());
+        assert!(!desc.outputs.is_empty());
     }
 
     /// Every registered tool must advertise a non-zero `describe_version`
@@ -448,20 +486,19 @@ mod tests {
         }
     }
 
-    /// Describe-version landmarks. `fasttree` is at 3 (Phase 1 + 2 + 3
-    /// bumps); the other four tools start at 1 and will be bumped only
-    /// when their `--describe` surfaces actually change. Asserting the
-    /// exact values guards against accidental unbumped-on-change drift
-    /// and accidental bumped-on-no-change drift in equal measure.
+    /// Describe-version landmarks (each tool's history is in a comment at
+    /// its describe_version). Asserting the exact values guards against
+    /// accidental unbumped-on-change drift and accidental
+    /// bumped-on-no-change drift in equal measure.
     #[test]
     fn test_describe_version_landmarks() {
         let cases: &[(&str, u32)] = &[
-            ("fasttree", 3),
-            ("prodigal", 4),
-            ("prodigal-train", 1),
-            ("sortmerna", 1),
-            ("bowtie2-align", 5),
-            ("bowtie2-build", 1),
+            ("fasttree", 4),
+            ("prodigal", 5),
+            ("prodigal-train", 2),
+            ("sortmerna", 2),
+            ("bowtie2-align", 6),
+            ("bowtie2-build", 2),
         ];
         for (name, expected) in cases {
             let desc = describe_tool(name).expect("registered tool must describe");

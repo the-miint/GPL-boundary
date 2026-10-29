@@ -8,6 +8,7 @@ use crate::shm::SharedMemory;
 use arrow::array::{Array, Int32Array, StringArray};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -40,13 +41,9 @@ pub fn write_arrow_to_shm(name: &str, batch: &RecordBatch) -> SharedMemory {
     shm
 }
 
-/// The Prodigal fork's ground-truth input, ext/prodigal/anthus_aco.fas (22
-/// contigs of 960 bp): (name, sequence).
-pub fn anthus() -> Vec<(String, String)> {
-    let fasta = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/ext/prodigal/anthus_aco.fas"
-    ));
+/// The records of a FASTA text: (header line, sequence without line
+/// breaks).
+pub fn fasta_records(fasta: &str) -> Vec<(String, String)> {
     fasta
         .split('>')
         .skip(1)
@@ -55,6 +52,34 @@ pub fn anthus() -> Vec<(String, String)> {
             (header.trim().to_string(), seq.split_whitespace().collect())
         })
         .collect()
+}
+
+/// The Prodigal fork's ground-truth input, ext/prodigal/anthus_aco.fas (22
+/// contigs of 960 bp): (name, sequence).
+pub fn anthus() -> Vec<(String, String)> {
+    fasta_records(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/ext/prodigal/anthus_aco.fas"
+    )))
+}
+
+/// anthus as one prodigal input batch.
+pub fn anthus_batch() -> RecordBatch {
+    let contigs = anthus();
+    let (names, seqs): (Vec<&str>, Vec<&str>) = contigs
+        .iter()
+        .map(|(name, seq)| (name.as_str(), seq.as_str()))
+        .unzip();
+    prodigal_batch(&names, &seqs)
+}
+
+/// A file of the fork's testdata/ground_truth (the CLI's output on anthus).
+pub fn prodigal_truth(file: &str) -> String {
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/ext/prodigal/testdata/ground_truth"
+    );
+    std::fs::read_to_string(format!("{dir}/{file}")).unwrap()
 }
 
 /// The fork's model of anthus (`prodigal -t ref_train.bin`), and its
@@ -76,27 +101,106 @@ pub fn prodigal_batch(names: &[&str], sequences: &[&str]) -> RecordBatch {
     RecordBatch::try_new(schema, columns).unwrap()
 }
 
-/// A prodigal response's result JSON and genes (its output segment
-/// unlinked), or its error.
-pub fn genes_of(response: Response) -> Result<(serde_json::Value, RecordBatch), String> {
+/// Assert a result's `model` is the CLI's model of anthus, as its GFF
+/// reports it (Model Data), with the default start weight.
+pub fn assert_anthus_model(model: &serde_json::Value) {
+    let cli = &gff_sequences(&prodigal_truth("ref_trained.gff"))[0];
+    let table = model["translation_table"].to_string();
+    assert_eq!(table, cli["transl_table"], "{model}");
+    assert_eq!(model["uses_sd"], cli["uses_sd"] == "1", "{model}");
+    let gc = model["gc_content"].as_f64().unwrap() * 100.0;
+    assert_eq!(format!("{gc:.2}"), cli["gc_cont"], "{model}");
+    assert_eq!(model["start_weight"], 4.35, "{model}");
+}
+
+/// A prodigal response: its result JSON and its two outputs.
+#[derive(Debug)]
+pub struct Prediction {
+    pub result: serde_json::Value,
+    pub genes: RecordBatch,
+    pub contigs: RecordBatch,
+}
+
+/// A prodigal response's result and outputs, genes then contigs (every
+/// output segment read and unlinked, then their labels checked), or its
+/// error.
+pub fn prediction_of(response: Response) -> Result<Prediction, String> {
     if !response.success {
         return Err(response.error.unwrap());
     }
-    let out = &response.shm_outputs[0];
-    let mut genes = read_arrow_from_shm(&out.name, out.size);
-    let _ = SharedMemory::unlink(&out.name);
-    Ok((response.result.unwrap(), genes.remove(0)))
+    let read = |out: &crate::protocol::ShmOutput| {
+        let mut batches = read_arrow_from_shm(&out.name, out.size);
+        let _ = SharedMemory::unlink(&out.name);
+        batches.remove(0)
+    };
+    let outputs: Vec<RecordBatch> = response.shm_outputs.iter().map(read).collect();
+    let labels: Vec<&str> = response
+        .shm_outputs
+        .iter()
+        .map(|o| o.label.as_str())
+        .collect();
+    assert_eq!(labels, ["genes", "contigs"]);
+    let [genes, contigs] = <[RecordBatch; 2]>::try_from(outputs).unwrap();
+    let result = response.result.unwrap();
+    Ok(Prediction {
+        result,
+        genes,
+        contigs,
+    })
+}
+
+/// A column of an output batch, by name.
+pub fn column<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> &'a T {
+    let col = batch
+        .column_by_name(name)
+        .unwrap_or_else(|| panic!("{name}"));
+    col.as_any().downcast_ref::<T>().unwrap()
 }
 
 /// (seq_name, begin, end, strand) of every gene in prodigal's output.
 pub fn gene_coordinates(genes: &RecordBatch) -> Vec<(String, i32, i32, i32)> {
-    let names = genes.column(0).as_any().downcast_ref::<StringArray>();
-    let int = |i: usize| genes.column(i).as_any().downcast_ref::<Int32Array>();
-    let (begin, end, strand) = (int(1).unwrap(), int(2).unwrap(), int(3).unwrap());
+    let names = column::<StringArray>(genes, "seq_name");
+    let int = |name| column::<Int32Array>(genes, name);
+    let (begin, end, strand) = (int("begin"), int("end"), int("strand"));
     (0..genes.num_rows())
         .map(|i| {
-            let name = names.unwrap().value(i).to_string();
+            let name = names.value(i).to_string();
             (name, begin.value(i), end.value(i), strand.value(i))
+        })
+        .collect()
+}
+
+/// A CDS line of a ground-truth GFF: its sequence, coordinates and
+/// attributes (ID, partial, ..., rbs_motif, ..., score, ...).
+pub struct GffGene {
+    pub seq_name: String,
+    pub begin: i32,
+    pub end: i32,
+    pub strand: i32,
+    pub attributes: HashMap<String, String>,
+}
+
+/// `k=v;k=v;` pairs, quotes removed.
+fn gff_pairs(text: &str) -> impl Iterator<Item = (String, String)> + '_ {
+    text.split(';').filter_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        Some((k.to_string(), v.trim_matches('"').to_string()))
+    })
+}
+
+/// Every CDS line of a GFF file of the fork's testdata/ground_truth.
+pub fn gff_genes(gff: &str) -> Vec<GffGene> {
+    gff.lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            GffGene {
+                seq_name: f[0].to_string(),
+                begin: f[3].parse().unwrap(),
+                end: f[4].parse().unwrap(),
+                strand: if f[6] == "+" { 1 } else { -1 },
+                attributes: gff_pairs(f[8]).collect(),
+            }
         })
         .collect()
 }
@@ -104,15 +208,25 @@ pub fn gene_coordinates(genes: &RecordBatch) -> Vec<(String, i32, i32, i32)> {
 /// (seq_name, begin, end, strand) of every gene in a GFF file of the fork's
 /// testdata/ground_truth.
 pub fn gff_coordinates(gff: &str) -> Vec<(String, i32, i32, i32)> {
-    gff.lines()
-        .filter(|l| !l.starts_with('#'))
-        .map(|l| {
-            let f: Vec<&str> = l.split('\t').collect();
-            let strand = if f[6] == "+" { 1 } else { -1 };
-            let (begin, end) = (f[3].parse().unwrap(), f[4].parse().unwrap());
-            (f[0].to_string(), begin, end, strand)
-        })
+    let genes = gff_genes(gff).into_iter();
+    genes
+        .map(|g| (g.seq_name, g.begin, g.end, g.strand))
         .collect()
+}
+
+/// Each sequence's header lines in a ground-truth GFF ("# Sequence Data"
+/// and "# Model Data"): seqnum, seqlen, seqhdr, run_type, model, gc_cont,
+/// transl_table, uses_sd, ...
+pub fn gff_sequences(gff: &str) -> Vec<HashMap<String, String>> {
+    let mut sequences: Vec<HashMap<String, String>> = Vec::new();
+    for line in gff.lines() {
+        if let Some(data) = line.strip_prefix("# Sequence Data: ") {
+            sequences.push(gff_pairs(data).collect());
+        } else if let Some(data) = line.strip_prefix("# Model Data: ") {
+            sequences.last_mut().unwrap().extend(gff_pairs(data));
+        }
+    }
+    sequences
 }
 
 /// A fresh directory under target/ (not the shared /tmp), removed on drop.

@@ -2,7 +2,9 @@
 //! writes SOA tree as Arrow IPC back to shared memory.
 
 use crate::protocol::{Response, ShmOutput};
-use crate::tools::{checked_cint, ConfigParam, FieldDescription, GplTool, ToolDescription};
+use crate::tools::{
+    checked_cint, ConfigParam, FieldDescription, GplTool, OutputDescription, ToolDescription,
+};
 use arrow::array::{
     BooleanArray, Float64Builder, Int32Array, Int64Array, Int64Builder, StringArray,
 };
@@ -664,12 +666,13 @@ impl GplTool for FastTreeTool {
     /// - 3: Phase 3 — model, gtrrates, gtrfreq, slow, bionj, nj,
     ///   top, notop, topm, quote, fastest (rejected when true),
     ///   gamma.
+    /// - 4: the output listed by label (`outputs`).
     fn describe(&self) -> ToolDescription {
         ToolDescription {
             name: "fasttree",
             version: self.version(),
             schema_version: self.schema_version(),
-            describe_version: 3,
+            describe_version: 4,
             description:
                 "Approximately-maximum-likelihood phylogenetic trees from sequence alignments",
             config_params: vec![
@@ -879,7 +882,9 @@ impl GplTool for FastTreeTool {
                     description: "Aligned sequence (all must be equal length)",
                 },
             ],
-            output_schema: vec![
+            outputs: vec![OutputDescription {
+                label: "tree",
+                schema: &[
                 FieldDescription {
                     name: "node_index",
                     arrow_type: "Int64",
@@ -930,6 +935,7 @@ impl GplTool for FastTreeTool {
                     description: "Tip name (NULL for internal nodes)",
                 },
             ],
+            }],
             response_metadata: vec![
                 FieldDescription {
                     name: "n_nodes",

@@ -1,13 +1,15 @@
 //! Prodigal adapter: reads Arrow IPC from shared memory, runs prodigal
 //! gene prediction, writes SOA genes as Arrow IPC back to shared memory.
 
+use crate::arrow_ipc::ShmOutputs;
 use crate::protocol::Response;
 use crate::tools::{
-    config_bool, config_cint, config_f64, config_knobs_known, config_str, ConfigParam,
-    FieldDescription, GplTool, StreamingContext, ToolDescription,
+    arrow_schema, config_bool, config_cint, config_f64, config_knobs_known, config_str,
+    ConfigParam, FieldDescription, GplTool, OutputDescription, StreamingContext, ToolDescription,
 };
-use arrow::array::{Array, BooleanArray, Float64Array, Int32Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{
+    Array, ArrayRef, BooleanBuilder, Float64Builder, Int32Builder, StringArray, StringBuilder,
+};
 use arrow::record_batch::RecordBatch;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_double, c_int, c_void};
@@ -247,204 +249,345 @@ unsafe extern "C" fn stderr_log_callback(msg: *const c_char, _user_data: *mut c_
 
 // --- Arrow schema definitions ---
 
-/// The input's columns, as --describe lists them (prodigal and
-/// prodigal-train).
-pub(super) fn input_fields() -> Vec<FieldDescription> {
-    vec![
-        FieldDescription {
-            name: "name",
-            arrow_type: "Utf8",
-            nullable: false,
-            description: "Sequence (contig) identifier",
-        },
-        FieldDescription {
-            name: "sequence",
-            arrow_type: "Utf8",
-            nullable: false,
-            description: "Nucleotide sequence (sequences may have different lengths); a \
-                          character outside 'A'..'z', which Prodigal would drop, is an error",
-        },
-    ]
+/// The input's columns (prodigal and prodigal-train), as --describe lists
+/// them.
+pub(super) const INPUT_FIELDS: &[FieldDescription] = &[
+    FieldDescription::new("name", "Utf8", false, "Sequence (contig) identifier"),
+    FieldDescription::new(
+        "sequence",
+        "Utf8",
+        false,
+        "Nucleotide sequence (sequences may have different lengths); a character \
+         outside 'A'..'z', which Prodigal would drop, is an error",
+    ),
+];
+
+/// The input's Arrow schema: contig sequences from miint.
+#[cfg(test)]
+pub fn input_schema() -> arrow::datatypes::Schema {
+    arrow_schema(INPUT_FIELDS).expect("INPUT_FIELDS are Arrow types")
 }
 
-/// Input schema: contig sequences from miint.
-#[allow(dead_code)]
-pub fn input_schema() -> Schema {
-    Schema::new(vec![
-        Field::new("name", DataType::Utf8, false),
-        Field::new("sequence", DataType::Utf8, false),
-    ])
+/// The genes output: one row per gene, in the order the CLI lists them.
+/// Its columns, as --describe lists them, make its Arrow schema.
+const GENES: OutputDescription = OutputDescription {
+    label: "genes",
+    schema: &[
+        FieldDescription::new(
+            "seq_index",
+            "Int32",
+            false,
+            "The gene's contig: its 1-based position in the batch (contigs.seq_index)",
+        ),
+        FieldDescription::new("seq_name", "Utf8", false, "The gene's contig: its name"),
+        FieldDescription::new(
+            "gene_index",
+            "Int32",
+            false,
+            "1-based number of the gene within its contig (the CLI's ID is \
+         <seqnum>_<gene_index>)",
+        ),
+        FieldDescription::new(
+            "begin",
+            "Int32",
+            false,
+            "Left coordinate (1-based, inclusive; begin < end on both strands)",
+        ),
+        FieldDescription::new(
+            "end",
+            "Int32",
+            false,
+            "Right coordinate (1-based, inclusive), the stop codon included",
+        ),
+        FieldDescription::new("strand", "Int32", false, "Strand (+1 or -1)"),
+        FieldDescription::new(
+            "partial_left",
+            "Boolean",
+            false,
+            "Gene runs off the left edge",
+        ),
+        FieldDescription::new(
+            "partial_right",
+            "Boolean",
+            false,
+            "Gene runs off the right edge",
+        ),
+        FieldDescription::new(
+            "start_type",
+            "Int32",
+            false,
+            "Start codon type (0=ATG, 1=GTG, 2=TTG, 3=Edge)",
+        ),
+        FieldDescription::new(
+            "score",
+            "Float64",
+            false,
+            "Gene score, cscore + sscore (the CLI's score=)",
+        ),
+        FieldDescription::new("cscore", "Float64", false, "Coding score"),
+        FieldDescription::new("sscore", "Float64", false, "Start score"),
+        FieldDescription::new("rscore", "Float64", false, "RBS score"),
+        FieldDescription::new("uscore", "Float64", false, "Upstream score"),
+        FieldDescription::new("tscore", "Float64", false, "Start type score"),
+        FieldDescription::new("confidence", "Float64", false, "Gene confidence [50, 100]"),
+        FieldDescription::new(
+            "gc_cont",
+            "Float64",
+            false,
+            "GC content of the gene as Prodigal counts it",
+        ),
+        FieldDescription::new(
+            "rbs_motif",
+            "Utf8",
+            true,
+            "Ribosome binding site motif as Prodigal prints it (e.g. \"AGGAG\", or an \
+         upstream motif such as \"TAA\"); NULL where Prodigal prints \"None\"",
+        ),
+        FieldDescription::new(
+            "rbs_spacer",
+            "Utf8",
+            true,
+            "RBS spacer (e.g. \"5-10bp\"); NULL where Prodigal prints \"None\"",
+        ),
+        FieldDescription::new(
+            "protein",
+            "Utf8",
+            false,
+            "The protein (the CLI's -a record, unwrapped): M for a start codon, * for a \
+         stop codon, X for a codon with an ambiguous base; no M or * where the gene \
+         runs off an edge",
+        ),
+    ],
+};
+
+/// The contigs output: one row per input contig, with or without genes.
+/// Its columns, as --describe lists them, make its Arrow schema.
+const CONTIGS: OutputDescription = OutputDescription {
+    label: "contigs",
+    schema: &[
+        FieldDescription::new(
+            "seq_index",
+            "Int32",
+            false,
+            "1-based position of the contig in the batch (the CLI's seqnum for a batch \
+         holding a whole file)",
+        ),
+        FieldDescription::new("seq_name", "Utf8", false, "Contig identifier (input name)"),
+        FieldDescription::new("length", "Int32", false, "Contig length in bases"),
+        FieldDescription::new(
+            "gc_content",
+            "Float64",
+            false,
+            "The contig's GC fraction (ambiguous bases count as not GC)",
+        ),
+        FieldDescription::new(
+            "translation_table",
+            "Int32",
+            false,
+            "Translation table the genes were called with: the model's, or the \
+         metagenomic bin's",
+        ),
+        FieldDescription::new(
+            "uses_sd",
+            "Boolean",
+            false,
+            "Whether that model or bin scores Shine-Dalgarno motifs",
+        ),
+        FieldDescription::new(
+            "meta_bin",
+            "Int32",
+            true,
+            "Metagenomic mode: the bin that called the genes, 0..49 (the first field of \
+         model_desc); NULL in single-genome mode",
+        ),
+        FieldDescription::new(
+            "model_desc",
+            "Utf8",
+            true,
+            "Metagenomic mode: that bin's description (the CLI's Model Data model=); NULL \
+         in single-genome mode",
+        ),
+        FieldDescription::new(
+            "n_genes",
+            "Int32",
+            false,
+            "Genes found on the contig (0 for none)",
+        ),
+    ],
+};
+
+// --- Output builders ---
+
+/// The genes output, built contig by contig.
+#[derive(Default)]
+struct GeneColumns {
+    seq_index: Int32Builder,
+    seq_name: StringBuilder,
+    gene_index: Int32Builder,
+    begin: Int32Builder,
+    end: Int32Builder,
+    strand: Int32Builder,
+    partial_left: BooleanBuilder,
+    partial_right: BooleanBuilder,
+    start_type: Int32Builder,
+    score: Float64Builder,
+    cscore: Float64Builder,
+    sscore: Float64Builder,
+    rscore: Float64Builder,
+    uscore: Float64Builder,
+    tscore: Float64Builder,
+    confidence: Float64Builder,
+    gc_cont: Float64Builder,
+    rbs_motif: StringBuilder,
+    rbs_spacer: StringBuilder,
+    protein: StringBuilder,
 }
 
-/// Output schema: predicted genes as columnar data for miint.
-fn output_schema() -> Schema {
-    Schema::new(vec![
-        Field::new("seq_name", DataType::Utf8, false),
-        Field::new("begin", DataType::Int32, false),
-        Field::new("end", DataType::Int32, false),
-        Field::new("strand", DataType::Int32, false),
-        Field::new("partial_left", DataType::Boolean, false),
-        Field::new("partial_right", DataType::Boolean, false),
-        Field::new("start_type", DataType::Int32, false),
-        Field::new("cscore", DataType::Float64, false),
-        Field::new("sscore", DataType::Float64, false),
-        Field::new("rscore", DataType::Float64, false),
-        Field::new("uscore", DataType::Float64, false),
-        Field::new("tscore", DataType::Float64, false),
-        Field::new("confidence", DataType::Float64, false),
-        Field::new("gc_cont", DataType::Float64, false),
-        Field::new("rbs_motif", DataType::Utf8, false),
-        Field::new("rbs_spacer", DataType::Utf8, false),
-    ])
+/// An RBS motif or spacer as the output holds it: NULL for the library's
+/// "None".
+unsafe fn rbs_text<'a>(text: *const c_char) -> Option<std::borrow::Cow<'a, str>> {
+    let text = (!text.is_null()).then(|| CStr::from_ptr(text).to_string_lossy())?;
+    (text != "None").then_some(text)
 }
 
-// --- Gene accumulator ---
-
-/// Accumulates gene results from multiple per-contig find_genes calls
-/// into parallel Vecs that map directly to Arrow columns.
-struct GeneAccumulator {
-    seq_names: Vec<String>,
-    begin: Vec<i32>,
-    end: Vec<i32>,
-    strand: Vec<i32>,
-    partial_left: Vec<bool>,
-    partial_right: Vec<bool>,
-    start_type: Vec<i32>,
-    cscore: Vec<f64>,
-    sscore: Vec<f64>,
-    rscore: Vec<f64>,
-    uscore: Vec<f64>,
-    tscore: Vec<f64>,
-    confidence: Vec<f64>,
-    gc_cont: Vec<f64>,
-    rbs_motif: Vec<String>,
-    rbs_spacer: Vec<String>,
-}
-
-impl GeneAccumulator {
-    fn new() -> Self {
-        Self {
-            seq_names: Vec::new(),
-            begin: Vec::new(),
-            end: Vec::new(),
-            strand: Vec::new(),
-            partial_left: Vec::new(),
-            partial_right: Vec::new(),
-            start_type: Vec::new(),
-            cscore: Vec::new(),
-            sscore: Vec::new(),
-            rscore: Vec::new(),
-            uscore: Vec::new(),
-            tscore: Vec::new(),
-            confidence: Vec::new(),
-            gc_cont: Vec::new(),
-            rbs_motif: Vec::new(),
-            rbs_spacer: Vec::new(),
-        }
-    }
-
-    /// Read C SOA arrays into Rust Vecs. Caller must ensure soa is valid.
-    unsafe fn append_from_soa(&mut self, seq_name: &str, soa: &ProdigalGenesSoa) {
+impl GeneColumns {
+    /// Append a contig's genes. Caller must ensure soa is the library's,
+    /// from a config with want_proteins.
+    unsafe fn append(
+        &mut self,
+        seq_index: i32,
+        seq_name: &str,
+        soa: &ProdigalGenesSoa,
+    ) -> Result<(), String> {
         // With no genes the arrays may be NULL
-        if soa.n_genes <= 0 {
-            return;
+        let n = usize::try_from(soa.n_genes).unwrap_or(0);
+        if n == 0 {
+            return Ok(());
         }
-        let n = soa.n_genes as usize;
+        if soa.protein_offsets.is_null() {
+            return Err("the library returned no proteins".into());
+        }
+        let ints = |p: *const i32| std::slice::from_raw_parts(p, n);
+        let floats = |p: *const c_double| std::slice::from_raw_parts(p, n);
+        let flags = |p| ints(p).iter().map(|&v| v != 0);
+        let texts = |p: *const *const c_char| std::slice::from_raw_parts(p, n);
+        // Gene i's protein is letters[offsets[i]..offsets[i + 1]]: the
+        // offsets start at 0 and never decrease
+        let offsets = std::slice::from_raw_parts(soa.protein_offsets, n + 1);
+        if offsets[0] != 0 || offsets.windows(2).any(|w| w[0] > w[1]) {
+            return Err("the library returned malformed protein offsets".into());
+        }
+        let letters =
+            std::slice::from_raw_parts(soa.protein_data.cast::<u8>(), offsets[n] as usize);
 
-        let begin = std::slice::from_raw_parts(soa.begin, n);
-        let end = std::slice::from_raw_parts(soa.end, n);
-        let strand = std::slice::from_raw_parts(soa.strand, n);
-        let partial_left = std::slice::from_raw_parts(soa.partial_left, n);
-        let partial_right = std::slice::from_raw_parts(soa.partial_right, n);
-        let start_type = std::slice::from_raw_parts(soa.start_type, n);
-        let cscore = std::slice::from_raw_parts(soa.cscore, n);
-        let sscore = std::slice::from_raw_parts(soa.sscore, n);
-        let rscore = std::slice::from_raw_parts(soa.rscore, n);
-        let uscore = std::slice::from_raw_parts(soa.uscore, n);
-        let tscore = std::slice::from_raw_parts(soa.tscore, n);
-        let confidence = std::slice::from_raw_parts(soa.confidence, n);
-        let gc_cont = std::slice::from_raw_parts(soa.gc_cont, n);
-        let motif_ptrs = std::slice::from_raw_parts(soa.rbs_motif, n);
-        let spacer_ptrs = std::slice::from_raw_parts(soa.rbs_spacer, n);
-
-        for _ in 0..n {
-            self.seq_names.push(seq_name.to_string());
+        for i in 0..n {
+            self.seq_index.append_value(seq_index);
+            self.seq_name.append_value(seq_name);
+            // n_genes is an i32
+            self.gene_index.append_value(i as i32 + 1);
+            let protein = &letters[offsets[i] as usize..offsets[i + 1] as usize];
+            let protein = std::str::from_utf8(protein).map_err(|e| format!("protein: {e}"))?;
+            self.protein.append_value(protein);
         }
-        self.begin.extend_from_slice(begin);
-        self.end.extend_from_slice(end);
-        self.strand.extend_from_slice(strand);
-        self.partial_left
-            .extend(partial_left.iter().map(|&v| v != 0));
-        self.partial_right
-            .extend(partial_right.iter().map(|&v| v != 0));
-        self.start_type.extend_from_slice(start_type);
-        self.cscore.extend_from_slice(cscore);
-        self.sscore.extend_from_slice(sscore);
-        self.rscore.extend_from_slice(rscore);
-        self.uscore.extend_from_slice(uscore);
-        self.tscore.extend_from_slice(tscore);
-        self.confidence.extend_from_slice(confidence);
-        self.gc_cont.extend_from_slice(gc_cont);
-
-        for &p in motif_ptrs {
-            self.rbs_motif.push(if p.is_null() {
-                String::new()
-            } else {
-                CStr::from_ptr(p).to_string_lossy().into_owned()
-            });
+        self.begin.append_slice(ints(soa.begin));
+        self.end.append_slice(ints(soa.end));
+        self.strand.append_slice(ints(soa.strand));
+        flags(soa.partial_left).for_each(|v| self.partial_left.append_value(v));
+        flags(soa.partial_right).for_each(|v| self.partial_right.append_value(v));
+        self.start_type.append_slice(ints(soa.start_type));
+        // The CLI's score: cscore + sscore
+        let (cscore, sscore) = (floats(soa.cscore), floats(soa.sscore));
+        let scores = cscore.iter().zip(sscore).map(|(c, s)| c + s);
+        scores.for_each(|v| self.score.append_value(v));
+        self.cscore.append_slice(cscore);
+        self.sscore.append_slice(sscore);
+        self.rscore.append_slice(floats(soa.rscore));
+        self.uscore.append_slice(floats(soa.uscore));
+        self.tscore.append_slice(floats(soa.tscore));
+        self.confidence.append_slice(floats(soa.confidence));
+        self.gc_cont.append_slice(floats(soa.gc_cont));
+        for &text in texts(soa.rbs_motif) {
+            self.rbs_motif.append_option(rbs_text(text));
         }
-        for &p in spacer_ptrs {
-            self.rbs_spacer.push(if p.is_null() {
-                String::new()
-            } else {
-                CStr::from_ptr(p).to_string_lossy().into_owned()
-            });
+        for &text in texts(soa.rbs_spacer) {
+            self.rbs_spacer.append_option(rbs_text(text));
         }
+        Ok(())
     }
 
-    fn n_genes(&self) -> usize {
-        self.begin.len()
+    fn finish(mut self) -> Result<RecordBatch, String> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.seq_index.finish()),
+            Arc::new(self.seq_name.finish()),
+            Arc::new(self.gene_index.finish()),
+            Arc::new(self.begin.finish()),
+            Arc::new(self.end.finish()),
+            Arc::new(self.strand.finish()),
+            Arc::new(self.partial_left.finish()),
+            Arc::new(self.partial_right.finish()),
+            Arc::new(self.start_type.finish()),
+            Arc::new(self.score.finish()),
+            Arc::new(self.cscore.finish()),
+            Arc::new(self.sscore.finish()),
+            Arc::new(self.rscore.finish()),
+            Arc::new(self.uscore.finish()),
+            Arc::new(self.tscore.finish()),
+            Arc::new(self.confidence.finish()),
+            Arc::new(self.gc_cont.finish()),
+            Arc::new(self.rbs_motif.finish()),
+            Arc::new(self.rbs_spacer.finish()),
+            Arc::new(self.protein.finish()),
+        ];
+        RecordBatch::try_new(Arc::new(arrow_schema(GENES.schema)?), columns)
+            .map_err(|e| format!("Failed to create the genes batch: {e}"))
+    }
+}
+
+/// The contigs output, built contig by contig.
+#[derive(Default)]
+struct ContigColumns {
+    seq_index: Int32Builder,
+    seq_name: StringBuilder,
+    length: Int32Builder,
+    gc_content: Float64Builder,
+    translation_table: Int32Builder,
+    uses_sd: BooleanBuilder,
+    meta_bin: Int32Builder,
+    model_desc: StringBuilder,
+    n_genes: Int32Builder,
+}
+
+impl ContigColumns {
+    /// Append a contig, with find_genes' stats for it.
+    fn append(&mut self, seq_index: i32, seq_name: &str, length: i32, stats: &ProdigalStats) {
+        self.seq_index.append_value(seq_index);
+        self.seq_name.append_value(seq_name);
+        self.length.append_value(length);
+        self.gc_content.append_value(stats.gc_content);
+        self.translation_table.append_value(stats.translation_table);
+        self.uses_sd.append_value(stats.uses_sd != 0);
+        // -1 in single-genome mode, which has no bins
+        let bin = (stats.best_meta_bin >= 0).then_some(stats.best_meta_bin);
+        self.meta_bin.append_option(bin);
+        let desc = bin.map(|_| c_buf_to_string(&stats.best_meta_desc));
+        self.model_desc.append_option(desc);
+        self.n_genes.append_value(stats.n_genes);
     }
 
-    fn into_record_batch(self) -> Result<RecordBatch, String> {
-        let schema = Arc::new(output_schema());
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(
-                    self.seq_names
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<&str>>(),
-                )),
-                Arc::new(Int32Array::from(self.begin)),
-                Arc::new(Int32Array::from(self.end)),
-                Arc::new(Int32Array::from(self.strand)),
-                Arc::new(BooleanArray::from(self.partial_left)),
-                Arc::new(BooleanArray::from(self.partial_right)),
-                Arc::new(Int32Array::from(self.start_type)),
-                Arc::new(Float64Array::from(self.cscore)),
-                Arc::new(Float64Array::from(self.sscore)),
-                Arc::new(Float64Array::from(self.rscore)),
-                Arc::new(Float64Array::from(self.uscore)),
-                Arc::new(Float64Array::from(self.tscore)),
-                Arc::new(Float64Array::from(self.confidence)),
-                Arc::new(Float64Array::from(self.gc_cont)),
-                Arc::new(StringArray::from(
-                    self.rbs_motif
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<&str>>(),
-                )),
-                Arc::new(StringArray::from(
-                    self.rbs_spacer
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<&str>>(),
-                )),
-            ],
-        )
-        .map_err(|e| format!("Failed to create Arrow RecordBatch: {e}"))
+    fn finish(mut self) -> Result<RecordBatch, String> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.seq_index.finish()),
+            Arc::new(self.seq_name.finish()),
+            Arc::new(self.length.finish()),
+            Arc::new(self.gc_content.finish()),
+            Arc::new(self.translation_table.finish()),
+            Arc::new(self.uses_sd.finish()),
+            Arc::new(self.meta_bin.finish()),
+            Arc::new(self.model_desc.finish()),
+            Arc::new(self.n_genes.finish()),
+        ];
+        RecordBatch::try_new(Arc::new(arrow_schema(CONTIGS.schema)?), columns)
+            .map_err(|e| format!("Failed to create the contigs batch: {e}"))
     }
 }
 
@@ -531,6 +674,8 @@ impl Settings {
         let path = config_str(json, "training_path")?;
         let sha256 = config_str(json, "training_sha256")?;
         config.meta_mode = meta_mode.into();
+        // The genes output always has the proteins
+        config.want_proteins = 1;
 
         // A batch may hold part of a genome, so single-genome mode needs a
         // model, or to be told that each batch is a whole genome
@@ -592,6 +737,42 @@ impl Settings {
 pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+/// A model's settings, as prodigal and prodigal-train report them.
+pub(super) fn model_json(info: &ProdigalTrainingInfo) -> serde_json::Value {
+    serde_json::json!({
+        "translation_table": info.translation_table,
+        "uses_sd": info.uses_sd != 0,
+        "gc_content": info.gc_content,
+        "start_weight": info.start_weight,
+    })
+}
+
+/// The model's settings in a result (`model_json`), as --describe lists
+/// them; nullable where the result may have no model.
+pub(super) fn model_fields(nullable: bool) -> Vec<FieldDescription> {
+    let field = |name, arrow_type, description| {
+        FieldDescription::new(name, arrow_type, nullable, description)
+    };
+    vec![
+        field(
+            "model.translation_table",
+            "integer",
+            "The model's translation table",
+        ),
+        field(
+            "model.uses_sd",
+            "boolean",
+            "Whether the model scores Shine-Dalgarno motifs",
+        ),
+        field(
+            "model.gc_content",
+            "float64",
+            "The model's GC fraction (the CLI's Model Data gc_cont)",
+        ),
+        field("model.start_weight", "float64", "The model's start weight"),
+    ]
 }
 
 /// A model's settings, as the library reads them from its blob.
@@ -754,8 +935,8 @@ impl Context {
     }
 
     /// Load a model file, refusing it unless its SHA-256 is the one asked
-    /// for: a file retrained since is not served.
-    fn load_model(&mut self, model: &Model) -> Result<(), String> {
+    /// for: a file retrained since is not served. Returns its settings.
+    fn load_model(&mut self, model: &Model) -> Result<ProdigalTrainingInfo, String> {
         // Larger than any model (558,392 bytes on 64-bit builds), so a wrong
         // file is refused before it is read
         const MAX_MODEL_BYTES: u64 = 1 << 20;
@@ -774,7 +955,8 @@ impl Context {
             ));
         }
         let rc = unsafe { prodigal_load_training(self.0, blob.as_ptr().cast(), blob.len()) };
-        self.check(rc)
+        self.check(rc)?;
+        training_info(&blob)
     }
 
     /// Load a contig, checking the library kept all of it.
@@ -799,39 +981,45 @@ impl Context {
         Ok(())
     }
 
-    /// Find the genes of every contig, and respond with them.
-    fn predict(&mut self, contigs: &Contigs) -> Result<Response, String> {
-        let mut accumulator = GeneAccumulator::new();
-        let mut last_stats: ProdigalStats = unsafe { std::mem::zeroed() };
-        for (name, seq) in contigs.iter() {
+    /// Find the genes of every contig, and respond with them and the
+    /// contigs, and the model's settings in single-genome mode.
+    fn predict(
+        &mut self,
+        contigs: &Contigs,
+        model: Option<&ProdigalTrainingInfo>,
+    ) -> Result<Response, String> {
+        let (mut genes, mut table) = (GeneColumns::default(), ContigColumns::default());
+        for (i, (name, seq)) in contigs.iter().enumerate() {
             let contig = |e: String| format!("contig '{name}': {e}");
+            // 1-based, as the CLI numbers sequences
+            let seq_index = i32::try_from(i + 1).map_err(|_| "too many contigs in a batch")?;
             self.load(seq).map_err(contig)?;
-            let mut genes: *mut ProdigalGenesSoa = ptr::null_mut();
+            let mut stats: ProdigalStats = unsafe { std::mem::zeroed() };
+            let mut soa: *mut ProdigalGenesSoa = ptr::null_mut();
             unsafe {
-                let rc = prodigal_find_genes(self.0, &mut genes, &mut last_stats);
+                let rc = prodigal_find_genes(self.0, &mut soa, &mut stats);
                 self.check(rc).map_err(contig)?;
-                if !genes.is_null() {
-                    accumulator.append_from_soa(name, &*genes);
-                    prodigal_genes_free(genes);
+                if !soa.is_null() {
+                    let appended = genes.append(seq_index, name, &*soa);
+                    prodigal_genes_free(soa);
+                    appended.map_err(contig)?;
                 }
             }
+            table.append(seq_index, name, c_len(seq), &stats);
         }
 
-        let n_genes = accumulator.n_genes();
-        let batch = accumulator.into_record_batch()?;
-        let shm_out = crate::arrow_ipc::write_batch_to_output_shm(&batch, "genes")?;
-        let result = serde_json::json!({
-            "n_genes": n_genes,
-            "n_sequences": contigs.iter().count(),
-            "stats": {
-                "gc_content": last_stats.gc_content,
-                "translation_table": last_stats.translation_table,
-                "uses_sd": last_stats.uses_sd,
-                "best_meta_bin": last_stats.best_meta_bin,
-                "best_meta_desc": c_buf_to_string(&last_stats.best_meta_desc),
-            }
+        let (genes, table) = (genes.finish()?, table.finish()?);
+        let mut result = serde_json::json!({
+            "n_genes": genes.num_rows(),
+            "n_sequences": table.num_rows(),
         });
-        Ok(Response::ok(result, vec![shm_out]))
+        if let Some(model) = model {
+            result["model"] = model_json(model);
+        }
+        let mut outputs = ShmOutputs::default();
+        outputs.write(&genes, GENES.label)?;
+        outputs.write(&table, CONTIGS.label)?;
+        Ok(Response::ok(result, outputs.into_vec()))
     }
 }
 
@@ -840,8 +1028,8 @@ impl Context {
 enum Session {
     /// One context for every batch: metagenomic mode (the bins are set up
     /// at the first contig and reused for every batch after), or
-    /// single-genome mode with training_path's model
-    Shared(Context),
+    /// single-genome mode with training_path's model, and its settings
+    Shared(Context, Option<ProdigalTrainingInfo>),
     /// A context for each batch, trained on the batch's contigs
     /// (single-genome mode, train_on_batch)
     TrainOnBatch(ProdigalConfig),
@@ -859,21 +1047,25 @@ impl Session {
             return Ok(Self::TrainOnBatch(settings.config));
         }
         let mut ctx = Context::new(&settings.config)?;
-        if let Some(model) = &settings.model {
-            let path = model.path.display();
-            ctx.load_model(model)
-                .map_err(|e| format!("training_path {path}: {e}"))?;
-        }
-        Ok(Self::Shared(ctx))
+        let info = match &settings.model {
+            None => None,
+            Some(model) => {
+                let path = model.path.display();
+                let info = ctx.load_model(model);
+                Some(info.map_err(|e| format!("training_path {path}: {e}"))?)
+            }
+        };
+        Ok(Self::Shared(ctx, info))
     }
 
     fn run(&mut self, contigs: &Contigs) -> Result<Response, String> {
         match self {
-            Self::Shared(ctx) => ctx.predict(contigs),
+            Self::Shared(ctx, model) => ctx.predict(contigs, model.as_ref()),
             Self::TrainOnBatch(config) => {
                 let mut ctx = Context::new(config)?;
                 ctx.train(contigs)?;
-                ctx.predict(contigs)
+                let model = training_info(&ctx.export()?)?;
+                ctx.predict(contigs, Some(&model))
             }
         }
     }
@@ -896,8 +1088,10 @@ impl GplTool for ProdigalTool {
         library_version()
     }
 
+    /// 2: genes gains seq_index, gene_index, score and protein, and its
+    /// rbs_motif / rbs_spacer are NULL for "None"; the contigs output.
     fn schema_version(&self) -> u32 {
-        1
+        2
     }
 
     fn describe(&self) -> ToolDescription {
@@ -911,7 +1105,9 @@ impl GplTool for ProdigalTool {
             // 3: train_on_batch; trans_table's allowed values are integers;
             // the input's nulls and dropped characters are refused.
             // 4: training_path + training_sha256 (a model from prodigal-train).
-            describe_version: 4,
+            // 5: schema 2 (outputs genes and contigs, listed by label); the
+            // result's model replaces the last contig's stats.
+            describe_version: 5,
             description: "Prokaryotic gene prediction for metagenomic and single-genome sequences",
             config_params: vec![
                 ConfigParam {
@@ -999,151 +1195,33 @@ impl GplTool for ProdigalTool {
                     allowed_values: vec![],
                 },
             ],
-            input_schema: input_fields(),
-            output_schema: vec![
-                FieldDescription {
-                    name: "seq_name",
-                    arrow_type: "Utf8",
-                    nullable: false,
-                    description: "Source contig identifier",
-                },
-                FieldDescription {
-                    name: "begin",
-                    arrow_type: "Int32",
-                    nullable: false,
-                    description: "Gene start position (1-based)",
-                },
-                FieldDescription {
-                    name: "end",
-                    arrow_type: "Int32",
-                    nullable: false,
-                    description: "Gene end position (1-based)",
-                },
-                FieldDescription {
-                    name: "strand",
-                    arrow_type: "Int32",
-                    nullable: false,
-                    description: "Strand (+1 or -1)",
-                },
-                FieldDescription {
-                    name: "partial_left",
-                    arrow_type: "Boolean",
-                    nullable: false,
-                    description: "Gene is partial at left edge",
-                },
-                FieldDescription {
-                    name: "partial_right",
-                    arrow_type: "Boolean",
-                    nullable: false,
-                    description: "Gene is partial at right edge",
-                },
-                FieldDescription {
-                    name: "start_type",
-                    arrow_type: "Int32",
-                    nullable: false,
-                    description: "Start codon type (0=ATG, 1=GTG, 2=TTG, 3=Edge)",
-                },
-                FieldDescription {
-                    name: "cscore",
-                    arrow_type: "Float64",
-                    nullable: false,
-                    description: "Coding score",
-                },
-                FieldDescription {
-                    name: "sscore",
-                    arrow_type: "Float64",
-                    nullable: false,
-                    description: "Start score",
-                },
-                FieldDescription {
-                    name: "rscore",
-                    arrow_type: "Float64",
-                    nullable: false,
-                    description: "RBS score",
-                },
-                FieldDescription {
-                    name: "uscore",
-                    arrow_type: "Float64",
-                    nullable: false,
-                    description: "Upstream score",
-                },
-                FieldDescription {
-                    name: "tscore",
-                    arrow_type: "Float64",
-                    nullable: false,
-                    description: "Type score",
-                },
-                FieldDescription {
-                    name: "confidence",
-                    arrow_type: "Float64",
-                    nullable: false,
-                    description: "Gene confidence [50, 100]",
-                },
-                FieldDescription {
-                    name: "gc_cont",
-                    arrow_type: "Float64",
-                    nullable: false,
-                    description: "GC content of gene region",
-                },
-                FieldDescription {
-                    name: "rbs_motif",
-                    arrow_type: "Utf8",
-                    nullable: false,
-                    description: "Ribosome binding site motif as Prodigal prints it (e.g. \
-                                  \"AGGAG\", or an upstream motif such as \"TAA\"); \
-                                  \"None\" if none",
-                },
-                FieldDescription {
-                    name: "rbs_spacer",
-                    arrow_type: "Utf8",
-                    nullable: false,
-                    description: "RBS spacer (e.g. \"5-10bp\"); \"None\" if none",
-                },
-            ],
+            input_schema: INPUT_FIELDS.to_vec(),
+            outputs: vec![GENES, CONTIGS],
             response_metadata: vec![
                 FieldDescription {
                     name: "n_genes",
                     arrow_type: "integer",
                     nullable: false,
-                    description: "Total gene count across all sequences",
+                    description: "Genes in the batch (rows of genes)",
                 },
                 FieldDescription {
                     name: "n_sequences",
                     arrow_type: "integer",
                     nullable: false,
-                    description: "Number of input sequences processed",
+                    description: "Contigs in the batch (rows of contigs)",
                 },
                 FieldDescription {
-                    name: "stats.gc_content",
-                    arrow_type: "float64",
-                    nullable: false,
-                    description: "GC content from last processed sequence",
+                    name: "model",
+                    arrow_type: "object",
+                    nullable: true,
+                    description: "Single-genome mode: the model the genes were called \
+                                      with (training_path's, or the one trained on the \
+                                      batch); absent in metagenomic mode",
                 },
-                FieldDescription {
-                    name: "stats.translation_table",
-                    arrow_type: "integer",
-                    nullable: false,
-                    description: "Translation table used",
-                },
-                FieldDescription {
-                    name: "stats.uses_sd",
-                    arrow_type: "integer",
-                    nullable: false,
-                    description: "Whether Shine-Dalgarno motifs were used",
-                },
-                FieldDescription {
-                    name: "stats.best_meta_bin",
-                    arrow_type: "integer",
-                    nullable: false,
-                    description: "Best metagenomic bin index (-1 if not meta mode)",
-                },
-                FieldDescription {
-                    name: "stats.best_meta_desc",
-                    arrow_type: "Utf8",
-                    nullable: false,
-                    description: "Description of best metagenomic bin",
-                },
-            ],
+            ]
+            .into_iter()
+            .chain(model_fields(true))
+            .collect(),
         }
     }
 
@@ -1171,12 +1249,14 @@ impl GplTool for ProdigalTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shm::SharedMemory;
     use crate::test_util::{
-        anthus, gene_coordinates, genes_of, gff_coordinates, prodigal_batch, read_arrow_from_shm,
-        scratch_dir, unique_shm_name, write_arrow_to_shm, PRODIGAL_REF_TRAIN as REF_TRAIN,
-        PRODIGAL_REF_TRAIN_SHA256 as REF_TRAIN_SHA256,
+        anthus, anthus_batch, assert_anthus_model, column, fasta_records, gene_coordinates,
+        gff_coordinates, gff_genes, gff_sequences, prediction_of, prodigal_batch, prodigal_truth,
+        scratch_dir, unique_shm_name, write_arrow_to_shm, Prediction,
+        PRODIGAL_REF_TRAIN as REF_TRAIN, PRODIGAL_REF_TRAIN_SHA256 as REF_TRAIN_SHA256,
     };
+    use arrow::array::{BooleanArray, Float64Array, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
 
     // Test sequences from Prodigal's anthus_aco.fas (960 bp each)
     const TEST_SEQ_1: &str = "ACAGGTTAGAAACTACTCTGTTTTCTGGCTCCTTGTTTAATGCCCTGTCCTATTTTATTGCGAAAATTGTCTGTTTTTCACAGAAAACTGAGAGTAGTCAAGGGATTCCTTGTCCTTTGCTTTGGTCTGCACAGCTGTCTTGTTTTAAGGCCAAGTGGAATGAGACAGCTGACTCTTCAGGTGTGAAAACTTGGATGTAGGTGTAGATTGGCTCTCAGTTGACCTCCAGCTGGTGCAGATTCTTCAGTTTGTTTGATGGAGCTTTGAGAAGTCCTTTCAGACTGAAGGATACTCTGAATTTTAGCTATGGAGATAATGTGGATGTTGTGTGTTTAAGTCCTGTTTGCAGTTTTTTTCTGTTCAGTCAGTTATTTTACTGTGTGAGTCAGGACCCTTAGAAGCCCTCAGTGGCAACCACAGAGCGCACAGTTAATTTTCTGTGCAAGAAAATTAAGATCATACTCTGTGTCCAGGAAAGTCAAGAATATTCCTGGTTTTCTCTACTGTAAAATTTTATCTTGTAACTTGTGTTTGGGTCTGCATGATTATTCAAAAATCTTAGTAGATTTGGAAGGATGTTGCATATTATGGAAACAAAGTTGGAAAAAGTTTGTATCAGTTGCAGTATTTCTTCACATCATTTNTTAACNNCNTNNNNNNNNNGCTTCTGCCACTTGAAAAGACAAATTAAAAACNAATTTATAATGCTTATATGCTTTAGTTACATTNGGGTCTTTCAGTAACTTTAGTGCTTTTGATAGCCATACCTGTGAGNTTGACAGTGTCTAAAATTAGAAGTGTTCCTTTTCTTCTGCTCTTCCCATTCTCGTGTGTCTTCAATAGTTTCTGCAAATAATGATGTGCAGACTTAGCATTGATTCAACAGCAGAGGTAAGCATACCTGTGGCTTACTTGGCTTCAGCTTATCCAGCAGTGCCAACCACTCTCTGTTTGTCTTAC";
@@ -1198,25 +1278,22 @@ mod tests {
         .unwrap()
     }
 
-    /// execute() on a batch: the result JSON and the genes, or the error.
-    fn predict_batch(
-        config: serde_json::Value,
-        batch: &RecordBatch,
-    ) -> Result<(serde_json::Value, RecordBatch), String> {
+    /// execute() on a batch: the result JSON and the outputs, or the error.
+    fn predict_batch(config: serde_json::Value, batch: &RecordBatch) -> Result<Prediction, String> {
         let input_name = unique_shm_name("pd-run");
         let input = write_arrow_to_shm(&input_name, batch);
-        genes_of(ProdigalTool.execute(&config, &input_name, input.len()))
+        prediction_of(ProdigalTool.execute(&config, &input_name, input.len()))
     }
 
     /// A batch run through a streaming session: the result JSON and the
-    /// genes, or the error.
+    /// outputs, or the error.
     fn predict_in(
         session: &mut Box<dyn StreamingContext>,
         batch: &RecordBatch,
-    ) -> Result<(serde_json::Value, RecordBatch), String> {
+    ) -> Result<Prediction, String> {
         let input_name = unique_shm_name("pd-sess");
         let input = write_arrow_to_shm(&input_name, batch);
-        genes_of(session.run_batch(&input_name, input.len()))
+        prediction_of(session.run_batch(&input_name, input.len()))
     }
 
     /// Single-genome mode from REF_TRAIN, with `knobs` added or replaced.
@@ -1236,86 +1313,272 @@ mod tests {
         config: serde_json::Value,
         names: &[&str],
         sequences: &[&str],
-    ) -> Result<(serde_json::Value, RecordBatch), String> {
+    ) -> Result<Prediction, String> {
         predict_batch(config, &prodigal_batch(names, sequences))
     }
 
+    /// anthus's genes and contigs in metagenomic mode, and from the CLI's
+    /// model of anthus, with the CLI's output for each: (config, GFF,
+    /// proteins).
+    fn cli_runs() -> [(serde_json::Value, &'static str, &'static str); 2] {
+        [
+            (serde_json::json!({}), "ref_meta.gff", "ref_meta.proteins"),
+            // ref_trained.gff's genes are ref_single.gff's
+            (
+                from_model(serde_json::json!({})),
+                "ref_trained.gff",
+                "ref_single.proteins",
+            ),
+        ]
+    }
+
+    /// A batch's outputs (prediction_of checks their labels and order) are
+    /// the ones --describe lists, with its columns: name, type as
+    /// described, nullability.
     #[test]
-    fn test_prodigal_meta_roundtrip() {
-        let input_name = unique_shm_name("pd-meta-in");
-
+    fn test_outputs_are_described() {
         let batch = prodigal_batch(&["contig_1", "contig_2"], &[TEST_SEQ_1, TEST_SEQ_2]);
+        let outputs = predict_batch(serde_json::json!({}), &batch).unwrap();
+        let desc = ProdigalTool.describe();
+        let described: Vec<&str> = desc.outputs.iter().map(|o| o.label).collect();
+        assert_eq!(described, ["genes", "contigs"]);
+        let column = |f: &Field| (f.name().clone(), f.data_type().to_string(), f.is_nullable());
+        for (batch, output) in [&outputs.genes, &outputs.contigs]
+            .into_iter()
+            .zip(&desc.outputs)
+        {
+            let columns: Vec<_> = batch.schema().fields().iter().map(|f| column(f)).collect();
+            let listed: Vec<_> = (output.schema.iter())
+                .map(|f| (f.name.to_string(), f.arrow_type.to_string(), f.nullable))
+                .collect();
+            assert_eq!(columns, listed, "{}", output.label);
+        }
+        assert!(outputs.genes.num_rows() > 0);
+        assert_eq!(outputs.contigs.num_rows(), 2);
+    }
 
-        let input_shm = write_arrow_to_shm(&input_name, &batch);
-        let input_shm_size = input_shm.len();
+    /// The genes are the CLI's, in both modes, column by column: each GFF
+    /// CDS line (ID = <seqnum>_<gene_index>, the place, partial,
+    /// start_type, the RBS motif and spacer, NULL where the CLI prints
+    /// "None", gc_cont, and the scores, score= being cscore + sscore), and
+    /// its protein (the -a record).
+    #[test]
+    fn test_genes_are_the_clis() {
+        const START_TYPES: [&str; 4] = ["ATG", "GTG", "TTG", "Edge"];
+        // (column, GFF attribute, the CLI's printed precision)
+        const VALUES: [(&str, &str, f64); 8] = [
+            ("score", "score", 0.005),
+            ("cscore", "cscore", 0.005),
+            ("sscore", "sscore", 0.005),
+            ("rscore", "rscore", 0.005),
+            ("uscore", "uscore", 0.005),
+            ("tscore", "tscore", 0.005),
+            ("confidence", "conf", 0.005),
+            ("gc_cont", "gc_cont", 0.0005),
+        ];
+        for (config, gff, proteins) in cli_runs() {
+            let genes = predict_batch(config, &anthus_batch()).unwrap().genes;
+            let expected = gff_genes(&prodigal_truth(gff));
+            let proteins = fasta_records(&prodigal_truth(proteins));
+            assert_eq!(genes.num_rows(), expected.len(), "{gff}");
+            assert_eq!(proteins.len(), expected.len(), "{gff}");
 
-        let tool = ProdigalTool;
-        let config = serde_json::json!({
-            "meta_mode": true,
-            "trans_table": 11,
-        });
-
-        let response = tool.execute(&config, &input_name, input_shm_size);
-        assert!(
-            response.success,
-            "Prodigal meta failed: {:?}",
-            response.error
-        );
-
-        // Verify output shm metadata
-        assert_eq!(response.shm_outputs.len(), 1);
-        let output_name = &response.shm_outputs[0].name;
-        let output_size = response.shm_outputs[0].size;
-        assert!(output_name.starts_with("/gb-"));
-        assert_eq!(response.shm_outputs[0].label, "genes");
-        assert!(output_size > 0);
-
-        // Verify JSON metadata
-        let result = response.result.unwrap();
-        assert!(
-            result["n_genes"].as_i64().unwrap() > 0,
-            "Expected prodigal to find genes in test sequences"
-        );
-        assert_eq!(result["n_sequences"], 2);
-        assert!(result["stats"]["gc_content"].as_f64().is_some());
-        assert!(result["stats"]["best_meta_bin"].as_i64().unwrap() >= 0);
-
-        // Verify Arrow IPC output
-        let out_batches = read_arrow_from_shm(output_name, output_size);
-        assert_eq!(out_batches.len(), 1);
-        let out = &out_batches[0];
-        assert_eq!(out.num_columns(), 16);
-
-        // Check column names
-        assert_eq!(out.schema().field(0).name(), "seq_name");
-        assert_eq!(out.schema().field(1).name(), "begin");
-        assert_eq!(out.schema().field(2).name(), "end");
-        assert_eq!(out.schema().field(3).name(), "strand");
-        assert_eq!(out.schema().field(4).name(), "partial_left");
-        assert_eq!(out.schema().field(5).name(), "partial_right");
-        assert_eq!(out.schema().field(6).name(), "start_type");
-        assert_eq!(out.schema().field(14).name(), "rbs_motif");
-        assert_eq!(out.schema().field(15).name(), "rbs_spacer");
-
-        // Verify seq_name values come from input contig names
-        if out.num_rows() > 0 {
-            let seq_name_col = out
-                .column_by_name("seq_name")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            for i in 0..seq_name_col.len() {
-                let val = seq_name_col.value(i);
-                assert!(
-                    val == "contig_1" || val == "contig_2",
-                    "Unexpected seq_name: {val}"
+            let int = |name| column::<Int32Array>(&genes, name).values();
+            let flag = |name, i| column::<BooleanArray>(&genes, name).value(i);
+            let float = |name| column::<Float64Array>(&genes, name).values();
+            let text = |name| column::<StringArray>(&genes, name);
+            let mut nulls = 0;
+            for (i, (gene, (_, letters))) in expected.iter().zip(&proteins).enumerate() {
+                let at = format!("{gff} gene {i}");
+                let attr = |name: &str| gene.attributes[name].as_str();
+                let id = format!("{}_{}", int("seq_index")[i], int("gene_index")[i]);
+                assert_eq!(id, attr("ID"), "{at}");
+                assert_eq!(text("seq_name").value(i), gene.seq_name, "{at}");
+                let place = (int("begin")[i], int("end")[i], int("strand")[i]);
+                assert_eq!(place, (gene.begin, gene.end, gene.strand), "{at}");
+                let partial = ["partial_left", "partial_right"].map(|p| u8::from(flag(p, i)));
+                assert_eq!(
+                    format!("{}{}", partial[0], partial[1]),
+                    attr("partial"),
+                    "{at}"
                 );
+                let start_type = START_TYPES[int("start_type")[i] as usize];
+                assert_eq!(start_type, attr("start_type"), "{at}");
+                for (name, attribute, precision) in VALUES {
+                    let cli: f64 = attr(attribute).parse().unwrap();
+                    let diff = (float(name)[i] - cli).abs();
+                    assert!(diff <= precision + 1e-9, "{at} {name}: {diff}");
+                }
+                for name in ["rbs_motif", "rbs_spacer"] {
+                    let col = text(name);
+                    let ours = (!col.is_null(i)).then(|| col.value(i));
+                    let cli = Some(attr(name)).filter(|&v| v != "None");
+                    assert_eq!(ours, cli, "{at} {name}");
+                    nulls += usize::from(col.is_null(i));
+                }
+                assert_eq!(text("protein").value(i), letters, "{at}");
+            }
+            assert!(nulls > 0, "{gff}: no \"None\" to check");
+        }
+    }
+
+    /// Protein offsets that don't start at 0 or go backwards are an error,
+    /// not a slice out of bounds.
+    #[test]
+    fn test_malformed_protein_offsets_are_an_error() {
+        let (ints, floats) = ([1i32; 2], [0.0f64; 2]);
+        let none = c"None".as_ptr();
+        let texts = [none; 2];
+        let letters = b"MKV*MK*";
+        let soa = |offsets: &[i32; 3]| ProdigalGenesSoa {
+            n_genes: 2,
+            begin: ints.as_ptr(),
+            end: ints.as_ptr(),
+            strand: ints.as_ptr(),
+            partial_left: ints.as_ptr(),
+            partial_right: ints.as_ptr(),
+            start_type: ints.as_ptr(),
+            cscore: floats.as_ptr(),
+            sscore: floats.as_ptr(),
+            rscore: floats.as_ptr(),
+            uscore: floats.as_ptr(),
+            tscore: floats.as_ptr(),
+            confidence: floats.as_ptr(),
+            gc_cont: floats.as_ptr(),
+            rbs_motif: texts.as_ptr(),
+            rbs_spacer: texts.as_ptr(),
+            protein_offsets: offsets.as_ptr(),
+            protein_data: letters.as_ptr().cast(),
+            _base: ptr::null_mut(),
+        };
+        let append =
+            |offsets: &[i32; 3]| unsafe { GeneColumns::default().append(1, "c", &soa(offsets)) };
+        assert!(append(&[0, 4, 7]).is_ok());
+        for bad in [[1, 4, 7], [0, 4, 3], [0, -4, 7]] {
+            let err = append(&bad).unwrap_err();
+            assert!(err.contains("protein offsets"), "{bad:?}: {err}");
+        }
+    }
+
+    /// One contigs row per input contig, in order, with the CLI's
+    /// sequence and model data (its GFF header lines), and the genes the
+    /// contig has.
+    #[test]
+    fn test_contigs_are_the_clis() {
+        let input = anthus();
+        for (config, gff, _) in cli_runs() {
+            let contigs = predict_batch(config, &anthus_batch()).unwrap().contigs;
+            let truth = prodigal_truth(gff);
+            let (expected, genes) = (gff_sequences(&truth), gff_genes(&truth));
+            assert_eq!(contigs.num_rows(), expected.len(), "{gff}");
+
+            let int = |name| column::<Int32Array>(&contigs, name);
+            let names = column::<StringArray>(&contigs, "seq_name");
+            let gc = column::<Float64Array>(&contigs, "gc_content");
+            let uses_sd = column::<BooleanArray>(&contigs, "uses_sd");
+            let (bin, desc) = (
+                int("meta_bin"),
+                column::<StringArray>(&contigs, "model_desc"),
+            );
+            for (i, cli) in expected.iter().enumerate() {
+                let at = format!("{gff} contig {i}");
+                assert_eq!(int("seq_index").value(i).to_string(), cli["seqnum"], "{at}");
+                // anthus_aco.fas has CRLF lines; the CLI keeps the CR
+                assert_eq!(names.value(i), cli["seqhdr"].trim_end(), "{at}");
+                assert_eq!(int("length").value(i).to_string(), cli["seqlen"], "{at}");
+                let table = int("translation_table").value(i).to_string();
+                assert_eq!(table, cli["transl_table"], "{at}");
+                assert_eq!(uses_sd.value(i), cli["uses_sd"] == "1", "{at}");
+                let n_genes = genes
+                    .iter()
+                    .filter(|g| g.seq_name == names.value(i))
+                    .count();
+                assert_eq!(int("n_genes").value(i) as usize, n_genes, "{at}");
+                if cli["run_type"] == "Metagenomic" {
+                    assert_eq!(desc.value(i), cli["model"], "{at}");
+                    let number = cli["model"].split('|').next().unwrap();
+                    assert_eq!(bin.value(i).to_string(), number, "{at}");
+                } else {
+                    assert!(bin.is_null(i) && desc.is_null(i), "{at}");
+                }
+                // The sequence's GC (the GFF has the model's)
+                let seq = input[i].1.as_bytes();
+                let n_gc = seq.iter().filter(|b| b"GCgc".contains(b)).count();
+                let want = n_gc as f64 / seq.len() as f64;
+                assert!((gc.value(i) - want).abs() < 1e-12, "{at}");
             }
         }
+    }
 
-        // Caller cleans up output shm
-        let _ = SharedMemory::unlink(output_name);
+    /// A contig without genes still has its contigs row, and the genes'
+    /// seq_index joins each gene to its contig's row, within each batch.
+    #[test]
+    fn test_contigs_include_contigs_without_genes() {
+        let names = ["c1", "tiny", "c2"];
+        let batch = prodigal_batch(&names, &[TEST_SEQ_1, "ACGTACGTAC", TEST_SEQ_2]);
+        let tiny = prodigal_batch(&["tiny"], &["ACGTACGTAC"]);
+        for config in [serde_json::json!({}), from_model(serde_json::json!({}))] {
+            let mut session = ProdigalTool
+                .create_streaming_context(&config)
+                .unwrap()
+                .unwrap();
+            for (batch, names) in [(&batch, &names[..]), (&tiny, &names[1..2])] {
+                let outputs = predict_in(&mut session, batch).unwrap();
+                let (genes, contigs) = (&outputs.genes, &outputs.contigs);
+                let at = format!("{config} {names:?}");
+                assert_eq!(contigs.num_rows(), names.len(), "{at}");
+                let n_genes = column::<Int32Array>(contigs, "n_genes");
+                let seq_index = column::<Int32Array>(contigs, "seq_index");
+                let gene_seq = column::<Int32Array>(genes, "seq_index");
+                let seq_names = column::<StringArray>(genes, "seq_name");
+                for (i, name) in names.iter().enumerate() {
+                    let index = seq_index.value(i);
+                    assert_eq!(index as usize, i + 1, "{at}");
+                    let of_contig: Vec<_> = (0..genes.num_rows())
+                        .filter(|&g| gene_seq.value(g) == index)
+                        .collect();
+                    assert_eq!(of_contig.len(), n_genes.value(i) as usize, "{at} {name}");
+                    assert!(of_contig.iter().all(|&g| seq_names.value(g) == *name));
+                    assert_eq!(n_genes.value(i) == 0, *name == "tiny", "{at} {name}");
+                }
+                assert_eq!(outputs.result["n_sequences"], names.len(), "{at}");
+                assert_eq!(outputs.result["n_genes"], genes.num_rows(), "{at}");
+            }
+        }
+    }
+
+    /// Each contig reports the table its genes were called with: the
+    /// model's.
+    #[test]
+    fn test_contigs_report_the_table() {
+        let config =
+            serde_json::json!({"meta_mode": false, "train_on_batch": true, "trans_table": 4});
+        let outputs = predict_batch(config, &anthus_batch()).unwrap();
+        let tables = column::<Int32Array>(&outputs.contigs, "translation_table");
+        assert_eq!(tables.len(), 22);
+        assert!(tables.iter().all(|t| t == Some(4)), "{tables:?}");
+        assert_eq!(outputs.result["model"]["translation_table"], 4);
+    }
+
+    /// The result reports the batch's counts, and in single-genome mode the
+    /// model's settings; no contig's stats.
+    #[test]
+    fn test_result_reports_the_model() {
+        let meta = predict_batch(serde_json::json!({}), &anthus_batch())
+            .unwrap()
+            .result;
+        let keys: Vec<&String> = meta.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["n_genes", "n_sequences"]);
+
+        // anthus's model, from the file or trained on the batch
+        let from_file = predict_batch(from_model(serde_json::json!({})), &anthus_batch());
+        let trained = serde_json::json!({"meta_mode": false, "train_on_batch": true});
+        let trained = predict_batch(trained, &anthus_batch());
+        for result in [from_file.unwrap().result, trained.unwrap().result] {
+            assert_anthus_model(&result["model"]);
+            let keys: Vec<&String> = result.as_object().unwrap().keys().collect();
+            assert_eq!(keys, ["model", "n_genes", "n_sequences"]);
+        }
     }
 
     #[test]
@@ -1389,26 +1652,11 @@ mod tests {
             .expect("context creation failed")
             .expect("tool should support streaming");
 
-        let input_name = unique_shm_name("pd-str-in");
         let batch = prodigal_batch(&["contig_1", "contig_2"], &[TEST_SEQ_1, TEST_SEQ_2]);
-        let input_shm = write_arrow_to_shm(&input_name, &batch);
-        let input_shm_size = input_shm.len();
-
-        let response = ctx.run_batch(&input_name, input_shm_size);
-        assert!(response.success, "run_batch failed: {:?}", response.error);
-        assert_eq!(response.shm_outputs.len(), 1);
-        assert_eq!(response.shm_outputs[0].label, "genes");
-
-        let result = response.result.unwrap();
-        assert!(result["n_genes"].as_i64().unwrap() > 0);
-        assert_eq!(result["n_sequences"], 2);
-
-        let out_batches =
-            read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
-        assert_eq!(out_batches.len(), 1);
-        assert!(out_batches[0].num_rows() > 0);
-
-        let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
+        let outputs = predict_in(&mut ctx, &batch).unwrap();
+        assert!(outputs.result["n_genes"].as_i64().unwrap() > 0);
+        assert_eq!(outputs.result["n_sequences"], 2);
+        assert!(outputs.genes.num_rows() > 0);
     }
 
     #[test]
@@ -1420,29 +1668,11 @@ mod tests {
             .expect("context creation failed")
             .expect("tool should support streaming");
 
-        // Batch 1: one sequence
-        let input1 = unique_shm_name("pd-str-b1");
-        let batch1 = prodigal_batch(&["contig_1"], &[TEST_SEQ_1]);
-        let shm_holder1 = write_arrow_to_shm(&input1, &batch1);
-        let shm_holder1_size = shm_holder1.len();
-        let resp1 = ctx.run_batch(&input1, shm_holder1_size);
-        assert!(resp1.success, "Batch 1 failed: {:?}", resp1.error);
-        let genes1 = resp1.result.as_ref().unwrap()["n_genes"].as_i64().unwrap();
-        let _ = SharedMemory::unlink(&resp1.shm_outputs[0].name);
-
-        // Batch 2: different sequence
-        let input2 = unique_shm_name("pd-str-b2");
-        let batch2 = prodigal_batch(&["contig_2"], &[TEST_SEQ_2]);
-        let shm_holder2 = write_arrow_to_shm(&input2, &batch2);
-        let shm_holder2_size = shm_holder2.len();
-        let resp2 = ctx.run_batch(&input2, shm_holder2_size);
-        assert!(resp2.success, "Batch 2 failed: {:?}", resp2.error);
-        let genes2 = resp2.result.as_ref().unwrap()["n_genes"].as_i64().unwrap();
-        let _ = SharedMemory::unlink(&resp2.shm_outputs[0].name);
-
-        // Both batches should find genes independently
-        assert!(genes1 > 0, "Batch 1 found no genes");
-        assert!(genes2 > 0, "Batch 2 found no genes");
+        // Both batches find genes independently
+        for (name, seq) in [("contig_1", TEST_SEQ_1), ("contig_2", TEST_SEQ_2)] {
+            let outputs = predict_in(&mut ctx, &prodigal_batch(&[name], &[seq])).unwrap();
+            assert!(outputs.genes.num_rows() > 0, "{name} found no genes");
+        }
     }
 
     /// Every mirror matches the library's own layout field by field
@@ -1662,16 +1892,10 @@ mod tests {
     /// (the fork's ref_single.gff: `prodigal -p single` on anthus).
     #[test]
     fn test_single_mode_trains_on_the_batch() {
-        let contigs = anthus();
-        let names: Vec<&str> = contigs.iter().map(|c| c.0.as_str()).collect();
-        let seqs: Vec<&str> = contigs.iter().map(|c| c.1.as_str()).collect();
         let config = serde_json::json!({"meta_mode": false, "train_on_batch": true});
-        let (result, genes) = predict(config, &names, &seqs).unwrap();
+        let Prediction { result, genes, .. } = predict_batch(config, &anthus_batch()).unwrap();
 
-        let expected = gff_coordinates(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/ext/prodigal/testdata/ground_truth/ref_single.gff"
-        )));
+        let expected = gff_coordinates(&prodigal_truth("ref_single.gff"));
         assert_eq!(gene_coordinates(&genes), expected);
         assert_eq!(result["n_genes"], expected.len());
     }
@@ -1721,11 +1945,7 @@ mod tests {
             assert!(err.contains("'c2'") && err.contains(&wanted), "{err}");
         }
         // The context is still usable
-        let input_name = unique_shm_name("pd-drop");
-        let input = write_arrow_to_shm(&input_name, &prodigal_batch(&["c1"], &[TEST_SEQ_1]));
-        let response = meta.run_batch(&input_name, input.len());
-        assert!(response.success, "{:?}", response.error);
-        let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
+        predict_in(&mut meta, &prodigal_batch(&["c1"], &[TEST_SEQ_1])).unwrap();
 
         // Single-genome mode
         let mut contigs = anthus();
@@ -1760,8 +1980,11 @@ mod tests {
     #[test]
     fn test_contigs_are_read_within_bounds() {
         let config = serde_json::json!({});
-        let (_, alone) = predict(config.clone(), &["c1"], &[TEST_SEQ_1]).unwrap();
-        let (_, both) = predict(config, &["c1", "c2"], &[TEST_SEQ_1, TEST_SEQ_2]).unwrap();
+        let alone = predict(config.clone(), &["c1"], &[TEST_SEQ_1])
+            .unwrap()
+            .genes;
+        let both = predict(config, &["c1", "c2"], &[TEST_SEQ_1, TEST_SEQ_2]);
+        let both = both.unwrap().genes;
         let c1: Vec<_> = gene_coordinates(&both)
             .into_iter()
             .filter(|g| g.0 == "c1")
@@ -1792,16 +2015,10 @@ mod tests {
     /// anthus is too short to train on.
     #[test]
     fn test_training_path_predicts_as_the_cli() {
-        let expected = gff_coordinates(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/ext/prodigal/testdata/ground_truth/ref_trained.gff"
-        )));
-        let contigs = anthus();
-        let names: Vec<&str> = contigs.iter().map(|c| c.0.as_str()).collect();
-        let seqs: Vec<&str> = contigs.iter().map(|c| c.1.as_str()).collect();
-        let batch = prodigal_batch(&names, &seqs);
+        let expected = gff_coordinates(&prodigal_truth("ref_trained.gff"));
+        let batch = anthus_batch();
         let config = from_model(serde_json::json!({}));
-        let (_, genes) = predict_batch(config.clone(), &batch).unwrap();
+        let genes = predict_batch(config.clone(), &batch).unwrap().genes;
         assert_eq!(gene_coordinates(&genes), expected);
 
         let mut session = ProdigalTool
@@ -1810,7 +2027,7 @@ mod tests {
             .unwrap();
         let mut got = Vec::new();
         for half in [batch.slice(0, 11), batch.slice(11, 11)] {
-            let (_, genes) = predict_in(&mut session, &half).unwrap();
+            let genes = predict_in(&mut session, &half).unwrap().genes;
             got.extend(gene_coordinates(&genes));
         }
         assert_eq!(got, expected);

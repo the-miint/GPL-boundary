@@ -51,7 +51,7 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
 use crate::protocol::ShmOutput;
-use crate::shm::ReadOnlyShm;
+use crate::shm::{ReadOnlyShm, SharedMemory};
 
 /// Default upper bound on the virtual reservation per output shm. POSIX shm
 /// segments are sparse — physical pages are allocated only on touch — so a
@@ -139,8 +139,7 @@ impl ShmWriter {
             if libc::ftruncate(fd, max_capacity as libc::off_t) < 0 {
                 let err = io::Error::last_os_error();
                 libc::close(fd);
-                libc::shm_unlink(c_name.as_ptr());
-                crate::shm::deregister_cleanup(&name);
+                let _ = SharedMemory::unlink(&name);
                 return Err(err);
             }
 
@@ -155,8 +154,7 @@ impl ShmWriter {
             if ptr == libc::MAP_FAILED {
                 let err = io::Error::last_os_error();
                 libc::close(fd);
-                libc::shm_unlink(c_name.as_ptr());
-                crate::shm::deregister_cleanup(&name);
+                let _ = SharedMemory::unlink(&name);
                 return Err(err);
             }
 
@@ -201,9 +199,7 @@ impl ShmWriter {
                 let err = io::Error::last_os_error();
                 // Best-effort cleanup of the now-orphaned fd and name.
                 libc::close(fd);
-                let c_name = CString::new(name.as_str()).unwrap_or_default();
-                libc::shm_unlink(c_name.as_ptr());
-                crate::shm::deregister_cleanup(&name);
+                let _ = SharedMemory::unlink(&name);
                 return Err(err);
             }
             libc::close(fd);
@@ -263,10 +259,7 @@ impl Drop for ShmWriter {
                 libc::close(self.fd);
             }
             if !self.name.is_empty() {
-                if let Ok(c_name) = CString::new(self.name.as_str()) {
-                    libc::shm_unlink(c_name.as_ptr());
-                }
-                crate::shm::deregister_cleanup(&self.name);
+                let _ = SharedMemory::unlink(&self.name);
             }
         }
     }
@@ -299,6 +292,33 @@ pub fn write_batch_to_output_shm(batch: &RecordBatch, label: &str) -> Result<Shm
     writer
         .finish()
         .map_err(|e| format!("Failed to finalize output shm: {e}"))
+}
+
+/// A response's output segments, all or none: dropped before `into_vec`,
+/// it unlinks those written so far, so a tool whose second write fails
+/// leaves no first segment behind.
+#[derive(Default)]
+pub struct ShmOutputs(Vec<ShmOutput>);
+
+impl ShmOutputs {
+    /// Write a batch to a new output segment (`write_batch_to_output_shm`).
+    pub fn write(&mut self, batch: &RecordBatch, label: &str) -> Result<(), String> {
+        self.0.push(write_batch_to_output_shm(batch, label)?);
+        Ok(())
+    }
+
+    /// The segments, for the response, which hands them to the caller.
+    pub fn into_vec(mut self) -> Vec<ShmOutput> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for ShmOutputs {
+    fn drop(&mut self) {
+        for out in &self.0 {
+            let _ = SharedMemory::unlink(&out.name);
+        }
+    }
 }
 
 /// Read all RecordBatches from an Arrow IPC stream in a shared memory
@@ -414,8 +434,30 @@ mod tests {
         assert_eq!(id_col.value(0), 1);
         assert_eq!(id_col.value(2), 3);
 
-        crate::shm::deregister_cleanup(&shm_out.name);
         let _ = SharedMemory::unlink(&shm_out.name);
+    }
+
+    /// A failed write unlinks the outputs written before it.
+    #[test]
+    fn test_shm_outputs_are_all_or_none() {
+        let batch = make_large_batch(3, 4);
+        let mut outputs = ShmOutputs::default();
+        outputs.write(&batch, "first").unwrap();
+        let first = outputs.0[0].name.clone();
+        assert!(SharedMemory::open_readonly(&first).is_ok());
+        assert!(crate::shm::is_registered(&first));
+        let err = outputs.write(&batch, "Not A Label").unwrap_err();
+        assert!(err.contains("label"), "{err}");
+        drop(outputs);
+        assert!(SharedMemory::open_readonly(&first).is_err(), "{first} left");
+        assert!(!crate::shm::is_registered(&first));
+
+        // Handed over, they stay
+        let mut outputs = ShmOutputs::default();
+        outputs.write(&batch, "kept").unwrap();
+        let kept = outputs.into_vec();
+        assert!(SharedMemory::open_readonly(&kept[0].name).is_ok());
+        let _ = SharedMemory::unlink(&kept[0].name);
     }
 
     #[test]
@@ -481,7 +523,6 @@ mod tests {
             err.contains("Unexpected EOS") || err.contains("Failed to decode"),
             "Expected decoder EOS/decode error, got: {err}"
         );
-        crate::shm::deregister_cleanup(&shm_out.name);
         let _ = SharedMemory::unlink(&shm_out.name);
     }
 
@@ -504,7 +545,6 @@ mod tests {
             err.contains("size=0") && err.contains("non-empty"),
             "Expected explanatory error about size=0 vs non-empty, got: {err}"
         );
-        crate::shm::deregister_cleanup(&shm_out.name);
         let _ = SharedMemory::unlink(&shm_out.name);
     }
 
@@ -576,7 +616,6 @@ mod tests {
             shm_out.size,
             on_disk
         );
-        crate::shm::deregister_cleanup(&shm_out.name);
         let _ = SharedMemory::unlink(&shm_out.name);
     }
 
@@ -606,7 +645,6 @@ mod tests {
         assert_eq!(val_col.value(0).len(), 8000);
         assert_eq!(val_col.value(2047).len(), 8000);
 
-        crate::shm::deregister_cleanup(&shm_out.name);
         let _ = SharedMemory::unlink(&shm_out.name);
     }
 
@@ -690,7 +728,6 @@ mod tests {
              copying instead of zero-slicing into the mmap"
         );
 
-        crate::shm::deregister_cleanup(&shm_out.name);
         drop(batches);
         let _ = SharedMemory::unlink(&shm_out.name);
     }
@@ -713,7 +750,6 @@ mod tests {
 
         let batches = read_batches_from_shm(&shm_out.name, shm_out.size).unwrap();
 
-        crate::shm::deregister_cleanup(&shm_out.name);
         SharedMemory::unlink(&shm_out.name).unwrap();
         assert!(SharedMemory::open_readonly(&shm_out.name).is_err());
 

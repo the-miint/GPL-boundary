@@ -225,7 +225,8 @@ impl GplTool for NewTool {
                 // ... all config params
             ],
             input_schema: vec![/* FieldDescription for each input column */],
-            output_schema: vec![/* FieldDescription for each output column */],
+            // One per shm output: its label and a FieldDescription per column
+            outputs: vec![OutputDescription { label: "tree", schema: vec![/* ... */] }],
             response_metadata: vec![/* FieldDescription for JSON result fields */],
         }
     }
@@ -248,6 +249,8 @@ impl GplTool for NewTool {
    then `destroy(ctx)`
 7. On success: convert SOA output → Arrow `RecordBatch` using `output_schema()`
 8. Write output: `crate::arrow_ipc::write_batch_to_output_shm(&batch, "label")`
+   as the last fallible step; with several outputs, or work after the
+   write, use `crate::arrow_ipc::ShmOutputs` (all or none)
 9. Free C output + destroy context
 10. Return `Response::ok(result_json, vec![shm_output])`
 

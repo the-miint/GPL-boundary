@@ -4,8 +4,8 @@
 
 use crate::protocol::Response;
 use crate::tools::prodigal::{
-    input_fields, library_version, model_config, sha256_hex, training_info, validate, Context,
-    Contigs, TRANS_TABLES,
+    library_version, model_config, model_fields, model_json, sha256_hex, training_info, validate,
+    Context, Contigs, INPUT_FIELDS, TRANS_TABLES,
 };
 use crate::tools::{config_str, ConfigParam, FieldDescription, GplTool, ToolDescription};
 use std::io::Write;
@@ -52,7 +52,9 @@ impl GplTool for ProdigalTrainTool {
             name: "prodigal-train",
             version: self.version(),
             schema_version: self.schema_version(),
-            describe_version: 1,
+            // 2: --describe's `outputs` replaces `output_schema` (none here);
+            // the model's settings are in `model`, as in prodigal's result.
+            describe_version: 2,
             description: "Train a single-genome Prodigal model on the input's contigs (one \
                           genome) and write it for prodigal's training_path",
             config_params: vec![
@@ -96,8 +98,8 @@ impl GplTool for ProdigalTrainTool {
                 },
                 flag("verbose", "Write tool log output to stderr for diagnostics"),
             ],
-            input_schema: input_fields(),
-            output_schema: vec![],
+            input_schema: INPUT_FIELDS.to_vec(),
+            outputs: vec![],
             response_metadata: vec![
                 result(
                     "training_path",
@@ -110,17 +112,14 @@ impl GplTool for ProdigalTrainTool {
                     "The model's SHA-256, for prodigal's training_sha256",
                 ),
                 result(
-                    "translation_table",
-                    "integer",
-                    "The model's translation table",
+                    "model",
+                    "object",
+                    "The model's settings, as prodigal reports them",
                 ),
-                result(
-                    "uses_sd",
-                    "integer",
-                    "1 if the model scores Shine-Dalgarno motifs, else 0",
-                ),
-                result("gc_content", "float64", "The model's GC fraction"),
-                result("start_weight", "float64", "The model's start weight"),
+            ]
+            .into_iter()
+            .chain(model_fields(false))
+            .chain([
                 result(
                     "closed_ends",
                     "boolean",
@@ -134,7 +133,8 @@ impl GplTool for ProdigalTrainTool {
                 result("n_sequences", "integer", "Contigs trained on"),
                 result("n_bases", "integer", "Bases trained on"),
                 result("elapsed_ms", "integer", "Wall-clock time"),
-            ],
+            ])
+            .collect(),
         }
     }
 
@@ -170,10 +170,7 @@ fn train(
     let result = serde_json::json!({
         "training_path": target,
         "training_sha256": sha256_hex(&blob),
-        "translation_table": info.translation_table,
-        "uses_sd": info.uses_sd,
-        "gc_content": info.gc_content,
-        "start_weight": info.start_weight,
+        "model": model_json(&info),
         "closed_ends": config.closed_ends != 0,
         "mask_regions": config.mask_regions != 0,
         "n_sequences": contigs.iter().count(),
@@ -226,9 +223,9 @@ mod tests {
     use super::ProdigalTrainTool;
     use crate::protocol::{BatchRequest, Response};
     use crate::test_util::{
-        gene_coordinates, genes_of, gff_coordinates, prodigal_batch, scratch_dir, unique_shm_name,
-        write_arrow_to_shm, PRODIGAL_REF_TRAIN as REF_TRAIN,
-        PRODIGAL_REF_TRAIN_SHA256 as REF_TRAIN_SHA256,
+        anthus_batch, assert_anthus_model, gene_coordinates, gff_coordinates, prediction_of,
+        prodigal_truth, scratch_dir, unique_shm_name, write_arrow_to_shm,
+        PRODIGAL_REF_TRAIN as REF_TRAIN, PRODIGAL_REF_TRAIN_SHA256 as REF_TRAIN_SHA256,
     };
     use crate::tools::prodigal::{sha256_hex, ProdigalTool};
     use crate::tools::GplTool;
@@ -240,16 +237,6 @@ mod tests {
     /// genes: seen on ARM64, and Intel macOS is unchecked
     /// (ext/prodigal/docs/testing.md).
     const TRAIN_BYTES_MATCH: bool = !cfg!(target_os = "macos");
-
-    /// The fork's ground-truth input as one batch.
-    fn anthus() -> RecordBatch {
-        let contigs = crate::test_util::anthus();
-        let (names, seqs): (Vec<&str>, Vec<&str>) = contigs
-            .iter()
-            .map(|(name, seq)| (name.as_str(), seq.as_str()))
-            .unzip();
-        prodigal_batch(&names, &seqs)
-    }
 
     fn run(tool: &str, config: serde_json::Value, batch: &RecordBatch) -> Response {
         let input_name = unique_shm_name("pd-train");
@@ -283,7 +270,7 @@ mod tests {
         let dir = scratch_dir();
         let path = dir.path().join("anthus.bin");
         let config = serde_json::json!({"training_path": path});
-        let response = run("prodigal-train", config, &anthus());
+        let response = run("prodigal-train", config, &anthus_batch());
         assert!(response.success, "{:?}", response.error);
         assert!(response.shm_outputs.is_empty());
         let result = response.result.unwrap();
@@ -298,11 +285,7 @@ mod tests {
         let canonical = std::fs::canonicalize(&path).unwrap();
         assert_eq!(result["training_path"], canonical.to_str().unwrap());
         // The model's settings, as the CLI trained them on anthus
-        assert_eq!(result["translation_table"], 11);
-        assert_eq!(result["start_weight"], 4.35);
-        assert!(result["uses_sd"].is_i64());
-        let gc = result["gc_content"].as_f64().unwrap();
-        assert!((0.0..=1.0).contains(&gc), "{gc}");
+        assert_anthus_model(&result["model"]);
         assert_eq!(result["closed_ends"], false);
         assert_eq!(result["mask_regions"], false);
         assert_eq!(result["n_sequences"], 22);
@@ -320,7 +303,7 @@ mod tests {
         let dir = scratch_dir();
         let path = dir.path().join("model.bin");
         let train = |config: serde_json::Value| {
-            let response = run("prodigal-train", config, &anthus());
+            let response = run("prodigal-train", config, &anthus_batch());
             assert!(response.success, "{:?}", response.error);
             response.result.unwrap()
         };
@@ -343,7 +326,9 @@ mod tests {
         let link = dir.path().join("current.bin");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let config = serde_json::json!({"training_path": link});
-        let result = run("prodigal-train", config, &anthus()).result.unwrap();
+        let result = run("prodigal-train", config, &anthus_batch())
+            .result
+            .unwrap();
         let link_type = std::fs::symlink_metadata(&link).unwrap().file_type();
         assert!(link_type.is_symlink());
         let target = std::fs::canonicalize(&target).unwrap();
@@ -363,7 +348,7 @@ mod tests {
         let response = run(
             "prodigal-train",
             serde_json::json!({"training_path": path}),
-            &anthus(),
+            &anthus_batch(),
         );
         assert!(response.success, "{:?}", response.error);
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
@@ -395,7 +380,7 @@ mod tests {
         let path = dir.path().join("model.bin");
         std::fs::write(&path, b"old").unwrap();
         // One contig of 960 bp: training needs 20,000
-        let short = anthus().slice(0, 1);
+        let short = anthus_batch().slice(0, 1);
         let response = run(
             "prodigal-train",
             serde_json::json!({"training_path": path}),
@@ -438,7 +423,7 @@ mod tests {
                 "Invalid prodigal config",
             ),
         ] {
-            let response = run("prodigal-train", config.clone(), &anthus());
+            let response = run("prodigal-train", config.clone(), &anthus_batch());
             let err = response.error.expect("refused");
             assert!(err.contains(named), "{config}: {err}");
         }
@@ -453,7 +438,7 @@ mod tests {
         let response = run(
             "prodigal-train",
             serde_json::json!({"training_path": path}),
-            &anthus(),
+            &anthus_batch(),
         );
         let err = response.error.expect("refused");
         assert!(err.contains(path.to_str().unwrap()), "{err}");
@@ -468,7 +453,7 @@ mod tests {
         let response = run(
             "prodigal-train",
             serde_json::json!({"training_path": path}),
-            &anthus(),
+            &anthus_batch(),
         );
         let result = response.result.expect("trained");
         let config = serde_json::json!({
@@ -476,11 +461,9 @@ mod tests {
             "training_path": result["training_path"],
             "training_sha256": result["training_sha256"],
         });
-        let (_, genes) = genes_of(run("prodigal", config, &anthus())).unwrap();
-        let expected = gff_coordinates(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/ext/prodigal/testdata/ground_truth/ref_trained.gff"
-        )));
-        assert_eq!(gene_coordinates(&genes), expected);
+        let outputs = prediction_of(run("prodigal", config, &anthus_batch())).unwrap();
+        let expected = gff_coordinates(&prodigal_truth("ref_trained.gff"));
+        assert_eq!(gene_coordinates(&outputs.genes), expected);
+        assert_eq!(outputs.result["model"], result["model"]);
     }
 }

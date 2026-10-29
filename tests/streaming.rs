@@ -796,6 +796,12 @@ fn test_prodigal_single_mode_routes() {
     for r in &responses[..2] {
         assert!(r["success"].as_bool().unwrap(), "{r}");
         assert_eq!(r["result"]["n_genes"].as_u64(), Some(n_genes as u64), "{r}");
+        let outputs = r["shm_outputs"].as_array().unwrap();
+        let labels: Vec<&str> = outputs
+            .iter()
+            .map(|o| o["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(labels, ["genes", "contigs"], "{r}");
     }
     let r = &responses[2];
     assert!(!r["success"].as_bool().unwrap(), "{r}");

@@ -154,7 +154,10 @@ Each tool gets:
 
 Use `arrow_ipc::write_batch_to_output_shm()` and
 `arrow_ipc::read_batches_from_shm()` for Arrow IPC marshaling -- do not
-duplicate this logic in tool modules.
+duplicate this logic in tool modules. A tool with several outputs, or a
+fallible step after a write, writes through `arrow_ipc::ShmOutputs`, which
+unlinks what it wrote unless the response takes the segments
+(`into_vec`), so a failed batch leaves none behind.
 
 We do not exhaustively test submodules; that is their own CI's job.
 
@@ -209,8 +212,9 @@ The binary supports introspection flags (no stdin required):
 
 - `gpl-boundary --version` -- JSON with gpl-boundary version + all tool versions
 - `gpl-boundary --list-tools` -- JSON array of available tool names
-- `gpl-boundary --describe fasttree` -- JSON with config params, input/output
-  Arrow schemas, response metadata fields
+- `gpl-boundary --describe fasttree` -- JSON with config params, the input
+  Arrow schema, each output's label and Arrow schema (`outputs`), response
+  metadata fields
 
 These let miint programmatically discover capabilities without hardcoding.
 
@@ -226,7 +230,7 @@ distinct bump policies and are NOT substitutes for each other:
 - `describe_version` — `--describe` introspection surface. Bumped on
   any change to `config_params` (add/rename/remove, type/default/
   allowed-values edit) or `response_metadata` (documentation-only,
-  does not affect Arrow). `input_schema` / `output_schema` edits also
+  does not affect Arrow). `input_schema` / `outputs` edits also
   bump this, but those always co-bump `schema_version`. A caller
   doing capability detection ("does this tool advertise knob X?")
   checks this.
@@ -236,7 +240,7 @@ distinct bump policies and are NOT substitutes for each other:
   protocol checks this.
 
 Current landmark values (see `src/tools/mod.rs::tests::test_describe_version_landmarks`):
-fasttree=3, bowtie2-align=5, prodigal=4, sortmerna/bowtie2-build/prodigal-train=1.
+fasttree=4, bowtie2-align=6, prodigal=5, sortmerna/bowtie2-build/prodigal-train=2.
 fasttree's history is documented in a CHANGELOG block above its
 `describe()` method. When you intentionally edit a `--describe`
 surface, bump the version in that tool's `describe()` AND update
@@ -341,7 +345,7 @@ advertisement:
    {"name": "bowtie2-align",  "schema_version": 2},
    {"name": "bowtie2-build",  "schema_version": 1},
    {"name": "fasttree",       "schema_version": 2},
-   {"name": "prodigal",       "schema_version": 1},
+   {"name": "prodigal",       "schema_version": 2},
    {"name": "prodigal-train", "schema_version": 1},
    {"name": "sortmerna",      "schema_version": 2}
  ]}
@@ -387,7 +391,7 @@ advertisement:
  "shm_outputs": [{"name": "/gb-1234-0-tree", "label": "tree", "size": 8192}],
  "result": {"n_nodes": 7, "n_leaves": 4, "root": 6}}
 ```
-- `schema_version` — per-tool (FastTree=2, Prodigal=1, SortMeRNA=2,
+- `schema_version` — per-tool (FastTree=2, Prodigal=2, SortMeRNA=2,
   Bowtie2=2, Bowtie2-build=1 as of writing); bumped on breaking
   output-schema changes.
 - `shm_outputs` — omitted when empty. Labels match `[a-z0-9-]+`.
@@ -513,14 +517,21 @@ omission first:
 - `name: Utf8` -- contig identifier
 - `sequence: Utf8` -- nucleotide sequence (different lengths allowed)
 
-**Prodigal output** (written by gpl-boundary to shm_outputs, label "genes"):
-- `seq_name: Utf8` -- source contig identifier
-- `begin: Int32` -- gene start position (1-based)
-- `end: Int32` -- gene end position (1-based)
+**Prodigal output** (schema_version=2): two shm outputs, `genes` then
+`contigs`, written all or none (`arrow_ipc::ShmOutputs`). Values are the
+CLI's (the GFF attributes and `-a` proteins).
+
+Label "genes", one row per gene:
+- `seq_index: Int32` -- the gene's contig, as `contigs.seq_index` (join key)
+- `seq_name: Utf8` -- the gene's contig name
+- `gene_index: Int32` -- 1-based within its contig (the CLI's ID is `<seqnum>_<gene_index>`)
+- `begin: Int32` -- left coordinate (1-based, inclusive)
+- `end: Int32` -- right coordinate (1-based, inclusive)
 - `strand: Int32` -- +1 forward, -1 reverse
 - `partial_left: Boolean` -- gene is partial at left edge
 - `partial_right: Boolean` -- gene is partial at right edge
 - `start_type: Int32` -- 0=ATG, 1=GTG, 2=TTG, 3=Edge
+- `score: Float64` -- cscore + sscore (the CLI's `score=`)
 - `cscore: Float64` -- coding score
 - `sscore: Float64` -- start score
 - `rscore: Float64` -- RBS score
@@ -528,8 +539,24 @@ omission first:
 - `tscore: Float64` -- type score
 - `confidence: Float64` -- gene confidence [50, 100]
 - `gc_cont: Float64` -- per-gene GC content
-- `rbs_motif: Utf8` -- ribosome binding site motif
-- `rbs_spacer: Utf8` -- RBS spacer region
+- `rbs_motif: Utf8` (nullable) -- RBS motif; NULL where the CLI prints "None"
+- `rbs_spacer: Utf8` (nullable) -- RBS spacer; NULL where the CLI prints "None"
+- `protein: Utf8` -- the CLI's `-a` protein, unwrapped (`*` at a stop, no `M`/`*` at a partial end)
+
+Label "contigs", one row per input contig, including contigs with no genes:
+- `seq_index: Int32` -- 1-based position in the batch
+- `seq_name: Utf8` -- contig name
+- `length: Int32` -- contig length (input refused if Prodigal would drop a character, so it is the input's)
+- `gc_content: Float64` -- the contig's GC fraction
+- `translation_table: Int32` -- table the genes were called with (model's or bin's)
+- `uses_sd: Boolean` -- that model or bin scores Shine-Dalgarno motifs
+- `meta_bin: Int32` (nullable) -- metagenomic bin, 0..49; NULL in single-genome mode
+- `model_desc: Utf8` (nullable) -- the bin's description (CLI `model=`); NULL in single-genome mode
+- `n_genes: Int32` -- genes on the contig
+
+The `result` JSON carries `n_genes`, `n_sequences` and, in single-genome
+mode, `model` (`translation_table`, `uses_sd`, `gc_content`,
+`start_weight`), as `prodigal-train` reports it.
 
 **SortMeRNA input** (written by miint to shm_input):
 - `read_id: Utf8` -- sequence identifier

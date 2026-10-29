@@ -195,7 +195,7 @@ pub fn cleanup_all() {
 /// Test-only: report whether `name` is currently in the registry.
 /// Walks the slot pool without locking.
 #[cfg(test)]
-fn is_registered(name: &str) -> bool {
+pub(crate) fn is_registered(name: &str) -> bool {
     let bytes = name.as_bytes();
     for slot in CLEANUP_SLOTS.iter() {
         if slot.state.load(Ordering::Acquire) != STATE_OCCUPIED {
@@ -470,17 +470,19 @@ impl SharedMemory {
         self.owned = false;
     }
 
-    /// Unlink (remove) the shared memory object by name.
+    /// Unlink (remove) the shared memory object by name, then drop the
+    /// name from the cleanup registry: there is nothing left to clean up.
+    /// In that order, so a signal between the two still finds it.
     #[cfg(unix)]
-    #[allow(dead_code)]
     pub fn unlink(name: &str) -> io::Result<()> {
         let c_name = to_cstring(name)?;
-        unsafe {
-            if libc::shm_unlink(c_name.as_ptr()) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        Ok(())
+        let unlinked = if unsafe { libc::shm_unlink(c_name.as_ptr()) } < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        };
+        deregister_cleanup(name);
+        unlinked
     }
 }
 
