@@ -9,7 +9,8 @@ use arrow::record_batch::RecordBatch;
 
 use crate::protocol::Response;
 use crate::tools::{
-    ConfigParam, FieldDescription, GplTool, StreamingContext, ToolDescription, ToolRegistration,
+    ConfigParam, FieldDescription, GplTool, OutputDescription, StreamingContext, ToolDescription,
+    ToolRegistration,
 };
 
 // ---------------------------------------------------------------------------
@@ -543,7 +544,8 @@ impl GplTool for SortMeRnaTool {
             name: "sortmerna",
             version: self.version(),
             schema_version: self.schema_version(),
-            describe_version: 1,
+            // 2: --describe lists the output by label (`outputs`).
+            describe_version: 2,
             description: "rRNA filtering and sequence alignment against reference databases",
             config_params: vec![
                 ConfigParam {
@@ -679,80 +681,83 @@ impl GplTool for SortMeRnaTool {
                     description: "Reverse read for paired-end; absence or all-null = single-end",
                 },
             ],
-            output_schema: vec![
-                FieldDescription {
-                    name: "read_id",
-                    arrow_type: "Utf8",
-                    nullable: false,
-                    description: "Read identifier (from input)",
-                },
-                FieldDescription {
-                    name: "aligned",
-                    arrow_type: "Int32",
-                    nullable: false,
-                    description: "1 if aligned, 0 otherwise",
-                },
-                FieldDescription {
-                    name: "strand",
-                    arrow_type: "Int32",
-                    nullable: true,
-                    description: "1=forward, 0=reverse-complement; NULL if unaligned",
-                },
-                FieldDescription {
-                    name: "ref_name",
-                    arrow_type: "Utf8",
-                    nullable: true,
-                    description: "Reference sequence ID; NULL if unaligned",
-                },
-                FieldDescription {
-                    name: "ref_start",
-                    arrow_type: "Int32",
-                    nullable: true,
-                    description: "1-based start on reference; NULL if unaligned",
-                },
-                FieldDescription {
-                    name: "ref_end",
-                    arrow_type: "Int32",
-                    nullable: true,
-                    description: "1-based end on reference; NULL if unaligned",
-                },
-                FieldDescription {
-                    name: "cigar",
-                    arrow_type: "Utf8",
-                    nullable: true,
-                    description: "CIGAR string; NULL if unaligned",
-                },
-                FieldDescription {
-                    name: "score",
-                    arrow_type: "Int32",
-                    nullable: true,
-                    description: "Smith-Waterman alignment score; NULL if unaligned",
-                },
-                FieldDescription {
-                    name: "e_value",
-                    arrow_type: "Float64",
-                    nullable: false,
-                    description: "E-value of best alignment (0.0 when unaligned)",
-                },
-                FieldDescription {
-                    name: "identity",
-                    arrow_type: "Float64",
-                    nullable: false,
-                    description: "Percent identity (0-100; 0.0 when unaligned)",
-                },
-                FieldDescription {
-                    name: "coverage",
-                    arrow_type: "Float64",
-                    nullable: false,
-                    description: "Query coverage (0-100; 0.0 when unaligned)",
-                },
-                FieldDescription {
-                    name: "edit_distance",
-                    arrow_type: "Int32",
-                    nullable: true,
-                    description: "Edit distance (mismatches + gaps); NULL if unaligned",
-                },
-            ],
+            outputs: vec![OutputDescription {
+                label: "alignments",
+                schema: &[
+                    FieldDescription {
+                        name: "read_id",
+                        arrow_type: "Utf8",
+                        nullable: false,
+                        description: "Read identifier (from input)",
+                    },
+                    FieldDescription {
+                        name: "aligned",
+                        arrow_type: "Int32",
+                        nullable: false,
+                        description: "1 if aligned, 0 otherwise",
+                    },
+                    FieldDescription {
+                        name: "strand",
+                        arrow_type: "Int32",
+                        nullable: true,
+                        description: "1=forward, 0=reverse-complement; NULL if unaligned",
+                    },
+                    FieldDescription {
+                        name: "ref_name",
+                        arrow_type: "Utf8",
+                        nullable: true,
+                        description: "Reference sequence ID; NULL if unaligned",
+                    },
+                    FieldDescription {
+                        name: "ref_start",
+                        arrow_type: "Int32",
+                        nullable: true,
+                        description: "1-based start on reference; NULL if unaligned",
+                    },
+                    FieldDescription {
+                        name: "ref_end",
+                        arrow_type: "Int32",
+                        nullable: true,
+                        description: "1-based end on reference; NULL if unaligned",
+                    },
+                    FieldDescription {
+                        name: "cigar",
+                        arrow_type: "Utf8",
+                        nullable: true,
+                        description: "CIGAR string; NULL if unaligned",
+                    },
+                    FieldDescription {
+                        name: "score",
+                        arrow_type: "Int32",
+                        nullable: true,
+                        description: "Smith-Waterman alignment score; NULL if unaligned",
+                    },
+                    FieldDescription {
+                        name: "e_value",
+                        arrow_type: "Float64",
+                        nullable: false,
+                        description: "E-value of best alignment (0.0 when unaligned)",
+                    },
+                    FieldDescription {
+                        name: "identity",
+                        arrow_type: "Float64",
+                        nullable: false,
+                        description: "Percent identity (0-100; 0.0 when unaligned)",
+                    },
+                    FieldDescription {
+                        name: "coverage",
+                        arrow_type: "Float64",
+                        nullable: false,
+                        description: "Query coverage (0-100; 0.0 when unaligned)",
+                    },
+                    FieldDescription {
+                        name: "edit_distance",
+                        arrow_type: "Int32",
+                        nullable: true,
+                        description: "Edit distance (mismatches + gaps); NULL if unaligned",
+                    },
+                ],
+            }],
             response_metadata: vec![
                 FieldDescription {
                     name: "total_reads",

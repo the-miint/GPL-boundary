@@ -216,7 +216,8 @@ impl GplTool for Bowtie2BuildTool {
             name: "bowtie2-build",
             version: self.version(),
             schema_version: self.schema_version(),
-            describe_version: 1,
+            // 2: --describe's `outputs` replaces `output_schema` (none here).
+            describe_version: 2,
             description: "Build a bowtie2 index from in-memory FASTA-style sequences",
             config_params: vec![
                 ConfigParam {
@@ -277,7 +278,7 @@ impl GplTool for Bowtie2BuildTool {
                 },
             ],
             // bowtie2-build emits index files on disk, not Arrow output.
-            output_schema: vec![],
+            outputs: vec![],
             response_metadata: vec![
                 FieldDescription {
                     name: "elapsed_ms",
@@ -501,7 +502,7 @@ mod tests {
                 "describe() missing config param '{required}'"
             );
         }
-        assert!(desc.output_schema.is_empty(), "build emits no Arrow output");
+        assert!(desc.outputs.is_empty(), "build emits no Arrow output");
     }
 
     #[test]

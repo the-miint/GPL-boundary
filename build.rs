@@ -199,7 +199,6 @@ fn build_prodigal() {
     let dir = PathBuf::from("ext/prodigal");
 
     cc::Build::new()
-        .file(dir.join("bitmap.c"))
         .file(dir.join("dprog.c"))
         .file(dir.join("gene.c"))
         .file(dir.join("metagenomic.c"))
@@ -210,30 +209,19 @@ fn build_prodigal() {
         .include(&dir)
         .define("PRODIGAL_NO_MAIN", None)
         .flag("-fvisibility=hidden")
+        // As the fork's Makefile: without it aarch64 fuses multiply-adds and
+        // prints some scores differently from x86-64 in the last digit.
+        .flag("-ffp-contract=off")
+        // -O3 alone, as the fork's Makefile: -funroll-loops (with
+        // -finline-functions, FastTree's flags, copied here once) made
+        // metagenomic mode 46% slower (E. coli 12.4 s → 18.1 s, the same
+        // output; -finline-functions alone changes nothing at -O3).
         .opt_level(3)
-        .flag_if_supported("-finline-functions")
-        .flag_if_supported("-funroll-loops")
         .warnings(false)
         .compile("prodigal_c");
 
-    println!("cargo:rerun-if-changed=ext/prodigal/bitmap.c");
-    println!("cargo:rerun-if-changed=ext/prodigal/dprog.c");
-    println!("cargo:rerun-if-changed=ext/prodigal/gene.c");
-    println!("cargo:rerun-if-changed=ext/prodigal/metagenomic.c");
-    println!("cargo:rerun-if-changed=ext/prodigal/node.c");
-    println!("cargo:rerun-if-changed=ext/prodigal/sequence.c");
-    println!("cargo:rerun-if-changed=ext/prodigal/training.c");
-    println!("cargo:rerun-if-changed=ext/prodigal/prodigal_api.c");
-    println!("cargo:rerun-if-changed=ext/prodigal/prodigal.h");
-    println!("cargo:rerun-if-changed=ext/prodigal/prodigal_internal.h");
-    println!("cargo:rerun-if-changed=ext/prodigal/bitmap.h");
-    println!("cargo:rerun-if-changed=ext/prodigal/dprog.h");
-    println!("cargo:rerun-if-changed=ext/prodigal/fptr.h");
-    println!("cargo:rerun-if-changed=ext/prodigal/gene.h");
-    println!("cargo:rerun-if-changed=ext/prodigal/metagenomic.h");
-    println!("cargo:rerun-if-changed=ext/prodigal/node.h");
-    println!("cargo:rerun-if-changed=ext/prodigal/sequence.h");
-    println!("cargo:rerun-if-changed=ext/prodigal/training.h");
+    // The whole submodule, so a source added or removed upstream is seen
+    println!("cargo:rerun-if-changed=ext/prodigal");
 }
 
 /// Compile SortMeRNA C and C++ sources into static libraries.

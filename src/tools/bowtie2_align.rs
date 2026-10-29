@@ -12,7 +12,8 @@ use arrow::record_batch::RecordBatch;
 
 use crate::protocol::Response;
 use crate::tools::{
-    ConfigParam, FieldDescription, GplTool, StreamingContext, ToolDescription, ToolRegistration,
+    ConfigParam, FieldDescription, GplTool, OutputDescription, StreamingContext, ToolDescription,
+    ToolRegistration,
 };
 
 // ---------------------------------------------------------------------------
@@ -1256,7 +1257,8 @@ impl GplTool for Bowtie2AlignTool {
             // (default true), reversing its prior implicit-only status. Lets a
             // diagnostic run toggle mmap to contrast the page-fault/RSS profile.
             // schema_version unchanged throughout — no output columns affected.
-            describe_version: 5,
+            // v6: --describe lists the output by label (`outputs`).
+            describe_version: 6,
             description: "Short read alignment against a bowtie2 index",
             config_params: vec![
                 // Core
@@ -1286,7 +1288,7 @@ impl GplTool for Bowtie2AlignTool {
                     param_type: "string",
                     default: serde_json::json!("sensitive"),
                     description: "Alignment preset (sensitivity/speed tradeoff)",
-                    allowed_values: vec![
+                    allowed_values: [
                         "very-fast",
                         "fast",
                         "sensitive",
@@ -1295,7 +1297,9 @@ impl GplTool for Bowtie2AlignTool {
                         "fast-local",
                         "sensitive-local",
                         "very-sensitive-local",
-                    ],
+                    ]
+                    .map(Into::into)
+                    .to_vec(),
                 },
                 ConfigParam {
                     name: "local_align",
@@ -1421,7 +1425,7 @@ impl GplTool for Bowtie2AlignTool {
                     param_type: "string",
                     default: serde_json::json!("fr"),
                     description: "Expected mate pair orientation",
-                    allowed_values: vec!["fr", "rf", "ff"],
+                    allowed_values: ["fr", "rf", "ff"].map(Into::into).to_vec(),
                 },
                 ConfigParam {
                     name: "no_mixed",
@@ -1628,7 +1632,9 @@ impl GplTool for Bowtie2AlignTool {
                     description: "Mate 2 quality string; null = FASTA",
                 },
             ],
-            output_schema: vec![
+            outputs: vec![OutputDescription {
+                label: "alignments",
+                schema: &[
                 FieldDescription {
                     name: "read_id",
                     arrow_type: "Utf8",
@@ -1763,6 +1769,7 @@ impl GplTool for Bowtie2AlignTool {
                                   with HTSlib-derived schemas.",
                 },
             ],
+            }],
             response_metadata: vec![
                 FieldDescription {
                     name: "n_reads",
@@ -3311,10 +3318,10 @@ CGATCATGCATGCAGGTACGATCAGACAGGCTAGCATCGATCAGC";
         assert_eq!(desc.schema_version, 2);
 
         assert_eq!(desc.input_schema.len(), 5);
-        assert_eq!(desc.output_schema.len(), 21);
+        assert_eq!(desc.outputs[0].schema.len(), 21);
 
         // Spot-check the v0.3-derived columns are advertised.
-        let output_names: Vec<&str> = desc.output_schema.iter().map(|f| f.name).collect();
+        let output_names: Vec<&str> = desc.outputs[0].schema.iter().map(|f| f.name).collect();
         for n in [
             "stop_position",
             "tag_ys",

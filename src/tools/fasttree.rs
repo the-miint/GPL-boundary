@@ -2,7 +2,9 @@
 //! writes SOA tree as Arrow IPC back to shared memory.
 
 use crate::protocol::{Response, ShmOutput};
-use crate::tools::{ConfigParam, FieldDescription, GplTool, ToolDescription};
+use crate::tools::{
+    checked_cint, ConfigParam, FieldDescription, GplTool, OutputDescription, ToolDescription,
+};
 use arrow::array::{
     BooleanArray, Float64Builder, Int32Array, Int64Array, Int64Builder, StringArray,
 };
@@ -154,23 +156,6 @@ fn output_schema() -> Schema {
 }
 
 // --- JSON config decoder ---
-
-/// Convert a JSON-decoded `i64` into the `c_int` width the C library
-/// expects, with a positive overflow guard. Negative-value range checks
-/// remain per-knob (some knobs accept 0 as "auto sentinel", others
-/// require strictly positive).
-fn checked_cint(name: &str, v: i64) -> Result<c_int, String> {
-    if v > c_int::MAX as i64 {
-        return Err(format!(
-            "{name}={v} exceeds C int range (max {})",
-            c_int::MAX
-        ));
-    }
-    if v < c_int::MIN as i64 {
-        return Err(format!("{name}={v} below C int range (min {})", c_int::MIN));
-    }
-    Ok(v as c_int)
-}
 
 /// Apply gpl-boundary's JSON config knobs onto an already-`fasttree_config_init`'d
 /// `FastTreeConfig`. Validates mutually-exclusive combinations at the
@@ -681,12 +666,13 @@ impl GplTool for FastTreeTool {
     /// - 3: Phase 3 — model, gtrrates, gtrfreq, slow, bionj, nj,
     ///   top, notop, topm, quote, fastest (rejected when true),
     ///   gamma.
+    /// - 4: the output listed by label (`outputs`).
     fn describe(&self) -> ToolDescription {
         ToolDescription {
             name: "fasttree",
             version: self.version(),
             schema_version: self.schema_version(),
-            describe_version: 3,
+            describe_version: 4,
             description:
                 "Approximately-maximum-likelihood phylogenetic trees from sequence alignments",
             config_params: vec![
@@ -695,7 +681,7 @@ impl GplTool for FastTreeTool {
                     param_type: "string",
                     default: serde_json::json!("auto"),
                     description: "Sequence type: auto-detect, nucleotide, or protein",
-                    allowed_values: vec!["auto", "nucleotide", "protein"],
+                    allowed_values: ["auto", "nucleotide", "protein"].map(Into::into).to_vec(),
                 },
                 ConfigParam {
                     name: "seed",
@@ -800,7 +786,9 @@ impl GplTool for FastTreeTool {
                     param_type: "string",
                     default: serde_json::json!("auto"),
                     description: "Substitution model. auto = JTT for protein, JC for nucleotide. jtt/lg/wag are protein-only; jc/gtr are nucleotide-only — the JSON adapter rejects mismatched seq_type up front.",
-                    allowed_values: vec!["auto", "jtt", "lg", "wag", "jc", "gtr"],
+                    allowed_values: ["auto", "jtt", "lg", "wag", "jc", "gtr"]
+                        .map(Into::into)
+                        .to_vec(),
                 },
                 ConfigParam {
                     name: "gtrrates",
@@ -894,7 +882,9 @@ impl GplTool for FastTreeTool {
                     description: "Aligned sequence (all must be equal length)",
                 },
             ],
-            output_schema: vec![
+            outputs: vec![OutputDescription {
+                label: "tree",
+                schema: &[
                 FieldDescription {
                     name: "node_index",
                     arrow_type: "Int64",
@@ -945,6 +935,7 @@ impl GplTool for FastTreeTool {
                     description: "Tip name (NULL for internal nodes)",
                 },
             ],
+            }],
             response_metadata: vec![
                 FieldDescription {
                     name: "n_nodes",

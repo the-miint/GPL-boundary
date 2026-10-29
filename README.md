@@ -75,7 +75,8 @@ the build, run `cargo test` or `make check`.
 | Tool | License | Description | Streaming |
 |------|---------|-------------|-----------|
 | [FastTree](https://github.com/the-miint/fasttree) | GPL-2.0+ | Approximately-maximum-likelihood phylogenetic trees | no |
-| [Prodigal](https://github.com/the-miint/prodigal) | GPL-3.0 | Prokaryotic gene prediction | metagenomic mode only |
+| [Prodigal](https://github.com/the-miint/prodigal) | GPL-3.0 | Prokaryotic gene prediction: genes with their proteins, and per-contig model data; metagenomic or single-genome mode | yes |
+| [Prodigal (train)](https://github.com/the-miint/prodigal) | GPL-3.0 | Train a single-genome model on a whole genome and write it (the CLI's `-t` format) for `prodigal` | no |
 | [SortMeRNA](https://github.com/the-miint/sortmerna) | LGPL-3.0 | rRNA filtering and sequence alignment | yes |
 | [Bowtie2 (align)](https://github.com/the-miint/bowtie2) | GPL-3.0 | Short read aligner; requires `.bt2` index (built in process or via `bowtie2-build`) | yes |
 | [Bowtie2 (build)](https://github.com/the-miint/bowtie2) | GPL-3.0 | Build a `.bt2` index from in-memory FASTA-style sequences | no |
@@ -110,6 +111,7 @@ gpl-boundary --list-tools
 # Full tool description (config params, Arrow schemas, response metadata)
 gpl-boundary --describe fasttree
 gpl-boundary --describe prodigal
+gpl-boundary --describe prodigal-train
 gpl-boundary --describe sortmerna
 gpl-boundary --describe bowtie2-align
 gpl-boundary --describe bowtie2-build
@@ -126,8 +128,9 @@ handshake, a batch request, or a `shutdown` sentinel.
 ```jsonc
 // 1. Init handshake (required first line)
 {"init": {"idle_timeout_ms": 60000}}
-// gpl-boundary replies:
-{"success": true, "protocol_version": 1}
+// gpl-boundary replies with the protocol version and each tool's
+// schema_version (see CLAUDE.md, "Protocol"):
+{"success": true, "protocol_version": 3, "tools": [{"name": "fasttree", "schema_version": 2}, ...]}
 
 // 2. One or more batch requests — each carries its own (tool, config)
 {"tool": "fasttree",
@@ -154,8 +157,8 @@ schema changes. Both let consumers detect drift without parsing the data.
 The dispatcher routes batches by `(tool, canonical_config)` fingerprint:
 distinct fingerprints get distinct workers and run in parallel. Tools
 with expensive setup (bowtie2 index loading, sortmerna reference
-indexing, prodigal metagenomic init) reuse a long-lived context across
-batches in the session.
+indexing, prodigal's metagenomic bins or single-genome model) reuse a
+long-lived context across batches in the session.
 
 ### Worker routing and eviction
 

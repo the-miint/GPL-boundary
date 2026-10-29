@@ -18,10 +18,11 @@ use std::os::raw::{c_char, c_int};
 ///
 /// This is deliberately NOT the C **API** version (`BT2_API_VERSION_*` in
 /// `bt2_api.h`, currently 0.3.0) nor a per-tool `schema_version`. `version()`
-/// reports the upstream tool version, matching `FASTTREE_VERSION` /
-/// `PRODIGAL_VERSION`. The bowtie2 C API exposes no runtime version accessor
-/// (unlike sortmerna's `smr_version()`), so this is a manual constant; if the
-/// submodule ever adds a `bt2_version()` symbol, prefer querying it at runtime.
+/// reports the upstream tool version, matching `FASTTREE_VERSION`. The bowtie2
+/// C API exposes no runtime version accessor (unlike sortmerna's
+/// `smr_version()` and prodigal's `prodigal_version_string()`), so this is a
+/// manual constant; if the submodule ever adds a `bt2_version()` symbol,
+/// prefer querying it at runtime.
 pub const BOWTIE2_VERSION: &str = "2.5.5";
 
 /// Success return code shared by every bt2_*_run function.

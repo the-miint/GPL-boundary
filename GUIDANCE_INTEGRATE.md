@@ -57,9 +57,11 @@ fn build_newtool() {
         .include(&dir)
         .define("NEWTOOL_NO_MAIN", None)
         .flag("-fvisibility=hidden")
+        // The submodule's own release-build flags (its Makefile's, or
+        // CMake Release's), nothing else: extra optimisation flags can cost
+        // (-funroll-loops made Prodigal 46% slower) and FP flags can change
+        // results
         .opt_level(3)
-        .flag_if_supported("-finline-functions")
-        .flag_if_supported("-funroll-loops")
         .warnings(false);
 
     // C++ builds also need -fvisibility-inlines-hidden
@@ -152,33 +154,42 @@ const NEWTOOL_VERSION: &str = "1.0.0";
 
 ### 3b. Arrow schema definitions
 
-Define the input schema (what the tool expects from miint) and the output
-schema (what the tool produces as Arrow IPC).
+Define the input schema (what the tool expects from miint) and each
+output's schema (what the tool produces as Arrow IPC) once, as
+`FieldDescription`s: `--describe` reports them, and
+`crate::tools::arrow_schema` builds the Arrow `Schema` from the same list,
+so the two can't drift. `src/tools/prodigal.rs` does this; the older
+adapters still write their Arrow schemas by hand.
 
 ```rust
-pub fn input_schema() -> Schema {
-    Schema::new(vec![
-        Field::new("name", DataType::Utf8, false),
-        Field::new("value", DataType::Float64, false),
-    ])
-}
+use crate::tools::{arrow_schema, FieldDescription, OutputDescription};
 
-fn output_schema() -> Schema {
-    Schema::new(vec![
+const INPUT_FIELDS: &[FieldDescription] = &[
+    FieldDescription::new("name", "Utf8", false, "Item identifier"),
+    FieldDescription::new("value", "Float64", false, "Item value"),
+];
+
+const RESULTS: OutputDescription = OutputDescription {
+    label: "results",
+    schema: &[
         // Index columns: prefer Int64 for any column that could plausibly
         // exceed 2³¹ — node indices, alignment positions, etc. Int32 is
         // fine only for small bounded counts (children counts, flags).
-        Field::new("id", DataType::Int64, false),
+        FieldDescription::new("id", "Int64", false, "Item index"),
         // Optional / "absent" values: use nullable columns rather than
         // sentinel values like -1 or 0. Translate the C library's
         // sentinel (documented in its header) to Arrow NULL on emission.
         // See FastTree v2 (`branch_length`, `support`) and SortMeRNA v2
         // (alignment-only columns gated on `aligned == 0`) for examples.
-        Field::new("score", DataType::Float64, true),
-        Field::new("name", DataType::Utf8, true),
-    ])
-}
+        FieldDescription::new("score", "Float64", true, "Score; NULL if none"),
+        FieldDescription::new("name", "Utf8", true, "Name; NULL if none"),
+    ],
+};
 ```
+
+`arrow_schema(RESULTS.schema)?` is the output's Arrow `Schema`; a type
+that isn't Arrow's `DataType` notation (`"Int32"`, `"Utf8"`, ...) is an
+error. A test can build the input's the same way.
 
 ### 3c. Tool struct and registration
 
@@ -213,6 +224,9 @@ impl GplTool for NewTool {
             name: "newtool",
             version: self.version(),
             schema_version: self.schema_version(),
+            // Bump on any change to this description's surface, and update
+            // the landmark test in src/tools/mod.rs
+            describe_version: 1,
             description: "One-line description of what this tool does",
             config_params: vec![
                 ConfigParam {
@@ -224,13 +238,19 @@ impl GplTool for NewTool {
                 },
                 // ... all config params
             ],
-            input_schema: vec![/* FieldDescription for each input column */],
-            output_schema: vec![/* FieldDescription for each output column */],
+            input_schema: INPUT_FIELDS.to_vec(),
+            // One per shm output, in the order the response lists them
+            outputs: vec![RESULTS],
             response_metadata: vec![/* FieldDescription for JSON result fields */],
         }
     }
 
-    fn execute(&self, config: &serde_json::Value, shm_input: &str) -> Response {
+    fn execute(
+        &self,
+        config: &serde_json::Value,
+        shm_input: &str,
+        shm_input_size: usize,
+    ) -> Response {
         // See below
     }
 }
@@ -238,16 +258,23 @@ impl GplTool for NewTool {
 
 **`execute()` follows this pattern:**
 
-1. Read Arrow input: `crate::arrow_ipc::read_batches_from_shm(shm_input)?`
+1. Read Arrow input: `crate::arrow_ipc::read_batches_from_shm(shm_input, shm_input_size)?`
+   (the size comes from the request; `fstat` is not used)
 2. Extract columns, validate, convert to C types (`Vec<CString>` etc.)
-3. Initialize C config via FFI: `zeroed()` + `config_init()` + apply JSON
-   config values
+3. Initialize C config via FFI: `zeroed()` + `config_init()`, then apply
+   the JSON strictly: `config_knobs_known(config, &params)` refuses a knob
+   `--describe` doesn't list, and `config_bool`/`config_str`/`config_f64`/
+   `config_cint` (all in `crate::tools`) refuse a wrong JSON type or an
+   integer outside C int, naming the knob, and take null as the default
 4. Create context: `newtool_create(&config)`, check for null
 5. Call the computation: `newtool_run(ctx, ...)`
 6. On error: `strerror(rc)` + `last_error(ctx)` → `Response::error(...)`,
    then `destroy(ctx)`
-7. On success: convert SOA output → Arrow `RecordBatch` using `output_schema()`
-8. Write output: `crate::arrow_ipc::write_batch_to_output_shm(&batch, "label")`
+7. On success: convert SOA output → Arrow `RecordBatch` using
+   `arrow_schema(RESULTS.schema)`
+8. Write output: `crate::arrow_ipc::write_batch_to_output_shm(&batch, RESULTS.label)`
+   as the last fallible step; with several outputs, or work after the
+   write, use `crate::arrow_ipc::ShmOutputs` (all or none)
 9. Free C output + destroy context
 10. Return `Response::ok(result_json, vec![shm_output])`
 
@@ -260,9 +287,16 @@ Write an `unsafe` helper that wraps each C array into an Arrow column:
 
 ```rust
 unsafe fn soa_to_record_batch(output: &NewToolOutput) -> Result<RecordBatch, String> {
-    let n = output.n_items as usize;
+    let schema = Arc::new(arrow_schema(RESULTS.schema)?);
+    // A negative count is an error, not a huge slice
+    let n = usize::try_from(output.n_items)
+        .map_err(|_| format!("the library returned {} items", output.n_items))?;
+    // With no items the arrays may be NULL, which from_raw_parts must not get
+    if n == 0 {
+        return Ok(RecordBatch::new_empty(schema));
+    }
 
-    let ids = std::slice::from_raw_parts(output.id, n);
+    let ids = std::slice::from_raw_parts(output.id, n); // int64_t *
     let scores = std::slice::from_raw_parts(output.score, n);
     let name_ptrs = std::slice::from_raw_parts(output.name, n);
 
@@ -271,9 +305,8 @@ unsafe fn soa_to_record_batch(output: &NewToolOutput) -> Result<RecordBatch, Str
         else { Some(CStr::from_ptr(p).to_string_lossy().into_owned()) }
     }).collect();
 
-    let schema = Arc::new(output_schema());
     RecordBatch::try_new(schema, vec![
-        Arc::new(Int32Array::from(ids.to_vec())),
+        Arc::new(Int64Array::from(ids.to_vec())),
         Arc::new(Float64Array::from(scores.to_vec())),
         Arc::new(StringArray::from(
             names.iter().map(|n| n.as_deref()).collect::<Vec<Option<&str>>>()
@@ -293,22 +326,23 @@ Three required tests in a `#[cfg(test)] mod tests` block:
 fn test_newtool_roundtrip() {
     let input_name = unique_shm_name("nt-in");
     let batch = make_input_batch(/* test data */);
-    let _input_shm = write_arrow_to_shm(&input_name, &batch);
+    let input_shm = write_arrow_to_shm(&input_name, &batch);
 
     let tool = NewTool;
     let config = serde_json::json!({ "seed": 42 });
-    let response = tool.execute(&config, &input_name);
+    let response = tool.execute(&config, &input_name, input_shm.len());
 
     assert!(response.success, "Failed: {:?}", response.error);
     assert_eq!(response.shm_outputs.len(), 1);
     assert!(response.shm_outputs[0].name.starts_with("/gb-"));
-    assert_eq!(response.shm_outputs[0].label, "your-label");
+    assert_eq!(response.shm_outputs[0].label, RESULTS.label);
     assert!(response.shm_outputs[0].size > 0);
 
     let result = response.result.unwrap();
     // ... assert expected metadata fields ...
 
-    let out_batches = read_arrow_from_shm(&response.shm_outputs[0].name);
+    let out = &response.shm_outputs[0];
+    let out_batches = read_arrow_from_shm(&out.name, out.size);
     assert_eq!(out_batches.len(), 1);
     // ... assert schema, row count, column values ...
 
@@ -316,7 +350,7 @@ fn test_newtool_roundtrip() {
 }
 ```
 
-Key: keep `_input_shm` alive until after `execute()` returns.
+Key: keep `input_shm` alive until after `execute()` returns.
 
 **2. Bad shm name:**
 
@@ -325,7 +359,7 @@ Key: keep `_input_shm` alive until after `execute()` returns.
 fn test_newtool_bad_input_shm() {
     let tool = NewTool;
     let config = serde_json::json!({});
-    let response = tool.execute(&config, "/nonexistent-shm-name");
+    let response = tool.execute(&config, "/nonexistent-shm-name", 0);
     assert!(!response.success);
     assert!(response.error.unwrap().contains("Failed to open shm"));
 }
@@ -388,11 +422,14 @@ FastTree) do not need streaming.
 
 ### What to implement
 
-1. A `<Tool>StreamingContext` struct holding the C context pointer and any
-   session-lived state. Implement `Drop` to call the C `destroy()` function.
+1. A `<Tool>StreamingContext` type holding the session's state: usually
+   the C context pointer, whose owner's `Drop` calls the C `destroy()`
+   function.
 2. Override `create_streaming_context()` on the `GplTool` impl. Parse config,
-   call C `create()`, return the context. Validate streaming is supported
-   (e.g., prodigal only supports streaming in meta mode).
+   call C `create()`, return the context. A config whose batches can't
+   share one context still gets a context that does the per-batch work
+   (e.g., prodigal's `train_on_batch` trains a fresh one on each batch), so
+   execute() and the session run the same code.
 3. Implement `StreamingContext::run_batch()`. Read input from shm, call C
    `run()`, convert output, write to output shm, return Response.
 
@@ -409,15 +446,15 @@ fn test_newtool_streaming_two_batches() {
 
     // Batch 1
     let input1 = unique_shm_name("nt-str-1");
-    let _shm1 = write_arrow_to_shm(&input1, &make_input_batch(/* data */));
-    let resp1 = ctx.run_batch(&input1);
+    let shm1 = write_arrow_to_shm(&input1, &make_input_batch(/* data */));
+    let resp1 = ctx.run_batch(&input1, shm1.len());
     assert!(resp1.success, "Batch 1 failed: {:?}", resp1.error);
     let _ = SharedMemory::unlink(&resp1.shm_outputs[0].name);
 
     // Batch 2
     let input2 = unique_shm_name("nt-str-2");
-    let _shm2 = write_arrow_to_shm(&input2, &make_input_batch(/* data */));
-    let resp2 = ctx.run_batch(&input2);
+    let shm2 = write_arrow_to_shm(&input2, &make_input_batch(/* data */));
+    let resp2 = ctx.run_batch(&input2, shm2.len());
     assert!(resp2.success, "Batch 2 failed: {:?}", resp2.error);
     let _ = SharedMemory::unlink(&resp2.shm_outputs[0].name);
 }
@@ -603,7 +640,7 @@ change. List every `.c` and `.h` file used by the build.
 
 In tests, the `SharedMemory` returned by `write_arrow_to_shm` unlinks the
 segment on drop. If you don't bind it to a variable (or bind it to `_`
-instead of `_input_shm`), the segment is unlinked immediately and the tool
+instead of `input_shm`), the segment is unlinked immediately and the tool
 gets a "Failed to open shm" error.
 
 ### Not cleaning up output shm in tests

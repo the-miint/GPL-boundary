@@ -22,11 +22,11 @@ spawns it as a long-lived daemon (one per DuckDB instance).
 - **WASM is a future goal**, not currently targeted
 
 **Batched streaming**: Tools with expensive context creation (bowtie2: index
-loading, sortmerna: reference indexing, prodigal: metagenomic bin
-initialization) support batched streaming. The `StreamingContext` trait
-provides `run_batch()` for per-batch work against a pre-loaded context.
-Single-genome prodigal does NOT support streaming (requires all sequences for
-training).
+loading, sortmerna: reference indexing, prodigal: metagenomic bins or a
+single-genome model) support batched streaming. The `StreamingContext`
+trait provides `run_batch()` for per-batch work against a pre-loaded
+context. Single-genome prodigal needs a model route (`training_path` or
+`train_on_batch`: see "Prodigal config knobs").
 
 **Per-fingerprint dispatch**: every batch carries its own `(tool, config)`
 pair. The coordinator computes a canonical-config fingerprint and routes to
@@ -151,7 +151,10 @@ Each tool gets:
 
 Use `arrow_ipc::write_batch_to_output_shm()` and
 `arrow_ipc::read_batches_from_shm()` for Arrow IPC marshaling -- do not
-duplicate this logic in tool modules.
+duplicate this logic in tool modules. A tool with several outputs, or a
+fallible step after a write, writes through `arrow_ipc::ShmOutputs`, which
+unlinks what it wrote unless the response takes the segments
+(`into_vec`), so a failed batch leaves none behind.
 
 We do not exhaustively test submodules; that is their own CI's job.
 
@@ -184,6 +187,7 @@ src/
     mod.rs           # GplTool trait, ToolRegistration, StreamingContext trait, inventory-based dispatch
     fasttree.rs      # FastTree FFI bindings + GplTool impl + tests
     prodigal.rs      # Prodigal FFI bindings + GplTool impl + tests
+    prodigal_train.rs # prodigal-train: writes a single-genome model (uses prodigal.rs's FFI)
     sortmerna.rs     # SortMeRNA FFI bindings + GplTool impl + tests
     bowtie2_align.rs # Bowtie2 aligner FFI bindings + GplTool impl + tests
     bowtie2_build.rs # Bowtie2 index builder FFI bindings + GplTool impl + tests
@@ -205,8 +209,9 @@ The binary supports introspection flags (no stdin required):
 
 - `gpl-boundary --version` -- JSON with gpl-boundary version + all tool versions
 - `gpl-boundary --list-tools` -- JSON array of available tool names
-- `gpl-boundary --describe fasttree` -- JSON with config params, input/output
-  Arrow schemas, response metadata fields
+- `gpl-boundary --describe fasttree` -- JSON with config params, the input
+  Arrow schema, each output's label and Arrow schema (`outputs`), response
+  metadata fields
 
 These let miint programmatically discover capabilities without hardcoding.
 
@@ -222,7 +227,7 @@ distinct bump policies and are NOT substitutes for each other:
 - `describe_version` — `--describe` introspection surface. Bumped on
   any change to `config_params` (add/rename/remove, type/default/
   allowed-values edit) or `response_metadata` (documentation-only,
-  does not affect Arrow). `input_schema` / `output_schema` edits also
+  does not affect Arrow). `input_schema` / `outputs` edits also
   bump this, but those always co-bump `schema_version`. A caller
   doing capability detection ("does this tool advertise knob X?")
   checks this.
@@ -232,7 +237,7 @@ distinct bump policies and are NOT substitutes for each other:
   protocol checks this.
 
 Current landmark values (see `src/tools/mod.rs::tests::test_describe_version_landmarks`):
-fasttree=3, bowtie2-align=5, prodigal/sortmerna/bowtie2-build=1.
+fasttree=4, bowtie2-align=6, prodigal=5, sortmerna/bowtie2-build/prodigal-train=2.
 fasttree's history is documented in a CHANGELOG block above its
 `describe()` method. When you intentionally edit a `--describe`
 surface, bump the version in that tool's `describe()` AND update
@@ -271,6 +276,10 @@ thread.
   Structs must match C headers exactly. Each config struct must have an ABI
   size-check test. Size checks catch added/removed fields but not reordering;
   manual review against the C header is still required when fields change.
+  Prodigal's mirrors go further: `test_abi_layout_matches_c` compares every
+  field's offset and size with the library's `prodigal_abi_layout()`, which
+  catches reordering too, but not a wrong type of the same size: review the
+  types against the header.
 - **Error handling**: tools return `Response::error(msg)`. Never panic across
   FFI.
 - **Tool registration**: tools self-register via `inventory::submit!`. No
@@ -333,7 +342,8 @@ advertisement:
    {"name": "bowtie2-align",  "schema_version": 2},
    {"name": "bowtie2-build",  "schema_version": 1},
    {"name": "fasttree",       "schema_version": 2},
-   {"name": "prodigal",       "schema_version": 1},
+   {"name": "prodigal",       "schema_version": 2},
+   {"name": "prodigal-train", "schema_version": 1},
    {"name": "sortmerna",      "schema_version": 2}
  ]}
 ```
@@ -378,9 +388,9 @@ advertisement:
  "shm_outputs": [{"name": "/gb-1234-0-tree", "label": "tree", "size": 8192}],
  "result": {"n_nodes": 7, "n_leaves": 4, "root": 6}}
 ```
-- `schema_version` — per-tool (FastTree=2, Prodigal=1, SortMeRNA=2,
-  Bowtie2=2, Bowtie2-build=1 as of writing); bumped on breaking
-  output-schema changes.
+- `schema_version` — per-tool (FastTree=2, Prodigal=2, SortMeRNA=2,
+  Bowtie2=2, Bowtie2-build=1, Prodigal-train=1 as of writing); bumped on
+  breaking output-schema changes.
 - `shm_outputs` — omitted when empty. Labels match `[a-z0-9-]+`.
 - `result` — lightweight metadata; bulk data always travels in
   `shm_outputs`.
@@ -504,14 +514,21 @@ omission first:
 - `name: Utf8` -- contig identifier
 - `sequence: Utf8` -- nucleotide sequence (different lengths allowed)
 
-**Prodigal output** (written by gpl-boundary to shm_outputs, label "genes"):
-- `seq_name: Utf8` -- source contig identifier
-- `begin: Int32` -- gene start position (1-based)
-- `end: Int32` -- gene end position (1-based)
+**Prodigal output** (schema_version=2): two shm outputs, `genes` then
+`contigs`, written all or none (`arrow_ipc::ShmOutputs`). Values are the
+CLI's (the GFF attributes and `-a` proteins).
+
+Label "genes", one row per gene:
+- `seq_index: Int32` -- the gene's contig, as `contigs.seq_index` (join key)
+- `seq_name: Utf8` -- the gene's contig name
+- `gene_index: Int32` -- 1-based within its contig (the CLI's ID is `<seqnum>_<gene_index>`)
+- `begin: Int32` -- left coordinate (1-based, inclusive)
+- `end: Int32` -- right coordinate (1-based, inclusive)
 - `strand: Int32` -- +1 forward, -1 reverse
 - `partial_left: Boolean` -- gene is partial at left edge
 - `partial_right: Boolean` -- gene is partial at right edge
 - `start_type: Int32` -- 0=ATG, 1=GTG, 2=TTG, 3=Edge
+- `score: Float64` -- cscore + sscore (the CLI's `score=`)
 - `cscore: Float64` -- coding score
 - `sscore: Float64` -- start score
 - `rscore: Float64` -- RBS score
@@ -519,8 +536,61 @@ omission first:
 - `tscore: Float64` -- type score
 - `confidence: Float64` -- gene confidence [50, 100]
 - `gc_cont: Float64` -- per-gene GC content
-- `rbs_motif: Utf8` -- ribosome binding site motif
-- `rbs_spacer: Utf8` -- RBS spacer region
+- `rbs_motif: Utf8` (nullable) -- RBS motif; NULL where the CLI prints "None"
+- `rbs_spacer: Utf8` (nullable) -- RBS spacer; NULL where the CLI prints "None"
+- `protein: Utf8` -- the CLI's `-a` protein, unwrapped (`*` at a stop, no `M`/`*` at a partial end)
+
+Label "contigs", one row per input contig, including contigs with no genes:
+- `seq_index: Int32` -- 1-based position in the batch
+- `seq_name: Utf8` -- contig name
+- `length: Int32` -- contig length (input refused if Prodigal would drop a character, so it is the input's)
+- `gc_content: Float64` -- the contig's GC fraction
+- `translation_table: Int32` -- table the genes were called with (model's or bin's)
+- `uses_sd: Boolean` -- that model or bin scores Shine-Dalgarno motifs
+- `meta_bin: Int32` (nullable) -- metagenomic bin, 0..49; NULL in single-genome mode
+- `model_desc: Utf8` (nullable) -- the bin's description (CLI `model=`); NULL in single-genome mode
+- `n_genes: Int32` -- genes on the contig
+
+The `result` JSON carries `n_genes`, `n_sequences` and, in single-genome
+mode, `model` (`translation_table`, `uses_sd`, `gc_content`,
+`start_weight`), as `prodigal-train` reports it.
+
+**Prodigal config knobs** (`describe_version=5`; parsed strictly: an
+unknown knob, a wrong JSON type or an integer outside C int is an error;
+null means the default):
+
+| Knob | Type | Default | Notes |
+|---|---|---|---|
+| `meta_mode` | bool | `true` | Metagenomic bins; `false` = single-genome mode, which needs a model route below |
+| `training_path` | string | – | Single-genome: a model file `prodigal-train` wrote, loaded once per worker; needs `training_sha256`; refuses `trans_table`/`start_weight`/`force_nonsd` (the model has them) |
+| `training_sha256` | string | – | The model's SHA-256, as `prodigal-train` reports it (64 lowercase hex digits; uppercase is refused rather than given its own fingerprint); checked on load, part of the fingerprint |
+| `train_on_batch` | bool | `false` | Single-genome without a model: train on each batch, which must hold a whole genome |
+| `trans_table` | int | `11` | 4, 5, 9, 11, 13, 15, 21, 25, 26, 32 (NCBI codes Prodigal uses as NCBI defines them); metagenomic mode takes 11 only |
+| `closed_ends` | bool | `false` | No genes off the edges; not stored in a model (nor by the CLI's `-t`): pass the value it was trained with to predict as the CLI does with `-c` |
+| `mask_regions` | bool | `false` | Don't build genes across runs of N; not stored in a model either |
+| `force_nonsd` | bool | `false` | Single-genome only |
+| `start_weight` | float | `4.35` | Single-genome only (metagenomic mode takes the default) |
+| `verbose` | bool | `false` | Library log to stderr |
+
+The input is refused for an empty batch, a null name (naming the input
+row), and, naming the contig, a null or empty sequence or a character
+outside `A`..`z` (Prodigal would drop it, shifting every coordinate after
+it).
+
+**prodigal-train** (input as Prodigal's; no Arrow output): trains a
+single-genome model on the batch's contigs (one whole genome) and writes it
+to `training_path` in the CLI's `-t` format (byte-equal to the CLI's on
+Linux; on macOS arm64 the bytes differ, the settings and predictions
+don't). The write is atomic (temp file + rename in the same directory) and
+follows a symlink to an existing file (a symlink to nothing is refused);
+the file gets a new file's mode (0666 less the umask), also when it
+replaces one; the directory must exist.
+Knobs: `training_path` (required), `trans_table`, `closed_ends`,
+`mask_regions`, `force_nonsd`, `start_weight`, `verbose` (as Prodigal's).
+The `result` JSON: `training_path` (canonical), `training_sha256` (pass it
+to `prodigal`), `model` (as Prodigal's result), `closed_ends` and
+`mask_regions` as trained (pass `prodigal` the same), `n_sequences`,
+`n_bases`, `elapsed_ms`.
 
 **SortMeRNA input** (written by miint to shm_input):
 - `read_id: Utf8` -- sequence identifier

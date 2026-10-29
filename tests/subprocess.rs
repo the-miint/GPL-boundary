@@ -253,8 +253,8 @@ fn test_subprocess_same_fingerprint_serializes() {
 
     let r1: String = REF_A.chars().skip(20).take(30).collect();
     let r2: String = REF_A.chars().skip(60).take(30).collect();
-    let shm1 = ShmGuard::create_with_batch("ph4-sub-same-1", &make_align_batch("r1", &r1));
-    let shm2 = ShmGuard::create_with_batch("ph4-sub-same-2", &make_align_batch("r2", &r2));
+    let shm1 = ShmGuard::create_with_batch("same-fp-1", &make_align_batch("r1", &r1));
+    let shm2 = ShmGuard::create_with_batch("same-fp-2", &make_align_batch("r2", &r2));
 
     let mut child = spawn_daemon();
     let session = format!(
@@ -343,8 +343,8 @@ fn test_subprocess_two_fingerprints_run_in_parallel() {
 
     let read_a: String = REF_A.chars().skip(10).take(30).collect();
     let read_b: String = REF_B.chars().skip(10).take(30).collect();
-    let shm_a = ShmGuard::create_with_batch("ph4-sub-par-a", &make_align_batch("a1", &read_a));
-    let shm_b = ShmGuard::create_with_batch("ph4-sub-par-b", &make_align_batch("b1", &read_b));
+    let shm_a = ShmGuard::create_with_batch("parallel-a", &make_align_batch("a1", &read_a));
+    let shm_b = ShmGuard::create_with_batch("parallel-b", &make_align_batch("b1", &read_b));
 
     let mut child = spawn_daemon();
     let session = format!(
@@ -428,7 +428,7 @@ fn test_subprocess_shutdown_reaps_workers() {
     build_index(&idx, "refA", REF_A);
 
     let read: String = REF_A.chars().skip(10).take(30).collect();
-    let shm = ShmGuard::create_with_batch("ph4-sub-reap", &make_align_batch("r1", &read));
+    let shm = ShmGuard::create_with_batch("reap", &make_align_batch("r1", &read));
 
     let mut child = spawn_daemon();
     let parent_pid = child.id();
@@ -524,8 +524,8 @@ fn test_subprocess_bowtie2_responses_carry_batch_id() {
     build_index(&idx, "refA", REF_A);
 
     let read: String = REF_A.chars().skip(10).take(30).collect();
-    let shm1 = ShmGuard::create_with_batch("ph4-sub-bid-1", &make_align_batch("r1", &read));
-    let shm2 = ShmGuard::create_with_batch("ph4-sub-bid-2", &make_align_batch("r2", &read));
+    let shm1 = ShmGuard::create_with_batch("batch-id-1", &make_align_batch("r1", &read));
+    let shm2 = ShmGuard::create_with_batch("batch-id-2", &make_align_batch("r2", &read));
 
     let big_id: u64 = u64::MAX - 1;
     let mut child = spawn_daemon();
@@ -596,8 +596,8 @@ fn test_subprocess_idle_eviction_does_not_break_reuse() {
     build_index(&idx, "refA", REF_A);
 
     let read: String = REF_A.chars().skip(10).take(30).collect();
-    let shm1 = ShmGuard::create_with_batch("ph4-evict-1", &make_align_batch("r1", &read));
-    let shm2 = ShmGuard::create_with_batch("ph4-evict-2", &make_align_batch("r2", &read));
+    let shm1 = ShmGuard::create_with_batch("evict-1", &make_align_batch("r1", &read));
+    let shm2 = ShmGuard::create_with_batch("evict-2", &make_align_batch("r2", &read));
 
     let mut child = spawn_daemon();
     let init = init_with_eviction(4, 4, 100);
@@ -746,9 +746,9 @@ fn test_subprocess_worker_crash_marks_fingerprint_dead() {
     let read_a: String = REF_A.chars().skip(10).take(30).collect();
     let read_b: String = REF_B.chars().skip(10).take(30).collect();
 
-    let shm1 = ShmGuard::create_with_batch("ph4-crash-1", &make_align_batch("a1", &read_a));
-    let shm2 = ShmGuard::create_with_batch("ph4-crash-2", &make_align_batch("a2", &read_a));
-    let shm3 = ShmGuard::create_with_batch("ph4-crash-3", &make_align_batch("b1", &read_b));
+    let shm1 = ShmGuard::create_with_batch("crash-1", &make_align_batch("a1", &read_a));
+    let shm2 = ShmGuard::create_with_batch("crash-2", &make_align_batch("a2", &read_a));
+    let shm3 = ShmGuard::create_with_batch("crash-3", &make_align_batch("b1", &read_b));
 
     let mut child = spawn_daemon();
     let parent_pid = child.id();
@@ -899,7 +899,7 @@ fn test_subprocess_orphan_shm_swept_after_crash() {
     build_index(&idx, "refA", REF_A);
 
     let read: String = REF_A.chars().skip(10).take(30).collect();
-    let shm = ShmGuard::create_with_batch("ph4-orphan-1", &make_align_batch("r1", &read));
+    let shm = ShmGuard::create_with_batch("orphan-1", &make_align_batch("r1", &read));
 
     let mut child = spawn_daemon();
     let parent_pid = child.id();
@@ -1004,9 +1004,9 @@ fn test_subprocess_max_workers_recycles_via_lru() {
     let read_a: String = REF_A.chars().skip(10).take(30).collect();
     let read_b: String = REF_B.chars().skip(10).take(30).collect();
     let read_c: String = REF_A.chars().skip(40).take(30).collect();
-    let shm_a = ShmGuard::create_with_batch("ph4-lru-a", &make_align_batch("a", &read_a));
-    let shm_b = ShmGuard::create_with_batch("ph4-lru-b", &make_align_batch("b", &read_b));
-    let shm_c = ShmGuard::create_with_batch("ph4-lru-c", &make_align_batch("c", &read_c));
+    let shm_a = ShmGuard::create_with_batch("lru-a", &make_align_batch("a", &read_a));
+    let shm_b = ShmGuard::create_with_batch("lru-b", &make_align_batch("b", &read_b));
+    let shm_c = ShmGuard::create_with_batch("lru-c", &make_align_batch("c", &read_c));
 
     let mut child = spawn_daemon();
     let init = init_with_eviction(1, 1, 60_000);
@@ -1090,8 +1090,8 @@ fn test_subprocess_inflight_batch_protected_from_eviction() {
     let read_b: String = REF_B.chars().skip(10).take(30).collect();
 
     let shm_a =
-        ShmGuard::create_with_batch("ph4-prot-a", &make_align_batch_multi("a", 1500, &read_a));
-    let shm_b = ShmGuard::create_with_batch("ph4-prot-b", &make_align_batch("b", &read_b));
+        ShmGuard::create_with_batch("inflight-a", &make_align_batch_multi("a", 1500, &read_a));
+    let shm_b = ShmGuard::create_with_batch("inflight-b", &make_align_batch("b", &read_b));
 
     let mut child = spawn_daemon();
     let init = init_with_eviction(1, 1, 60_000);
@@ -1195,7 +1195,7 @@ fn test_subprocess_max_workers_bounds_resident_children() {
             read_b.as_str()
         };
         shms.push(ShmGuard::create_with_batch(
-            &format!("ph4-bound-{i}"),
+            &format!("bound-{i}"),
             &make_align_batch(&format!("r{i}"), r),
         ));
     }
