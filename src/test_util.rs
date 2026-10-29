@@ -3,7 +3,9 @@
 //! Intentionally duplicates IPC serialization logic from `arrow_ipc.rs` so that
 //! tests exercise production read/write paths against independently-written data.
 
+use crate::protocol::Response;
 use crate::shm::SharedMemory;
+use arrow::array::{Array, Int32Array, StringArray};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use std::path::PathBuf;
@@ -36,6 +38,88 @@ pub fn write_arrow_to_shm(name: &str, batch: &RecordBatch) -> SharedMemory {
     let mut shm = SharedMemory::create(name, ipc_buf.len()).unwrap();
     shm.as_mut_slice()[..ipc_buf.len()].copy_from_slice(&ipc_buf);
     shm
+}
+
+/// The Prodigal fork's ground-truth input, ext/prodigal/anthus_aco.fas (22
+/// contigs of 960 bp): (name, sequence).
+pub fn anthus() -> Vec<(String, String)> {
+    let fasta = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/ext/prodigal/anthus_aco.fas"
+    ));
+    fasta
+        .split('>')
+        .skip(1)
+        .map(|record| {
+            let (header, seq) = record.split_once('\n').unwrap();
+            (header.trim().to_string(), seq.split_whitespace().collect())
+        })
+        .collect()
+}
+
+/// The fork's model of anthus (`prodigal -t ref_train.bin`), and its
+/// SHA-256 (sha256sum).
+pub const PRODIGAL_REF_TRAIN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/ext/prodigal/testdata/ground_truth/ref_train.bin"
+);
+pub const PRODIGAL_REF_TRAIN_SHA256: &str =
+    "fffe0cd8e9cb2fd3f53a7bfe72a9f734482d0c96df32baef9a0e9bd4b346d7d9";
+
+/// A prodigal input batch.
+pub fn prodigal_batch(names: &[&str], sequences: &[&str]) -> RecordBatch {
+    let columns: Vec<arrow::array::ArrayRef> = vec![
+        std::sync::Arc::new(StringArray::from(names.to_vec())),
+        std::sync::Arc::new(StringArray::from(sequences.to_vec())),
+    ];
+    let schema = std::sync::Arc::new(crate::tools::prodigal::input_schema());
+    RecordBatch::try_new(schema, columns).unwrap()
+}
+
+/// A prodigal response's result JSON and genes (its output segment
+/// unlinked), or its error.
+pub fn genes_of(response: Response) -> Result<(serde_json::Value, RecordBatch), String> {
+    if !response.success {
+        return Err(response.error.unwrap());
+    }
+    let out = &response.shm_outputs[0];
+    let mut genes = read_arrow_from_shm(&out.name, out.size);
+    let _ = SharedMemory::unlink(&out.name);
+    Ok((response.result.unwrap(), genes.remove(0)))
+}
+
+/// (seq_name, begin, end, strand) of every gene in prodigal's output.
+pub fn gene_coordinates(genes: &RecordBatch) -> Vec<(String, i32, i32, i32)> {
+    let names = genes.column(0).as_any().downcast_ref::<StringArray>();
+    let int = |i: usize| genes.column(i).as_any().downcast_ref::<Int32Array>();
+    let (begin, end, strand) = (int(1).unwrap(), int(2).unwrap(), int(3).unwrap());
+    (0..genes.num_rows())
+        .map(|i| {
+            let name = names.unwrap().value(i).to_string();
+            (name, begin.value(i), end.value(i), strand.value(i))
+        })
+        .collect()
+}
+
+/// (seq_name, begin, end, strand) of every gene in a GFF file of the fork's
+/// testdata/ground_truth.
+pub fn gff_coordinates(gff: &str) -> Vec<(String, i32, i32, i32)> {
+    gff.lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            let strand = if f[6] == "+" { 1 } else { -1 };
+            let (begin, end) = (f[3].parse().unwrap(), f[4].parse().unwrap());
+            (f[0].to_string(), begin, end, strand)
+        })
+        .collect()
+}
+
+/// A fresh directory under target/ (not the shared /tmp), removed on drop.
+pub fn scratch_dir() -> tempfile::TempDir {
+    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/target/test-scratch");
+    std::fs::create_dir_all(base).unwrap();
+    tempfile::tempdir_in(base).unwrap()
 }
 
 /// Read all Arrow RecordBatches from an IPC stream in shared memory.

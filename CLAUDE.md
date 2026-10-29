@@ -25,9 +25,11 @@ spawns it as a long-lived daemon (one per DuckDB instance).
 loading, sortmerna: reference indexing, prodigal: metagenomic bin
 initialization) support batched streaming. The `StreamingContext` trait
 provides `run_batch()` for per-batch work against a pre-loaded context.
-Single-genome prodigal keeps no context across batches: it trains a fresh
-one on each batch's contigs, so it requires `train_on_batch: true` (each
-batch must hold a whole genome).
+Single-genome prodigal needs a model: `training_path` + `training_sha256`
+(a file `prodigal-train` wrote, loaded once per worker; the hash is part of
+the fingerprint and is checked on load), or `train_on_batch: true`, which
+trains a fresh context on each batch's contigs (each batch must hold a
+whole genome).
 
 **Per-fingerprint dispatch**: every batch carries its own `(tool, config)`
 pair. The coordinator computes a canonical-config fingerprint and routes to
@@ -185,6 +187,7 @@ src/
     mod.rs           # GplTool trait, ToolRegistration, StreamingContext trait, inventory-based dispatch
     fasttree.rs      # FastTree FFI bindings + GplTool impl + tests
     prodigal.rs      # Prodigal FFI bindings + GplTool impl + tests
+    prodigal_train.rs # prodigal-train: writes a single-genome model (uses prodigal.rs's FFI)
     sortmerna.rs     # SortMeRNA FFI bindings + GplTool impl + tests
     bowtie2_align.rs # Bowtie2 aligner FFI bindings + GplTool impl + tests
     bowtie2_build.rs # Bowtie2 index builder FFI bindings + GplTool impl + tests
@@ -233,7 +236,7 @@ distinct bump policies and are NOT substitutes for each other:
   protocol checks this.
 
 Current landmark values (see `src/tools/mod.rs::tests::test_describe_version_landmarks`):
-fasttree=3, bowtie2-align=5, prodigal=3, sortmerna/bowtie2-build=1.
+fasttree=3, bowtie2-align=5, prodigal=4, sortmerna/bowtie2-build/prodigal-train=1.
 fasttree's history is documented in a CHANGELOG block above its
 `describe()` method. When you intentionally edit a `--describe`
 surface, bump the version in that tool's `describe()` AND update
@@ -339,6 +342,7 @@ advertisement:
    {"name": "bowtie2-build",  "schema_version": 1},
    {"name": "fasttree",       "schema_version": 2},
    {"name": "prodigal",       "schema_version": 1},
+   {"name": "prodigal-train", "schema_version": 1},
    {"name": "sortmerna",      "schema_version": 2}
  ]}
 ```

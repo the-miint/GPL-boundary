@@ -3,6 +3,7 @@ pub mod bowtie2_build;
 pub mod bowtie2_ffi;
 pub mod fasttree;
 pub mod prodigal;
+pub mod prodigal_train;
 pub mod sortmerna;
 
 use crate::protocol::{BatchRequest, Response};
@@ -74,11 +75,11 @@ pub(crate) fn config_knobs_known(
 
 /// A knob's value: `None` if absent or null, an error naming the knob if
 /// `get` does not take it.
-fn config_knob<T>(
-    config: &serde_json::Value,
+fn config_knob<'a, T>(
+    config: &'a serde_json::Value,
     name: &str,
     what: &str,
-    get: impl Fn(&serde_json::Value) -> Option<T>,
+    get: impl Fn(&'a serde_json::Value) -> Option<T>,
 ) -> Result<Option<T>, String> {
     match config.get(name) {
         None | Some(serde_json::Value::Null) => Ok(None),
@@ -90,6 +91,13 @@ fn config_knob<T>(
 
 pub(crate) fn config_bool(config: &serde_json::Value, name: &str) -> Result<Option<bool>, String> {
     config_knob(config, name, "a boolean", serde_json::Value::as_bool)
+}
+
+pub(crate) fn config_str<'a>(
+    config: &'a serde_json::Value,
+    name: &str,
+) -> Result<Option<&'a str>, String> {
+    config_knob(config, name, "a string", serde_json::Value::as_str)
 }
 
 pub(crate) fn config_f64(config: &serde_json::Value, name: &str) -> Result<Option<f64>, String> {
@@ -449,7 +457,8 @@ mod tests {
     fn test_describe_version_landmarks() {
         let cases: &[(&str, u32)] = &[
             ("fasttree", 3),
-            ("prodigal", 3),
+            ("prodigal", 4),
+            ("prodigal-train", 1),
             ("sortmerna", 1),
             ("bowtie2-align", 5),
             ("bowtie2-build", 1),

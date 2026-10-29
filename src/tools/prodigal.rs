@@ -3,14 +3,15 @@
 
 use crate::protocol::Response;
 use crate::tools::{
-    config_bool, config_cint, config_f64, config_knobs_known, ConfigParam, FieldDescription,
-    GplTool, StreamingContext, ToolDescription,
+    config_bool, config_cint, config_f64, config_knobs_known, config_str, ConfigParam,
+    FieldDescription, GplTool, StreamingContext, ToolDescription,
 };
 use arrow::array::{Array, BooleanArray, Float64Array, Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_double, c_int, c_void};
+use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
 
@@ -120,6 +121,15 @@ c_mirror! {
 }
 
 c_mirror! {
+    "prodigal_training_info_t" => pub struct ProdigalTrainingInfo {
+        pub translation_table: i32,
+        pub uses_sd: i32,
+        pub gc_content: c_double,
+        pub start_weight: c_double,
+    }
+}
+
+c_mirror! {
     /// A row of prodigal_abi_layout(): the ABI test reads the table with it.
     #[cfg(test)]
     "prodigal_abi_field_t" => pub struct ProdigalAbiField {
@@ -161,6 +171,19 @@ extern "C" {
     ) -> c_int;
     fn prodigal_get_seq_info(ctx: *const prodigal_ctx_t, info: *mut ProdigalSeqInfo) -> c_int;
     fn prodigal_train(ctx: *mut prodigal_ctx_t) -> c_int;
+    fn prodigal_load_training(ctx: *mut prodigal_ctx_t, data: *const c_void, len: usize) -> c_int;
+    fn prodigal_export_training(
+        ctx: *const prodigal_ctx_t,
+        data_out: *mut *mut c_void,
+        len_out: *mut usize,
+    ) -> c_int;
+    fn prodigal_training_info(
+        data: *const c_void,
+        len: usize,
+        info: *mut ProdigalTrainingInfo,
+        msg: *mut c_char,
+        msg_len: usize,
+    ) -> c_int;
     fn prodigal_find_genes(
         ctx: *mut prodigal_ctx_t,
         genes_out: *mut *mut ProdigalGenesSoa,
@@ -196,6 +219,13 @@ impl ProdigalConfig {
     }
 }
 
+/// The linked library's own version (prodigal.h's runtime query).
+pub(super) fn library_version() -> String {
+    unsafe { CStr::from_ptr(prodigal_version_string()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// A NUL-terminated C char buffer as a String (to the buffer's end if it
 /// has no NUL).
 fn c_buf_to_string(buf: &[c_char]) -> String {
@@ -216,6 +246,26 @@ unsafe extern "C" fn stderr_log_callback(msg: *const c_char, _user_data: *mut c_
 }
 
 // --- Arrow schema definitions ---
+
+/// The input's columns, as --describe lists them (prodigal and
+/// prodigal-train).
+pub(super) fn input_fields() -> Vec<FieldDescription> {
+    vec![
+        FieldDescription {
+            name: "name",
+            arrow_type: "Utf8",
+            nullable: false,
+            description: "Sequence (contig) identifier",
+        },
+        FieldDescription {
+            name: "sequence",
+            arrow_type: "Utf8",
+            nullable: false,
+            description: "Nucleotide sequence (sequences may have different lengths); a \
+                          character outside 'A'..'z', which Prodigal would drop, is an error",
+        },
+    ]
+}
 
 /// Input schema: contig sequences from miint.
 #[allow(dead_code)]
@@ -408,65 +458,129 @@ inventory::submit! {
     }
 }
 
-/// A request's config, checked: the library's defaults with the JSON's
-/// knobs applied, which prodigal_config_validate accepts.
+/// The translation tables the library takes (single-genome mode;
+/// metagenomic mode takes 11 only).
+pub(super) const TRANS_TABLES: [c_int; 10] = [4, 5, 9, 11, 13, 15, 21, 25, 26, 32];
+
+/// The model's knobs, which prodigal and prodigal-train share, strictly
+/// typed on the library's defaults (what the JSON omits keeps them); any
+/// other knob must be in `params`, the tool's --describe.
+pub(super) fn model_config(
+    json: &serde_json::Value,
+    params: &[ConfigParam],
+) -> Result<ProdigalConfig, String> {
+    config_knobs_known(json, params)?;
+    let mut c = unsafe { ProdigalConfig::library_defaults()? };
+    if let Some(table) = config_cint(json, "trans_table")? {
+        c.trans_table = table;
+    }
+    for (name, field) in [
+        ("closed_ends", &mut c.closed_ends),
+        ("mask_regions", &mut c.mask_regions),
+        ("force_nonsd", &mut c.force_nonsd),
+    ] {
+        if let Some(on) = config_bool(json, name)? {
+            *field = on.into();
+        }
+    }
+    if let Some(weight) = config_f64(json, "start_weight")? {
+        c.start_weight = weight;
+    }
+    if config_bool(json, "verbose")?.unwrap_or(false) {
+        c.log_callback = Some(stderr_log_callback);
+    }
+    Ok(c)
+}
+
+/// The library's reason for refusing a config (prodigal_config_validate).
+pub(super) fn validate(config: &ProdigalConfig) -> Result<(), String> {
+    let mut msg: [c_char; 256] = [0; 256];
+    if unsafe { prodigal_config_validate(config, msg.as_mut_ptr(), msg.len()) } != PRODIGAL_OK {
+        let why = c_buf_to_string(&msg);
+        return Err(format!("Invalid prodigal config: {why}"));
+    }
+    Ok(())
+}
+
+/// A model file, and the SHA-256 it must have.
+struct Model {
+    path: PathBuf,
+    sha256: String,
+}
+
+/// A request's config, checked: the library's config, which
+/// prodigal_config_validate accepts, and single-genome mode's model file.
 struct Settings {
     config: ProdigalConfig,
+    model: Option<Model>,
 }
 
 impl Settings {
     /// Parse and check a request's config, before any input is read.
     fn parse(json: &serde_json::Value) -> Result<Self, String> {
-        let config = Self::c_config(json)?;
-        let mut msg: [c_char; 256] = [0; 256];
-        if unsafe { prodigal_config_validate(&config, msg.as_mut_ptr(), msg.len()) } != PRODIGAL_OK
-        {
-            let why = c_buf_to_string(&msg);
-            return Err(format!("Invalid prodigal config: {why}"));
-        }
-        Ok(Self { config })
+        let settings = Self::unchecked(json)?;
+        validate(&settings.config)?;
+        Ok(settings)
     }
 
-    /// The JSON's knobs, strictly typed, on the library's defaults (what
-    /// the JSON omits keeps them).
-    fn c_config(json: &serde_json::Value) -> Result<ProdigalConfig, String> {
-        config_knobs_known(json, &ProdigalTool.describe().config_params)?;
-
-        let mut c = unsafe { ProdigalConfig::library_defaults()? };
+    /// The JSON's settings, before the library checks the config.
+    fn unchecked(json: &serde_json::Value) -> Result<Self, String> {
+        let mut config = model_config(json, &ProdigalTool.describe().config_params)?;
         let meta_mode = config_bool(json, "meta_mode")?.unwrap_or(true);
         let train_on_batch = config_bool(json, "train_on_batch")?.unwrap_or(false);
-        c.meta_mode = meta_mode.into();
-        if let Some(table) = config_cint(json, "trans_table")? {
-            c.trans_table = table;
-        }
-        for (name, field) in [
-            ("closed_ends", &mut c.closed_ends),
-            ("mask_regions", &mut c.mask_regions),
-            ("force_nonsd", &mut c.force_nonsd),
-        ] {
-            if let Some(on) = config_bool(json, name)? {
-                *field = on.into();
-            }
-        }
-        if let Some(weight) = config_f64(json, "start_weight")? {
-            c.start_weight = weight;
-        }
-        if config_bool(json, "verbose")?.unwrap_or(false) {
-            c.log_callback = Some(stderr_log_callback);
-        }
+        let path = config_str(json, "training_path")?;
+        let sha256 = config_str(json, "training_sha256")?;
+        config.meta_mode = meta_mode.into();
 
-        // A batch may hold part of a genome, so training on it must be asked for
-        if meta_mode && train_on_batch {
-            return Err("train_on_batch applies to single-genome mode (meta_mode=false)".into());
-        }
-        if !meta_mode && !train_on_batch {
+        // A batch may hold part of a genome, so single-genome mode needs a
+        // model, or to be told that each batch is a whole genome
+        if meta_mode && (train_on_batch || path.is_some()) {
             return Err(
-                "single-genome mode (meta_mode=false) trains on the batch's \
-                 contigs: set train_on_batch=true if each batch holds a whole genome"
+                "train_on_batch and training_path apply to single-genome mode \
+                 (meta_mode=false)"
                     .into(),
             );
         }
-        Ok(c)
+        if train_on_batch && path.is_some() {
+            return Err("train_on_batch and training_path are alternatives: set one".into());
+        }
+        if !meta_mode && !train_on_batch && path.is_none() {
+            return Err(
+                "single-genome mode (meta_mode=false) needs one of training_path \
+                 (a model from prodigal-train) or train_on_batch=true (train on \
+                 each batch, which must then hold a whole genome)"
+                    .into(),
+            );
+        }
+        let model = match path {
+            None if sha256.is_some() => {
+                return Err("training_sha256 goes with training_path".into());
+            }
+            None => None,
+            Some(path) => {
+                // The model carries them
+                let knobs = ["trans_table", "start_weight", "force_nonsd"];
+                if let Some(knob) = knobs.into_iter().find(|&k| !json[k].is_null()) {
+                    return Err(format!(
+                        "{knob} comes from training_path's model: leave it out"
+                    ));
+                }
+                let sha256 = sha256.ok_or(
+                    "training_path needs training_sha256, the model's SHA-256 \
+                     (prodigal-train reports it)",
+                )?;
+                if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(format!(
+                        "training_sha256 must be 64 hexadecimal digits, got {sha256:?}"
+                    ));
+                }
+                Some(Model {
+                    path: path.into(),
+                    sha256: sha256.to_ascii_lowercase(),
+                })
+            }
+        };
+        Ok(Self { config, model })
     }
 
     fn meta_mode(&self) -> bool {
@@ -474,13 +588,38 @@ impl Settings {
     }
 }
 
+/// A file's SHA-256, in lowercase hexadecimal.
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+/// A model's settings, as the library reads them from its blob.
+pub(super) fn training_info(blob: &[u8]) -> Result<ProdigalTrainingInfo, String> {
+    let mut info: ProdigalTrainingInfo = unsafe { std::mem::zeroed() };
+    let mut msg: [c_char; 256] = [0; 256];
+    let rc = unsafe {
+        prodigal_training_info(
+            blob.as_ptr().cast(),
+            blob.len(),
+            &mut info,
+            msg.as_mut_ptr(),
+            msg.len(),
+        )
+    };
+    if rc != PRODIGAL_OK {
+        return Err(format!("the model is refused: {}", c_buf_to_string(&msg)));
+    }
+    Ok(info)
+}
+
 /// A batch's contigs, read in place from the input mapping: its (name,
 /// sequence) columns, which hold no nulls and no character the library
 /// drops.
-struct Contigs(Vec<(StringArray, StringArray)>);
+pub(super) struct Contigs(Vec<(StringArray, StringArray)>);
 
 impl Contigs {
-    fn read(shm_input: &str, shm_input_size: usize) -> Result<Self, String> {
+    pub(super) fn read(shm_input: &str, shm_input_size: usize) -> Result<Self, String> {
         let batches = crate::arrow_ipc::read_batches_from_shm(shm_input, shm_input_size)?;
         let mut columns = Vec::with_capacity(batches.len());
         let mut row = 0;
@@ -518,7 +657,7 @@ impl Contigs {
     }
 
     /// (name, sequence) of each contig, in input order.
-    fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
         let batches = self.0.iter();
         batches.flat_map(|(names, seqs)| (0..names.len()).map(|i| (names.value(i), seqs.value(i))))
     }
@@ -544,7 +683,7 @@ fn dropped_character(seq: &str) -> Option<String> {
 }
 
 /// An owned prodigal context, destroyed on drop.
-struct Context(*mut prodigal_ctx_t);
+pub(super) struct Context(*mut prodigal_ctx_t);
 
 impl Drop for Context {
     fn drop(&mut self) {
@@ -553,10 +692,10 @@ impl Drop for Context {
 }
 
 impl Context {
-    fn new(settings: &Settings) -> Result<Self, String> {
-        let ctx = unsafe { prodigal_create(&settings.config) };
+    /// A context for a config validate() accepts.
+    pub(super) fn new(config: &ProdigalConfig) -> Result<Self, String> {
+        let ctx = unsafe { prodigal_create(config) };
         if ctx.is_null() {
-            // Settings::parse has validated the config
             return Err("Failed to create prodigal context (out of memory)".into());
         }
         Ok(Self(ctx))
@@ -581,7 +720,7 @@ impl Context {
     }
 
     /// Train on every contig, as the CLI's single-genome mode does.
-    fn train(&mut self, contigs: &Contigs) -> Result<(), String> {
+    pub(super) fn train(&mut self, contigs: &Contigs) -> Result<(), String> {
         let (seqs, lens): (Vec<*const c_char>, Vec<i32>) = contigs
             .iter()
             .map(|(_, s)| (s.as_ptr().cast(), c_len(s)))
@@ -599,6 +738,43 @@ impl Context {
                 .and_then(|()| self.check(prodigal_train(self.0)))
         }
         .map_err(|e| format!("training on the batch: {e}"))
+    }
+
+    /// The model, as the CLI's -t writes it.
+    pub(super) fn export(&self) -> Result<Vec<u8>, String> {
+        let mut data: *mut c_void = ptr::null_mut();
+        let mut len = 0;
+        if unsafe { prodigal_export_training(self.0, &mut data, &mut len) } != PRODIGAL_OK {
+            // No message: the context is const
+            return Err("prodigal_export_training failed".into());
+        }
+        let blob = unsafe { std::slice::from_raw_parts(data as *const u8, len) }.to_vec();
+        unsafe { libc::free(data) };
+        Ok(blob)
+    }
+
+    /// Load a model file, refusing it unless its SHA-256 is the one asked
+    /// for: a file retrained since is not served.
+    fn load_model(&mut self, model: &Model) -> Result<(), String> {
+        // Larger than any model (558,392 bytes on 64-bit builds), so a wrong
+        // file is refused before it is read
+        const MAX_MODEL_BYTES: u64 = 1 << 20;
+        let meta = std::fs::metadata(&model.path).map_err(|e| e.to_string())?;
+        if !meta.is_file() || meta.len() > MAX_MODEL_BYTES {
+            return Err(format!(
+                "not a Prodigal model (a file of at most {MAX_MODEL_BYTES} bytes)"
+            ));
+        }
+        let blob = std::fs::read(&model.path).map_err(|e| e.to_string())?;
+        let sha256 = sha256_hex(&blob);
+        if sha256 != model.sha256 {
+            return Err(format!(
+                "its SHA-256 is {sha256}, not training_sha256 {} (retrained since?)",
+                model.sha256
+            ));
+        }
+        let rc = unsafe { prodigal_load_training(self.0, blob.as_ptr().cast(), blob.len()) };
+        self.check(rc)
     }
 
     /// Load a contig, checking the library kept all of it.
@@ -662,12 +838,13 @@ impl Context {
 /// What a request's batches run on: execute() runs one, a streaming
 /// session every batch of its config.
 enum Session {
-    /// One context for every batch: in metagenomic mode the bins are set up
-    /// at the first contig and reused for every batch after
+    /// One context for every batch: metagenomic mode (the bins are set up
+    /// at the first contig and reused for every batch after), or
+    /// single-genome mode with training_path's model
     Shared(Context),
     /// A context for each batch, trained on the batch's contigs
     /// (single-genome mode, train_on_batch)
-    TrainOnBatch(Settings),
+    TrainOnBatch(ProdigalConfig),
 }
 
 // Safety: The C context is not thread-safe, but no references to it are
@@ -678,18 +855,23 @@ unsafe impl Send for Session {}
 
 impl Session {
     fn new(settings: Settings) -> Result<Self, String> {
-        Ok(if settings.meta_mode() {
-            Self::Shared(Context::new(&settings)?)
-        } else {
-            Self::TrainOnBatch(settings)
-        })
+        if !settings.meta_mode() && settings.model.is_none() {
+            return Ok(Self::TrainOnBatch(settings.config));
+        }
+        let mut ctx = Context::new(&settings.config)?;
+        if let Some(model) = &settings.model {
+            let path = model.path.display();
+            ctx.load_model(model)
+                .map_err(|e| format!("training_path {path}: {e}"))?;
+        }
+        Ok(Self::Shared(ctx))
     }
 
     fn run(&mut self, contigs: &Contigs) -> Result<Response, String> {
         match self {
             Self::Shared(ctx) => ctx.predict(contigs),
-            Self::TrainOnBatch(settings) => {
-                let mut ctx = Context::new(settings)?;
+            Self::TrainOnBatch(config) => {
+                let mut ctx = Context::new(config)?;
                 ctx.train(contigs)?;
                 ctx.predict(contigs)
             }
@@ -711,10 +893,7 @@ impl GplTool for ProdigalTool {
     }
 
     fn version(&self) -> String {
-        // The linked library's own version (prodigal.h's runtime query)
-        unsafe { CStr::from_ptr(prodigal_version_string()) }
-            .to_string_lossy()
-            .into_owned()
+        library_version()
     }
 
     fn schema_version(&self) -> u32 {
@@ -731,24 +910,46 @@ impl GplTool for ProdigalTool {
             // (Prodigal 2.6.5 refuses other values); rbs_* say "None".
             // 3: train_on_batch; trans_table's allowed values are integers;
             // the input's nulls and dropped characters are refused.
-            describe_version: 3,
+            // 4: training_path + training_sha256 (a model from prodigal-train).
+            describe_version: 4,
             description: "Prokaryotic gene prediction for metagenomic and single-genome sequences",
             config_params: vec![
                 ConfigParam {
                     name: "meta_mode",
                     param_type: "boolean",
                     default: serde_json::json!(true),
-                    description: "Use pre-trained metagenomic models (true) or train on the \
-                                  input (false, which needs train_on_batch)",
+                    description: "Use pre-trained metagenomic models (true), or a model of \
+                                  one genome (false: needs training_path or train_on_batch)",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "training_path",
+                    param_type: "string",
+                    default: serde_json::Value::Null,
+                    description: "Single-genome mode: the model file prodigal-train wrote \
+                                  (the CLI's -t format), loaded once per worker. Needs \
+                                  training_sha256; the model sets trans_table, start_weight \
+                                  and force_nonsd, so they are refused with it. closed_ends \
+                                  and mask_regions are not in the model: pass the values it \
+                                  was trained with",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "training_sha256",
+                    param_type: "string",
+                    default: serde_json::Value::Null,
+                    description: "The SHA-256 of training_path's model, in hexadecimal \
+                                  as prodigal-train reports it. A worker loads the file only \
+                                  if its hash matches, and then serves that model for this \
+                                  hash",
                     allowed_values: vec![],
                 },
                 ConfigParam {
                     name: "train_on_batch",
                     param_type: "boolean",
                     default: serde_json::json!(false),
-                    description: "Single-genome mode (meta_mode=false) only, and required \
-                                  there: train on each batch's own contigs, so each batch \
-                                  must hold a whole genome",
+                    description: "Single-genome mode without training_path: train on each \
+                                  batch's own contigs, so each batch must hold a whole genome",
                     allowed_values: vec![],
                 },
                 ConfigParam {
@@ -758,9 +959,7 @@ impl GplTool for ProdigalTool {
                     description: "NCBI translation table number (11: bacteria, archaea, \
                                   plant plastids). Metagenomic mode takes 11 only (its bins \
                                   choose 11 or 4 per contig); the others need single-genome mode",
-                    allowed_values: [4, 5, 9, 11, 13, 15, 21, 25, 26, 32]
-                        .map(Into::into)
-                        .to_vec(),
+                    allowed_values: TRANS_TABLES.map(Into::into).to_vec(),
                 },
                 ConfigParam {
                     name: "closed_ends",
@@ -800,22 +999,7 @@ impl GplTool for ProdigalTool {
                     allowed_values: vec![],
                 },
             ],
-            input_schema: vec![
-                FieldDescription {
-                    name: "name",
-                    arrow_type: "Utf8",
-                    nullable: false,
-                    description: "Sequence (contig) identifier",
-                },
-                FieldDescription {
-                    name: "sequence",
-                    arrow_type: "Utf8",
-                    nullable: false,
-                    description: "Nucleotide sequence (sequences may have different \
-                                  lengths); a character outside 'A'..'z', which Prodigal \
-                                  would drop, is an error",
-                },
-            ],
+            input_schema: input_fields(),
             output_schema: vec![
                 FieldDescription {
                     name: "seq_name",
@@ -988,23 +1172,15 @@ impl GplTool for ProdigalTool {
 mod tests {
     use super::*;
     use crate::shm::SharedMemory;
-    use crate::test_util::{read_arrow_from_shm, unique_shm_name, write_arrow_to_shm};
+    use crate::test_util::{
+        anthus, gene_coordinates, genes_of, gff_coordinates, prodigal_batch, read_arrow_from_shm,
+        scratch_dir, unique_shm_name, write_arrow_to_shm, PRODIGAL_REF_TRAIN as REF_TRAIN,
+        PRODIGAL_REF_TRAIN_SHA256 as REF_TRAIN_SHA256,
+    };
 
     // Test sequences from Prodigal's anthus_aco.fas (960 bp each)
     const TEST_SEQ_1: &str = "ACAGGTTAGAAACTACTCTGTTTTCTGGCTCCTTGTTTAATGCCCTGTCCTATTTTATTGCGAAAATTGTCTGTTTTTCACAGAAAACTGAGAGTAGTCAAGGGATTCCTTGTCCTTTGCTTTGGTCTGCACAGCTGTCTTGTTTTAAGGCCAAGTGGAATGAGACAGCTGACTCTTCAGGTGTGAAAACTTGGATGTAGGTGTAGATTGGCTCTCAGTTGACCTCCAGCTGGTGCAGATTCTTCAGTTTGTTTGATGGAGCTTTGAGAAGTCCTTTCAGACTGAAGGATACTCTGAATTTTAGCTATGGAGATAATGTGGATGTTGTGTGTTTAAGTCCTGTTTGCAGTTTTTTTCTGTTCAGTCAGTTATTTTACTGTGTGAGTCAGGACCCTTAGAAGCCCTCAGTGGCAACCACAGAGCGCACAGTTAATTTTCTGTGCAAGAAAATTAAGATCATACTCTGTGTCCAGGAAAGTCAAGAATATTCCTGGTTTTCTCTACTGTAAAATTTTATCTTGTAACTTGTGTTTGGGTCTGCATGATTATTCAAAAATCTTAGTAGATTTGGAAGGATGTTGCATATTATGGAAACAAAGTTGGAAAAAGTTTGTATCAGTTGCAGTATTTCTTCACATCATTTNTTAACNNCNTNNNNNNNNNGCTTCTGCCACTTGAAAAGACAAATTAAAAACNAATTTATAATGCTTATATGCTTTAGTTACATTNGGGTCTTTCAGTAACTTTAGTGCTTTTGATAGCCATACCTGTGAGNTTGACAGTGTCTAAAATTAGAAGTGTTCCTTTTCTTCTGCTCTTCCCATTCTCGTGTGTCTTCAATAGTTTCTGCAAATAATGATGTGCAGACTTAGCATTGATTCAACAGCAGAGGTAAGCATACCTGTGGCTTACTTGGCTTCAGCTTATCCAGCAGTGCCAACCACTCTCTGTTTGTCTTAC";
     const TEST_SEQ_2: &str = "ACAGGTTAGAAACTACTCTGTTTTCTGGCTGCTTGTTTAATGCCCTCTCCTATTTTATTGTGACGATTGTCTGTTTTTCACAGAAAACTGAGAGTAGTCAAGGGATTCCTTGTCCTTTGCTTTGGTGTGCACAGCTGTCTTGTTTTAAGGCCCAGTGGAATGAGACAGCTGACTCTTCAGGTGTGAAAACTTGGATGTACGTGTAGATTGGCTCTCAGTTGACCTCCAGCTGGTGCAGATTCTTCAGTTTGTTTGATGGAGCTTTGAGAAGTCCTTTCAGACTGAAGGATACTCTGAATTTTAGCTATGGAAATAATGTGGATGTTGTGTGTTTAAGCACTGTTTGCAGTTTTTTTCTGTTCAGTCAGTTATTTTACTGTGTGAGTCAGGACTCTTAGAAGCCCTCTGTGGCAACCACAGAGCGCATAGTTAATTTTCTGTACAAGAAAATTAAGATCCTACTCAGTGTTCAGGAAAGTCAAGAATATTCCTGGTTTTCTCTACTGTAAAATTTTATCTTGTAACTTGTGTTTGGGTCTGCATGATTATTCAAAAATCTTAGTAGATTTGGAAGGATGTTGCATTTTATGGAAACAAAGTTGGGAAAAGTTTGTATCAGTTCCAGTATTTCTTCACATCATTTNTTAACNNCNTNNNNNNNNNGCTTCTACCACTTGAAAAGACAAATTAAAAACNAATTTATAATGCTTATATGCTTTAGTTACATTNGGGTCTTTCAGTAACTTTAGTGCTTTACTTAGCCATACCTGTGAGCNTGGCAGTGTCTAAAATTAGAAGTGTTCCTTTTCTTCTGCTCTTCCCATTCTCGTGTGTCTTCAATAGTTTCTGCAAATAATGATGTGCAGACTTAGCATTGGTTCAACAGCAGAGGTAAAAATACCTGTGGCTTACCCGGCTTCAGCTTATCCAGCAGTGCCAACCACTCTCTGTTTGTCTTAC";
-
-    fn make_input_batch(names: &[&str], sequences: &[&str]) -> RecordBatch {
-        let schema = Arc::new(input_schema());
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(names.to_vec())),
-                Arc::new(StringArray::from(sequences.to_vec())),
-            ],
-        )
-        .unwrap()
-    }
 
     /// An input batch whose columns may hold nulls.
     fn make_nullable_batch(names: &[Option<&str>], sequences: &[Option<&str>]) -> RecordBatch {
@@ -1022,22 +1198,6 @@ mod tests {
         .unwrap()
     }
 
-    /// The fork's ground-truth input (22 contigs of 960 bp): (name, sequence).
-    fn anthus() -> Vec<(String, String)> {
-        let fasta = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/ext/prodigal/anthus_aco.fas"
-        ));
-        fasta
-            .split('>')
-            .skip(1)
-            .map(|record| {
-                let (header, seq) = record.split_once('\n').unwrap();
-                (header.trim().to_string(), seq.split_whitespace().collect())
-            })
-            .collect()
-    }
-
     /// execute() on a batch: the result JSON and the genes, or the error.
     fn predict_batch(
         config: serde_json::Value,
@@ -1045,14 +1205,31 @@ mod tests {
     ) -> Result<(serde_json::Value, RecordBatch), String> {
         let input_name = unique_shm_name("pd-run");
         let input = write_arrow_to_shm(&input_name, batch);
-        let response = ProdigalTool.execute(&config, &input_name, input.len());
-        if !response.success {
-            return Err(response.error.unwrap());
+        genes_of(ProdigalTool.execute(&config, &input_name, input.len()))
+    }
+
+    /// A batch run through a streaming session: the result JSON and the
+    /// genes, or the error.
+    fn predict_in(
+        session: &mut Box<dyn StreamingContext>,
+        batch: &RecordBatch,
+    ) -> Result<(serde_json::Value, RecordBatch), String> {
+        let input_name = unique_shm_name("pd-sess");
+        let input = write_arrow_to_shm(&input_name, batch);
+        genes_of(session.run_batch(&input_name, input.len()))
+    }
+
+    /// Single-genome mode from REF_TRAIN, with `knobs` added or replaced.
+    fn from_model(knobs: serde_json::Value) -> serde_json::Value {
+        let mut config = serde_json::json!({
+            "meta_mode": false,
+            "training_path": REF_TRAIN,
+            "training_sha256": REF_TRAIN_SHA256,
+        });
+        for (knob, value) in knobs.as_object().unwrap() {
+            config[knob] = value.clone();
         }
-        let out = &response.shm_outputs[0];
-        let mut genes = read_arrow_from_shm(&out.name, out.size);
-        let _ = SharedMemory::unlink(&out.name);
-        Ok((response.result.unwrap(), genes.remove(0)))
+        config
     }
 
     fn predict(
@@ -1060,27 +1237,14 @@ mod tests {
         names: &[&str],
         sequences: &[&str],
     ) -> Result<(serde_json::Value, RecordBatch), String> {
-        predict_batch(config, &make_input_batch(names, sequences))
-    }
-
-    /// (seq_name, begin, end, strand) of every gene.
-    fn coordinates(genes: &RecordBatch) -> Vec<(String, i32, i32, i32)> {
-        let names = genes.column(0).as_any().downcast_ref::<StringArray>();
-        let int = |i: usize| genes.column(i).as_any().downcast_ref::<Int32Array>();
-        let (begin, end, strand) = (int(1).unwrap(), int(2).unwrap(), int(3).unwrap());
-        (0..genes.num_rows())
-            .map(|i| {
-                let name = names.unwrap().value(i).to_string();
-                (name, begin.value(i), end.value(i), strand.value(i))
-            })
-            .collect()
+        predict_batch(config, &prodigal_batch(names, sequences))
     }
 
     #[test]
     fn test_prodigal_meta_roundtrip() {
         let input_name = unique_shm_name("pd-meta-in");
 
-        let batch = make_input_batch(&["contig_1", "contig_2"], &[TEST_SEQ_1, TEST_SEQ_2]);
+        let batch = prodigal_batch(&["contig_1", "contig_2"], &[TEST_SEQ_1, TEST_SEQ_2]);
 
         let input_shm = write_arrow_to_shm(&input_name, &batch);
         let input_shm_size = input_shm.len();
@@ -1159,7 +1323,7 @@ mod tests {
         let input_name = unique_shm_name("pd-sg-in");
 
         // 960 bp sequences are far below the 20000 bp minimum for training
-        let batch = make_input_batch(&["contig_1"], &[TEST_SEQ_1]);
+        let batch = prodigal_batch(&["contig_1"], &[TEST_SEQ_1]);
         let input_shm = write_arrow_to_shm(&input_name, &batch);
         let input_shm_size = input_shm.len();
 
@@ -1226,7 +1390,7 @@ mod tests {
             .expect("tool should support streaming");
 
         let input_name = unique_shm_name("pd-str-in");
-        let batch = make_input_batch(&["contig_1", "contig_2"], &[TEST_SEQ_1, TEST_SEQ_2]);
+        let batch = prodigal_batch(&["contig_1", "contig_2"], &[TEST_SEQ_1, TEST_SEQ_2]);
         let input_shm = write_arrow_to_shm(&input_name, &batch);
         let input_shm_size = input_shm.len();
 
@@ -1258,7 +1422,7 @@ mod tests {
 
         // Batch 1: one sequence
         let input1 = unique_shm_name("pd-str-b1");
-        let batch1 = make_input_batch(&["contig_1"], &[TEST_SEQ_1]);
+        let batch1 = prodigal_batch(&["contig_1"], &[TEST_SEQ_1]);
         let shm_holder1 = write_arrow_to_shm(&input1, &batch1);
         let shm_holder1_size = shm_holder1.len();
         let resp1 = ctx.run_batch(&input1, shm_holder1_size);
@@ -1268,7 +1432,7 @@ mod tests {
 
         // Batch 2: different sequence
         let input2 = unique_shm_name("pd-str-b2");
-        let batch2 = make_input_batch(&["contig_2"], &[TEST_SEQ_2]);
+        let batch2 = prodigal_batch(&["contig_2"], &[TEST_SEQ_2]);
         let shm_holder2 = write_arrow_to_shm(&input2, &batch2);
         let shm_holder2_size = shm_holder2.len();
         let resp2 = ctx.run_batch(&input2, shm_holder2_size);
@@ -1306,6 +1470,7 @@ mod tests {
             ProdigalGenesSoa::c_layout(),
             ProdigalStats::c_layout(),
             ProdigalSeqInfo::c_layout(),
+            ProdigalTrainingInfo::c_layout(),
             ProdigalAbiField::c_layout(),
         ] {
             let c: Vec<_> = c_rows
@@ -1377,7 +1542,7 @@ mod tests {
     #[test]
     fn test_refused_config_says_why() {
         let reason = |config: &serde_json::Value| unsafe {
-            let pd = Settings::c_config(config).unwrap();
+            let pd = Settings::unchecked(config).unwrap().config;
             let mut msg: [c_char; 256] = [0; 256];
             let rc = prodigal_config_validate(&pd, msg.as_mut_ptr(), msg.len());
             assert_ne!(rc, PRODIGAL_OK, "{config}: the library accepts it");
@@ -1385,7 +1550,7 @@ mod tests {
         };
         let tool = ProdigalTool;
         let input_name = unique_shm_name("pd-refused");
-        let input_shm = write_arrow_to_shm(&input_name, &make_input_batch(&["c1"], &[TEST_SEQ_1]));
+        let input_shm = write_arrow_to_shm(&input_name, &prodigal_batch(&["c1"], &[TEST_SEQ_1]));
         for config in [
             serde_json::json!({"meta_mode": true, "trans_table": 4}),
             serde_json::json!({"meta_mode": true, "force_nonsd": true}),
@@ -1503,25 +1668,11 @@ mod tests {
         let config = serde_json::json!({"meta_mode": false, "train_on_batch": true});
         let (result, genes) = predict(config, &names, &seqs).unwrap();
 
-        let gff = include_str!(concat!(
+        let expected = gff_coordinates(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/ext/prodigal/testdata/ground_truth/ref_single.gff"
-        ));
-        let expected: Vec<(String, i32, i32, i32)> = gff
-            .lines()
-            .filter(|l| !l.starts_with('#'))
-            .map(|l| {
-                let f: Vec<&str> = l.split('\t').collect();
-                let strand = if f[6] == "+" { 1 } else { -1 };
-                (
-                    f[0].to_string(),
-                    f[3].parse().unwrap(),
-                    f[4].parse().unwrap(),
-                    strand,
-                )
-            })
-            .collect();
-        assert_eq!(coordinates(&genes), expected);
+        )));
+        assert_eq!(gene_coordinates(&genes), expected);
         assert_eq!(result["n_genes"], expected.len());
     }
 
@@ -1560,7 +1711,7 @@ mod tests {
         ] {
             let bad = with(TEST_SEQ_2, at, c);
             let input_name = unique_shm_name("pd-drop");
-            let batch = make_input_batch(&["c1", "c2"], &[TEST_SEQ_1, &bad]);
+            let batch = prodigal_batch(&["c1", "c2"], &[TEST_SEQ_1, &bad]);
             let input = write_arrow_to_shm(&input_name, &batch);
             let err = meta
                 .run_batch(&input_name, input.len())
@@ -1571,7 +1722,7 @@ mod tests {
         }
         // The context is still usable
         let input_name = unique_shm_name("pd-drop");
-        let input = write_arrow_to_shm(&input_name, &make_input_batch(&["c1"], &[TEST_SEQ_1]));
+        let input = write_arrow_to_shm(&input_name, &prodigal_batch(&["c1"], &[TEST_SEQ_1]));
         let response = meta.run_batch(&input_name, input.len());
         assert!(response.success, "{:?}", response.error);
         let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
@@ -1611,24 +1762,137 @@ mod tests {
         let config = serde_json::json!({});
         let (_, alone) = predict(config.clone(), &["c1"], &[TEST_SEQ_1]).unwrap();
         let (_, both) = predict(config, &["c1", "c2"], &[TEST_SEQ_1, TEST_SEQ_2]).unwrap();
-        let c1: Vec<_> = coordinates(&both)
+        let c1: Vec<_> = gene_coordinates(&both)
             .into_iter()
             .filter(|g| g.0 == "c1")
             .collect();
         assert!(!c1.is_empty());
-        assert_eq!(coordinates(&alone), c1);
+        assert_eq!(gene_coordinates(&alone), c1);
     }
 
-    /// --describe advertises train_on_batch.
+    /// --describe advertises single-genome mode's routes.
     #[test]
-    fn test_describe_lists_train_on_batch() {
+    fn test_describe_lists_single_mode_routes() {
         let desc = ProdigalTool.describe();
-        let param = desc
-            .config_params
-            .iter()
-            .find(|p| p.name == "train_on_batch");
-        let param = param.expect("train_on_batch param");
-        assert_eq!(param.param_type, "boolean");
-        assert_eq!(param.default, serde_json::json!(false));
+        for (name, param_type, default) in [
+            ("train_on_batch", "boolean", serde_json::json!(false)),
+            ("training_path", "string", serde_json::Value::Null),
+            ("training_sha256", "string", serde_json::Value::Null),
+        ] {
+            let param = desc.config_params.iter().find(|p| p.name == name);
+            let param = param.expect(name);
+            assert_eq!(param.param_type, param_type, "{name}");
+            assert_eq!(param.default, default, "{name}");
+        }
+    }
+
+    /// From a model file, single-genome mode calls the CLI's genes
+    /// (ref_trained.gff: `prodigal -t ref_train.bin` on anthus). A session
+    /// loads the model once and predicts every batch from it: half of
+    /// anthus is too short to train on.
+    #[test]
+    fn test_training_path_predicts_as_the_cli() {
+        let expected = gff_coordinates(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/ext/prodigal/testdata/ground_truth/ref_trained.gff"
+        )));
+        let contigs = anthus();
+        let names: Vec<&str> = contigs.iter().map(|c| c.0.as_str()).collect();
+        let seqs: Vec<&str> = contigs.iter().map(|c| c.1.as_str()).collect();
+        let batch = prodigal_batch(&names, &seqs);
+        let config = from_model(serde_json::json!({}));
+        let (_, genes) = predict_batch(config.clone(), &batch).unwrap();
+        assert_eq!(gene_coordinates(&genes), expected);
+
+        let mut session = ProdigalTool
+            .create_streaming_context(&config)
+            .unwrap()
+            .unwrap();
+        let mut got = Vec::new();
+        for half in [batch.slice(0, 11), batch.slice(11, 11)] {
+            let (_, genes) = predict_in(&mut session, &half).unwrap();
+            got.extend(gene_coordinates(&genes));
+        }
+        assert_eq!(got, expected);
+    }
+
+    /// training_path needs training_sha256, the file's (in either case), so
+    /// a model retrained in place is refused rather than served.
+    #[test]
+    fn test_training_path_checks_the_sha256() {
+        let tool = ProdigalTool;
+        let refused = |config: serde_json::Value| {
+            let err = tool.create_streaming_context(&config).err();
+            err.unwrap_or_else(|| panic!("{config}: accepted"))
+        };
+        let err = refused(from_model(serde_json::json!({"training_sha256": null})));
+        assert!(err.contains("training_sha256"), "{err}");
+        let err = refused(from_model(serde_json::json!({"training_sha256": "abc"})));
+        assert!(err.contains("training_sha256"), "{err}");
+        let sha_only = serde_json::json!({
+            "meta_mode": false,
+            "train_on_batch": true,
+            "training_sha256": REF_TRAIN_SHA256,
+        });
+        assert!(refused(sha_only).contains("training_path"));
+
+        let other = "0".repeat(64);
+        let err = refused(from_model(serde_json::json!({"training_sha256": other})));
+        assert!(
+            err.contains(&other) && err.contains(REF_TRAIN_SHA256),
+            "{err}"
+        );
+
+        let upper = REF_TRAIN_SHA256.to_uppercase();
+        let upper = from_model(serde_json::json!({"training_sha256": upper}));
+        assert!(tool.create_streaming_context(&upper).is_ok());
+    }
+
+    /// A model file that cannot be read, is not a file, is too large to be a
+    /// model (refused before it is read) or that the library refuses is an
+    /// error naming the path.
+    #[test]
+    fn test_training_path_refused_model() {
+        let dir = scratch_dir();
+        let short = dir.path().join("short.bin");
+        let bytes = std::fs::read(REF_TRAIN).unwrap();
+        std::fs::write(&short, &bytes[..1000]).unwrap();
+        let sha = sha256_hex(&bytes[..1000]);
+        let large = dir.path().join("large.bin");
+        std::fs::write(&large, vec![0u8; 2 << 20]).unwrap();
+        let missing = dir.path().join("missing.bin");
+        let not_a_file = dir.path().to_path_buf();
+        for path in [&short, &large, &missing, &not_a_file] {
+            let config =
+                from_model(serde_json::json!({"training_path": path, "training_sha256": sha}));
+            let err = ProdigalTool.create_streaming_context(&config).err();
+            let err = err.expect("refused");
+            assert!(err.contains(path.to_str().unwrap()), "{err}");
+            let unread = path == &large || path == &not_a_file;
+            assert_eq!(err.contains("not a Prodigal model"), unread, "{err}");
+        }
+    }
+
+    /// training_path is single-genome mode's other route. The model carries
+    /// the translation table, start weight and SD choice, so setting them
+    /// with it is an error; closed_ends and mask_regions apply as usual.
+    #[test]
+    fn test_training_path_conflicts() {
+        for (knobs, named) in [
+            (serde_json::json!({"meta_mode": true}), "meta_mode"),
+            (serde_json::json!({"meta_mode": null}), "meta_mode"),
+            (serde_json::json!({"train_on_batch": true}), "alternatives"),
+            (serde_json::json!({"trans_table": 11}), "trans_table"),
+            (serde_json::json!({"start_weight": 4.35}), "start_weight"),
+            (serde_json::json!({"force_nonsd": false}), "force_nonsd"),
+            (serde_json::json!({"training_path": 7}), "training_path"),
+        ] {
+            let config = from_model(knobs);
+            let err = ProdigalTool.create_streaming_context(&config).err();
+            let err = err.unwrap_or_else(|| panic!("{config}: accepted"));
+            assert!(err.contains(named), "{config}: {err}");
+        }
+        let config = from_model(serde_json::json!({"closed_ends": true, "mask_regions": true}));
+        assert!(ProdigalTool.create_streaming_context(&config).is_ok());
     }
 }

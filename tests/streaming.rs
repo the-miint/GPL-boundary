@@ -185,6 +185,7 @@ fn test_init_reply_carries_tool_registry() {
         "bowtie2-build",
         "fasttree",
         "prodigal",
+        "prodigal-train",
         "sortmerna",
     ] {
         assert!(
@@ -783,29 +784,45 @@ fn anthus_batch() -> (RecordBatch, usize) {
 fn test_prodigal_single_mode_routes() {
     let (batch, n_genes) = anthus_batch();
     let shm = ShmGuard::create_with_batch("g2-single", &batch);
-    let configs = [
-        r#"{"meta_mode":false,"train_on_batch":true}"#,
-        r#"{"meta_mode":false,"train_on_batch":true}"#,
-        r#"{"meta_mode":false}"#,
-    ];
+    let trains = serde_json::json!({"meta_mode": false, "train_on_batch": true});
+    let responses = run_session(
+        &shm,
+        &[
+            ("prodigal", trains.clone()),
+            ("prodigal", trains),
+            ("prodigal", serde_json::json!({"meta_mode": false})),
+        ],
+    );
+    for r in &responses[..2] {
+        assert!(r["success"].as_bool().unwrap(), "{r}");
+        assert_eq!(r["result"]["n_genes"].as_u64(), Some(n_genes as u64), "{r}");
+    }
+    let r = &responses[2];
+    assert!(!r["success"].as_bool().unwrap(), "{r}");
+    let err = r["error"].as_str().unwrap();
+    assert!(err.contains("train_on_batch"), "{err}");
+}
 
+/// One daemon session's responses to `batches` (tool, config) on one input,
+/// by batch_id, with their output segments unlinked.
+fn run_session(shm: &ShmGuard, batches: &[(&str, serde_json::Value)]) -> Vec<serde_json::Value> {
     let mut child = spawn_daemon();
     {
         let stdin = child.stdin.as_mut().unwrap();
         stdin.write_all(init_line(None).as_bytes()).unwrap();
-        for (i, config) in configs.iter().enumerate() {
-            let line = format!(
-                "{{\"tool\":\"prodigal\",\"config\":{config},\"shm_input\":\"{}\",\
-                 \"shm_input_size\":{},\"batch_id\":{i}}}\n",
-                shm.name(),
-                shm.size()
-            );
-            stdin.write_all(line.as_bytes()).unwrap();
+        for (i, (tool, config)) in batches.iter().enumerate() {
+            let line = serde_json::json!({
+                "tool": tool,
+                "config": config,
+                "shm_input": shm.name(),
+                "shm_input_size": shm.size(),
+                "batch_id": i,
+            });
+            stdin.write_all(format!("{line}\n").as_bytes()).unwrap();
         }
         stdin.write_all(b"{\"shutdown\":true}\n").unwrap();
     }
     drop(child.stdin.take());
-
     let out = child.wait_with_output().expect("Failed to wait");
     assert!(
         out.status.success(),
@@ -813,13 +830,7 @@ fn test_prodigal_single_mode_routes() {
         String::from_utf8_lossy(&out.stderr)
     );
     let lines = parse_lines(&out.stdout);
-    assert_eq!(lines.len(), 4, "Expected init reply + 3 batch responses");
-    let response = |id: u64| {
-        let found = lines[1..]
-            .iter()
-            .find(|r| r["batch_id"].as_u64() == Some(id));
-        found.unwrap_or_else(|| panic!("missing response with batch_id={id}"))
-    };
+    assert_eq!(lines.len(), batches.len() + 1, "{lines:?}");
     for resp in &lines[1..] {
         if let Some(outputs) = resp["shm_outputs"].as_array() {
             for o in outputs {
@@ -827,16 +838,62 @@ fn test_prodigal_single_mode_routes() {
             }
         }
     }
+    (0..batches.len() as u64)
+        .map(|id| {
+            let found = lines[1..]
+                .iter()
+                .find(|r| r["batch_id"].as_u64() == Some(id));
+            found
+                .unwrap_or_else(|| panic!("missing response with batch_id={id}"))
+                .clone()
+        })
+        .collect()
+}
 
-    for id in [0, 1] {
-        let r = response(id);
-        assert!(r["success"].as_bool().unwrap(), "{r}");
-        assert_eq!(r["result"]["n_genes"].as_u64(), Some(n_genes as u64), "{r}");
-    }
-    let r = response(2);
-    assert!(!r["success"].as_bool().unwrap(), "{r}");
-    assert!(
-        r["error"].as_str().unwrap().contains("train_on_batch"),
-        "{r}"
+/// prodigal-train writes a model; prodigal predicts from it, given its
+/// SHA-256, in another session, and refuses it with any other hash.
+#[test]
+fn test_prodigal_train_then_predict() {
+    let (batch, n_genes) = anthus_batch();
+    let shm = ShmGuard::create_with_batch("g3-train", &batch);
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = dir.path().join("anthus.bin");
+
+    let trained = run_session(
+        &shm,
+        &[("prodigal-train", serde_json::json!({"training_path": path}))],
     );
+    let result = &trained[0]["result"];
+    assert!(trained[0]["success"].as_bool().unwrap(), "{}", trained[0]);
+    let model = |sha: &serde_json::Value| {
+        serde_json::json!({
+            "meta_mode": false,
+            "training_path": result["training_path"],
+            "training_sha256": sha,
+        })
+    };
+
+    let predicted = run_session(
+        &shm,
+        &[
+            ("prodigal", model(&result["training_sha256"])),
+            ("prodigal", model(&serde_json::json!("0".repeat(64)))),
+        ],
+    );
+    assert!(
+        predicted[0]["success"].as_bool().unwrap(),
+        "{}",
+        predicted[0]
+    );
+    assert_eq!(
+        predicted[0]["result"]["n_genes"].as_u64(),
+        Some(n_genes as u64)
+    );
+    assert!(
+        !predicted[1]["success"].as_bool().unwrap(),
+        "{}",
+        predicted[1]
+    );
+    let err = predicted[1]["error"].as_str().unwrap();
+    assert!(err.contains("training_sha256"), "{err}");
 }
