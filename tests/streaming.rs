@@ -747,3 +747,96 @@ fn test_two_fingerprints_in_one_session() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Prodigal single-genome mode
+// ---------------------------------------------------------------------------
+
+/// The Prodigal fork's ground-truth input (22 contigs of 960 bp), as one
+/// batch, and the number of genes `prodigal -p single` calls on it.
+fn anthus_batch() -> (RecordBatch, usize) {
+    let fasta = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/ext/prodigal/anthus_aco.fas"
+    ));
+    let (names, seqs): (Vec<&str>, Vec<String>) = fasta
+        .split('>')
+        .skip(1)
+        .map(|record| {
+            let (header, seq) = record.split_once('\n').unwrap();
+            (header.trim(), seq.split_whitespace().collect())
+        })
+        .unzip();
+    let seqs: Vec<&str> = seqs.iter().map(String::as_str).collect();
+    let gff = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/ext/prodigal/testdata/ground_truth/ref_single.gff"
+    ));
+    let n_genes = gff.lines().filter(|l| !l.starts_with('#')).count();
+    (make_prodigal_batch(&names, &seqs), n_genes)
+}
+
+/// Single-genome mode through the daemon: with train_on_batch, each batch
+/// trains on its own contigs (no context carries over); without it the
+/// batch is refused, and the session goes on.
+#[test]
+fn test_prodigal_single_mode_routes() {
+    let (batch, n_genes) = anthus_batch();
+    let shm = ShmGuard::create_with_batch("g2-single", &batch);
+    let configs = [
+        r#"{"meta_mode":false,"train_on_batch":true}"#,
+        r#"{"meta_mode":false,"train_on_batch":true}"#,
+        r#"{"meta_mode":false}"#,
+    ];
+
+    let mut child = spawn_daemon();
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(init_line(None).as_bytes()).unwrap();
+        for (i, config) in configs.iter().enumerate() {
+            let line = format!(
+                "{{\"tool\":\"prodigal\",\"config\":{config},\"shm_input\":\"{}\",\
+                 \"shm_input_size\":{},\"batch_id\":{i}}}\n",
+                shm.name(),
+                shm.size()
+            );
+            stdin.write_all(line.as_bytes()).unwrap();
+        }
+        stdin.write_all(b"{\"shutdown\":true}\n").unwrap();
+    }
+    drop(child.stdin.take());
+
+    let out = child.wait_with_output().expect("Failed to wait");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines = parse_lines(&out.stdout);
+    assert_eq!(lines.len(), 4, "Expected init reply + 3 batch responses");
+    let response = |id: u64| {
+        let found = lines[1..]
+            .iter()
+            .find(|r| r["batch_id"].as_u64() == Some(id));
+        found.unwrap_or_else(|| panic!("missing response with batch_id={id}"))
+    };
+    for resp in &lines[1..] {
+        if let Some(outputs) = resp["shm_outputs"].as_array() {
+            for o in outputs {
+                unlink_shm(o["name"].as_str().unwrap());
+            }
+        }
+    }
+
+    for id in [0, 1] {
+        let r = response(id);
+        assert!(r["success"].as_bool().unwrap(), "{r}");
+        assert_eq!(r["result"]["n_genes"].as_u64(), Some(n_genes as u64), "{r}");
+    }
+    let r = response(2);
+    assert!(!r["success"].as_bool().unwrap(), "{r}");
+    assert!(
+        r["error"].as_str().unwrap().contains("train_on_batch"),
+        "{r}"
+    );
+}

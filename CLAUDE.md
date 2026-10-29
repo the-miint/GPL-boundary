@@ -25,8 +25,9 @@ spawns it as a long-lived daemon (one per DuckDB instance).
 loading, sortmerna: reference indexing, prodigal: metagenomic bin
 initialization) support batched streaming. The `StreamingContext` trait
 provides `run_batch()` for per-batch work against a pre-loaded context.
-Single-genome prodigal does NOT support streaming (requires all sequences for
-training).
+Single-genome prodigal keeps no context across batches: it trains a fresh
+one on each batch's contigs, so it requires `train_on_batch: true` (each
+batch must hold a whole genome).
 
 **Per-fingerprint dispatch**: every batch carries its own `(tool, config)`
 pair. The coordinator computes a canonical-config fingerprint and routes to
@@ -232,7 +233,7 @@ distinct bump policies and are NOT substitutes for each other:
   protocol checks this.
 
 Current landmark values (see `src/tools/mod.rs::tests::test_describe_version_landmarks`):
-fasttree=3, bowtie2-align=5, prodigal=2, sortmerna/bowtie2-build=1.
+fasttree=3, bowtie2-align=5, prodigal=3, sortmerna/bowtie2-build=1.
 fasttree's history is documented in a CHANGELOG block above its
 `describe()` method. When you intentionally edit a `--describe`
 surface, bump the version in that tool's `describe()` AND update

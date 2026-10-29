@@ -6,6 +6,7 @@ pub mod prodigal;
 pub mod sortmerna;
 
 use crate::protocol::{BatchRequest, Response};
+use std::os::raw::c_int;
 
 /// Description of an Arrow schema field for introspection.
 #[derive(serde::Serialize)]
@@ -23,9 +24,87 @@ pub struct ConfigParam {
     pub param_type: &'static str,
     pub default: serde_json::Value,
     pub description: &'static str,
-    /// If non-empty, the allowed values for this parameter.
+    /// If non-empty, the allowed values for this parameter, of its type.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub allowed_values: Vec<&'static str>,
+    pub allowed_values: Vec<serde_json::Value>,
+}
+
+// --- Config knobs ---
+
+/// Convert a JSON-decoded integer into the `c_int` width the C library
+/// expects, with a positive overflow guard. Negative-value range checks
+/// remain per-knob (some knobs accept 0 as "auto sentinel", others
+/// require strictly positive).
+pub(crate) fn checked_cint(name: &str, v: impl Into<i128>) -> Result<c_int, String> {
+    let v = v.into();
+    if v > c_int::MAX as i128 {
+        return Err(format!(
+            "{name}={v} exceeds C int range (max {})",
+            c_int::MAX
+        ));
+    }
+    if v < c_int::MIN as i128 {
+        return Err(format!("{name}={v} below C int range (min {})", c_int::MIN));
+    }
+    Ok(v as c_int)
+}
+
+/// Check that `config` is an object (null: no knobs) whose knobs are all
+/// among `params` (the tool's --describe).
+pub(crate) fn config_knobs_known(
+    config: &serde_json::Value,
+    params: &[ConfigParam],
+) -> Result<(), String> {
+    let knobs = match config {
+        serde_json::Value::Null => return Ok(()),
+        serde_json::Value::Object(knobs) => knobs,
+        other => return Err(format!("config must be a JSON object, got {other}")),
+    };
+    match knobs.keys().find(|k| !params.iter().any(|p| p.name == *k)) {
+        Some(unknown) => {
+            let known: Vec<&str> = params.iter().map(|p| p.name).collect();
+            Err(format!(
+                "unknown config knob {unknown:?} (known: {})",
+                known.join(", ")
+            ))
+        }
+        None => Ok(()),
+    }
+}
+
+/// A knob's value: `None` if absent or null, an error naming the knob if
+/// `get` does not take it.
+fn config_knob<T>(
+    config: &serde_json::Value,
+    name: &str,
+    what: &str,
+    get: impl Fn(&serde_json::Value) -> Option<T>,
+) -> Result<Option<T>, String> {
+    match config.get(name) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => get(v)
+            .map(Some)
+            .ok_or_else(|| format!("{name} must be {what}, got {v}")),
+    }
+}
+
+pub(crate) fn config_bool(config: &serde_json::Value, name: &str) -> Result<Option<bool>, String> {
+    config_knob(config, name, "a boolean", serde_json::Value::as_bool)
+}
+
+pub(crate) fn config_f64(config: &serde_json::Value, name: &str) -> Result<Option<f64>, String> {
+    config_knob(config, name, "a number", serde_json::Value::as_f64)
+}
+
+/// An integer knob, which must also fit a C int.
+pub(crate) fn config_cint(config: &serde_json::Value, name: &str) -> Result<Option<c_int>, String> {
+    let integer = |v: &serde_json::Value| {
+        let signed = v.as_i64().map(i128::from);
+        signed.or_else(|| v.as_u64().map(i128::from))
+    };
+    config_knob(config, name, "an integer", integer)?
+        .map(|v| checked_cint(name, v))
+        .transpose()
 }
 
 /// Full tool description for programmatic introspection.
@@ -197,9 +276,7 @@ pub fn streaming_setup(
             match t.create_streaming_context(config) {
                 Ok(Some(ctx)) => Ok(Some((ctx, schema_version))),
                 Ok(None) => Ok(None),
-                Err(e) => Err(Response::error(format!(
-                    "Failed to create streaming context for '{tool_name}': {e}"
-                ))),
+                Err(e) => Err(Response::error(format!("{tool_name}: {e}"))),
             }
         }
     }
@@ -372,7 +449,7 @@ mod tests {
     fn test_describe_version_landmarks() {
         let cases: &[(&str, u32)] = &[
             ("fasttree", 3),
-            ("prodigal", 2),
+            ("prodigal", 3),
             ("sortmerna", 1),
             ("bowtie2-align", 5),
             ("bowtie2-build", 1),

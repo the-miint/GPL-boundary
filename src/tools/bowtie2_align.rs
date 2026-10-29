@@ -1286,7 +1286,7 @@ impl GplTool for Bowtie2AlignTool {
                     param_type: "string",
                     default: serde_json::json!("sensitive"),
                     description: "Alignment preset (sensitivity/speed tradeoff)",
-                    allowed_values: vec![
+                    allowed_values: [
                         "very-fast",
                         "fast",
                         "sensitive",
@@ -1295,7 +1295,9 @@ impl GplTool for Bowtie2AlignTool {
                         "fast-local",
                         "sensitive-local",
                         "very-sensitive-local",
-                    ],
+                    ]
+                    .map(Into::into)
+                    .to_vec(),
                 },
                 ConfigParam {
                     name: "local_align",
@@ -1421,7 +1423,7 @@ impl GplTool for Bowtie2AlignTool {
                     param_type: "string",
                     default: serde_json::json!("fr"),
                     description: "Expected mate pair orientation",
-                    allowed_values: vec!["fr", "rf", "ff"],
+                    allowed_values: ["fr", "rf", "ff"].map(Into::into).to_vec(),
                 },
                 ConfigParam {
                     name: "no_mixed",

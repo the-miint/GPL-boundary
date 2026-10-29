@@ -1,12 +1,15 @@
 //! Prodigal adapter: reads Arrow IPC from shared memory, runs prodigal
 //! gene prediction, writes SOA genes as Arrow IPC back to shared memory.
 
-use crate::protocol::{Response, ShmOutput};
-use crate::tools::{ConfigParam, FieldDescription, GplTool, StreamingContext, ToolDescription};
-use arrow::array::{BooleanArray, Float64Array, Int32Array, StringArray};
+use crate::protocol::Response;
+use crate::tools::{
+    config_bool, config_cint, config_f64, config_knobs_known, ConfigParam, FieldDescription,
+    GplTool, StreamingContext, ToolDescription,
+};
+use arrow::array::{Array, BooleanArray, Float64Array, Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::{c_char, c_double, c_int, c_void};
 use std::ptr;
 use std::sync::Arc;
@@ -110,6 +113,13 @@ c_mirror! {
 }
 
 c_mirror! {
+    "prodigal_seq_info_t" => pub struct ProdigalSeqInfo {
+        pub length: i32,
+        pub gc_content: c_double,
+    }
+}
+
+c_mirror! {
     /// A row of prodigal_abi_layout(): the ABI test reads the table with it.
     #[cfg(test)]
     "prodigal_abi_field_t" => pub struct ProdigalAbiField {
@@ -149,6 +159,7 @@ extern "C" {
         lens: *const i32,
         n_seqs: i32,
     ) -> c_int;
+    fn prodigal_get_seq_info(ctx: *const prodigal_ctx_t, info: *mut ProdigalSeqInfo) -> c_int;
     fn prodigal_train(ctx: *mut prodigal_ctx_t) -> c_int;
     fn prodigal_find_genes(
         ctx: *mut prodigal_ctx_t,
@@ -282,9 +293,12 @@ impl GeneAccumulator {
         }
     }
 
-    /// Read C SOA arrays into Rust Vecs. Caller must ensure soa is valid
-    /// and n_genes > 0.
+    /// Read C SOA arrays into Rust Vecs. Caller must ensure soa is valid.
     unsafe fn append_from_soa(&mut self, seq_name: &str, soa: &ProdigalGenesSoa) {
+        // With no genes the arrays may be NULL
+        if soa.n_genes <= 0 {
+            return;
+        }
         let n = soa.n_genes as usize;
 
         let begin = std::slice::from_raw_parts(soa.begin, n);
@@ -394,252 +408,300 @@ inventory::submit! {
     }
 }
 
-/// Parsed prodigal config values shared by execute() and create_streaming_context().
-struct ProdigalParsedConfig {
-    meta_mode: bool,
-    /// None: the library's default (prodigal_config_init_v)
-    trans_table: Option<c_int>,
-    closed_ends: bool,
-    mask_regions: bool,
-    force_nonsd: bool,
-    /// None: the library's default, the only weight metagenomic mode takes
-    start_weight: Option<f64>,
-    verbose: bool,
+/// A request's config, checked: the library's defaults with the JSON's
+/// knobs applied, which prodigal_config_validate accepts.
+struct Settings {
+    config: ProdigalConfig,
 }
 
-impl ProdigalParsedConfig {
-    fn from_json(config: &serde_json::Value) -> Self {
-        Self {
-            meta_mode: config
-                .get("meta_mode")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true),
-            trans_table: config
-                .get("trans_table")
-                .and_then(|v| v.as_i64())
-                .map(|t| t as c_int),
-            closed_ends: config
-                .get("closed_ends")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            mask_regions: config
-                .get("mask_regions")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            force_nonsd: config
-                .get("force_nonsd")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            start_weight: config.get("start_weight").and_then(|v| v.as_f64()),
-            verbose: config
-                .get("verbose")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-        }
-    }
-
-    /// Build a C ProdigalConfig from parsed values, on the library's
-    /// defaults.
-    unsafe fn c_config(&self) -> Result<ProdigalConfig, String> {
-        let mut pd = ProdigalConfig::library_defaults()?;
-        if let Some(table) = self.trans_table {
-            pd.trans_table = table;
-        }
-        pd.closed_ends = if self.closed_ends { 1 } else { 0 };
-        pd.mask_regions = if self.mask_regions { 1 } else { 0 };
-        pd.force_nonsd = if self.force_nonsd { 1 } else { 0 };
-        pd.meta_mode = if self.meta_mode { 1 } else { 0 };
-        if let Some(weight) = self.start_weight {
-            pd.start_weight = weight;
-        }
-        if self.verbose {
-            pd.log_callback = Some(stderr_log_callback);
-        }
-        Ok(pd)
-    }
-
-    /// Create a context, or say why not: the library's reason for a config
-    /// it refuses (prodigal_config_validate), else out of memory.
-    unsafe fn create_context(&self) -> Result<*mut prodigal_ctx_t, String> {
-        let pd = self.c_config()?;
-        let ctx = prodigal_create(&pd);
-        if !ctx.is_null() {
-            return Ok(ctx);
-        }
+impl Settings {
+    /// Parse and check a request's config, before any input is read.
+    fn parse(json: &serde_json::Value) -> Result<Self, String> {
+        let config = Self::c_config(json)?;
         let mut msg: [c_char; 256] = [0; 256];
-        if prodigal_config_validate(&pd, msg.as_mut_ptr(), msg.len()) != PRODIGAL_OK {
+        if unsafe { prodigal_config_validate(&config, msg.as_mut_ptr(), msg.len()) } != PRODIGAL_OK
+        {
             let why = c_buf_to_string(&msg);
             return Err(format!("Invalid prodigal config: {why}"));
         }
-        Err("Failed to create prodigal context (out of memory)".to_string())
+        Ok(Self { config })
     }
-}
 
-impl ProdigalTool {
-    /// Read Arrow IPC stream from shared memory, extract name and sequence columns.
-    fn read_input(
-        shm_input: &str,
-        shm_input_size: usize,
-    ) -> Result<(Vec<String>, Vec<String>), String> {
-        let batches = crate::arrow_ipc::read_batches_from_shm(shm_input, shm_input_size)?;
+    /// The JSON's knobs, strictly typed, on the library's defaults (what
+    /// the JSON omits keeps them).
+    fn c_config(json: &serde_json::Value) -> Result<ProdigalConfig, String> {
+        config_knobs_known(json, &ProdigalTool.describe().config_params)?;
 
-        let mut all_names = Vec::new();
-        let mut all_seqs = Vec::new();
-
-        for batch in &batches {
-            let name_col = batch
-                .column_by_name("name")
-                .ok_or("Input missing 'name' column")?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or("'name' column is not Utf8")?;
-
-            let seq_col = batch
-                .column_by_name("sequence")
-                .ok_or("Input missing 'sequence' column")?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or("'sequence' column is not Utf8")?;
-
-            for i in 0..batch.num_rows() {
-                all_names.push(name_col.value(i).to_string());
-                all_seqs.push(seq_col.value(i).to_string());
+        let mut c = unsafe { ProdigalConfig::library_defaults()? };
+        let meta_mode = config_bool(json, "meta_mode")?.unwrap_or(true);
+        let train_on_batch = config_bool(json, "train_on_batch")?.unwrap_or(false);
+        c.meta_mode = meta_mode.into();
+        if let Some(table) = config_cint(json, "trans_table")? {
+            c.trans_table = table;
+        }
+        for (name, field) in [
+            ("closed_ends", &mut c.closed_ends),
+            ("mask_regions", &mut c.mask_regions),
+            ("force_nonsd", &mut c.force_nonsd),
+        ] {
+            if let Some(on) = config_bool(json, name)? {
+                *field = on.into();
             }
         }
+        if let Some(weight) = config_f64(json, "start_weight")? {
+            c.start_weight = weight;
+        }
+        if config_bool(json, "verbose")?.unwrap_or(false) {
+            c.log_callback = Some(stderr_log_callback);
+        }
 
-        Ok((all_names, all_seqs))
+        // A batch may hold part of a genome, so training on it must be asked for
+        if meta_mode && train_on_batch {
+            return Err("train_on_batch applies to single-genome mode (meta_mode=false)".into());
+        }
+        if !meta_mode && !train_on_batch {
+            return Err(
+                "single-genome mode (meta_mode=false) trains on the batch's \
+                 contigs: set train_on_batch=true if each batch holds a whole genome"
+                    .into(),
+            );
+        }
+        Ok(c)
     }
 
-    /// Build Arrow RecordBatch from accumulated genes and write to output shm.
-    fn write_output(accumulator: GeneAccumulator) -> Result<ShmOutput, String> {
-        let batch = accumulator.into_record_batch()?;
-        crate::arrow_ipc::write_batch_to_output_shm(&batch, "genes")
+    fn meta_mode(&self) -> bool {
+        self.config.meta_mode != 0
     }
 }
 
-// --- Streaming context ---
+/// A batch's contigs, read in place from the input mapping: its (name,
+/// sequence) columns, which hold no nulls and no character the library
+/// drops.
+struct Contigs(Vec<(StringArray, StringArray)>);
 
-/// Holds a prodigal context for batched streaming. The metagenomic bin
-/// initialization (~28MB) happens once on the first `find_genes` call
-/// and is reused across all subsequent batches.
-struct ProdigalStreamingContext {
-    ctx: *mut prodigal_ctx_t,
+impl Contigs {
+    fn read(shm_input: &str, shm_input_size: usize) -> Result<Self, String> {
+        let batches = crate::arrow_ipc::read_batches_from_shm(shm_input, shm_input_size)?;
+        let mut columns = Vec::with_capacity(batches.len());
+        let mut row = 0;
+        for batch in &batches {
+            let column = |name: &str| {
+                let col = batch
+                    .column_by_name(name)
+                    .ok_or_else(|| format!("Input missing '{name}' column"))?;
+                let col = col.as_any().downcast_ref::<StringArray>();
+                col.cloned()
+                    .ok_or_else(|| format!("'{name}' column is not Utf8"))
+            };
+            let (names, seqs) = (column("name")?, column("sequence")?);
+            for i in 0..batch.num_rows() {
+                // 1-based, as positions in a sequence
+                let row = row + i + 1;
+                if names.is_null(i) {
+                    return Err(format!("input row {row}: null name"));
+                }
+                let name = names.value(i);
+                if seqs.is_null(i) {
+                    return Err(format!("contig '{name}' (input row {row}): null sequence"));
+                }
+                if let Some(why) = dropped_character(seqs.value(i)) {
+                    return Err(format!("contig '{name}': {why}"));
+                }
+            }
+            row += batch.num_rows();
+            columns.push((names, seqs));
+        }
+        if row == 0 {
+            return Err("At least 1 sequence required".into());
+        }
+        Ok(Self(columns))
+    }
+
+    /// (name, sequence) of each contig, in input order.
+    fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        let batches = self.0.iter();
+        batches.flat_map(|(names, seqs)| (0..names.len()).map(|i| (names.value(i), seqs.value(i))))
+    }
 }
 
-// Safety: The underlying C context is not thread-safe, but no shared
-// references to self.ctx are handed out. Only &mut self methods exist
-// (run_batch), so exclusive access is enforced at the type level.
-unsafe impl Send for ProdigalStreamingContext {}
+/// A sequence's length as the library takes it. Utf8 offsets are i32, so
+/// an Arrow value's length always fits.
+fn c_len(seq: &str) -> i32 {
+    seq.len() as i32
+}
 
-impl Drop for ProdigalStreamingContext {
+/// A sequence's first character outside 'A'..'z', which the library would
+/// drop (shifting every coordinate after it), as an error.
+fn dropped_character(seq: &str) -> Option<String> {
+    let at = seq.bytes().position(|b| !(b'A'..=b'z').contains(&b))?;
+    // Every byte before it is ASCII, so it starts a character
+    let c = seq[at..].chars().next().unwrap();
+    Some(format!(
+        "{c:?} at position {} is not a base or an ambiguity code (Prodigal \
+         would drop it, shifting every coordinate after it)",
+        at + 1
+    ))
+}
+
+/// An owned prodigal context, destroyed on drop.
+struct Context(*mut prodigal_ctx_t);
+
+impl Drop for Context {
     fn drop(&mut self) {
-        if !self.ctx.is_null() {
-            unsafe { prodigal_destroy(self.ctx) };
-        }
+        unsafe { prodigal_destroy(self.0) };
     }
 }
 
-impl StreamingContext for ProdigalStreamingContext {
-    fn run_batch(&mut self, shm_input: &str, shm_input_size: usize) -> Response {
-        let (names, sequences) = match ProdigalTool::read_input(shm_input, shm_input_size) {
-            Ok(data) => data,
-            Err(e) => return Response::error(e),
-        };
-
-        if names.is_empty() {
-            return Response::error("At least 1 sequence required");
+impl Context {
+    fn new(settings: &Settings) -> Result<Self, String> {
+        let ctx = unsafe { prodigal_create(&settings.config) };
+        if ctx.is_null() {
+            // Settings::parse has validated the config
+            return Err("Failed to create prodigal context (out of memory)".into());
         }
+        Ok(Self(ctx))
+    }
 
+    /// A call's result: the library's error code and message if it failed.
+    fn check(&self, rc: c_int) -> Result<(), String> {
+        if rc == PRODIGAL_OK {
+            return Ok(());
+        }
+        let (code, msg) = unsafe {
+            (
+                CStr::from_ptr(prodigal_strerror(rc)),
+                CStr::from_ptr(prodigal_last_error(self.0)),
+            )
+        };
+        Err(format!(
+            "{}: {}",
+            code.to_string_lossy(),
+            msg.to_string_lossy()
+        ))
+    }
+
+    /// Train on every contig, as the CLI's single-genome mode does.
+    fn train(&mut self, contigs: &Contigs) -> Result<(), String> {
+        let (seqs, lens): (Vec<*const c_char>, Vec<i32>) = contigs
+            .iter()
+            .map(|(_, s)| (s.as_ptr().cast(), c_len(s)))
+            .unzip();
+        let n = i32::try_from(seqs.len()).map_err(|_| "too many contigs to train on")?;
         unsafe {
-            let mut accumulator = GeneAccumulator::new();
-            let mut last_stats: ProdigalStats = std::mem::zeroed();
+            let rc = prodigal_set_training_sequences(
+                self.0,
+                seqs.as_ptr(),
+                ptr::null(),
+                lens.as_ptr(),
+                n,
+            );
+            self.check(rc)
+                .and_then(|()| self.check(prodigal_train(self.0)))
+        }
+        .map_err(|e| format!("training on the batch: {e}"))
+    }
 
-            for (name, sequence) in names.iter().zip(sequences.iter()) {
-                if sequence.len() > i32::MAX as usize {
-                    return Response::error(format!(
-                        "Sequence '{}' is too long: {} bytes (max {})",
-                        name,
-                        sequence.len(),
-                        i32::MAX
-                    ));
-                }
-                let c_seq = match CString::new(sequence.as_str()) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        return Response::error(format!(
-                            "Sequence '{name}' contains interior null byte"
-                        ));
-                    }
-                };
-                let c_header = match CString::new(name.as_str()) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        return Response::error(format!(
-                            "Sequence name '{name}' contains interior null byte"
-                        ));
-                    }
-                };
-                let seq_len = sequence.len() as i32;
+    /// Load a contig, checking the library kept all of it.
+    fn load(&mut self, seq: &str) -> Result<(), String> {
+        unsafe {
+            let rc = prodigal_set_sequence(self.0, seq.as_ptr().cast(), c_len(seq), ptr::null());
+            self.check(rc)?;
+            let mut info: ProdigalSeqInfo = std::mem::zeroed();
+            if prodigal_get_seq_info(self.0, &mut info) != PRODIGAL_OK {
+                return Err("prodigal_get_seq_info failed".into());
+            }
+            // Contigs::read refused what the library drops: this catches a
+            // change in that rule
+            if info.length != c_len(seq) {
+                let kept = info.length;
+                return Err(format!(
+                    "Prodigal kept {kept} of its {} characters",
+                    seq.len()
+                ));
+            }
+        }
+        Ok(())
+    }
 
-                // prodigal_set_sequence resets internal state from any previous
-                // sequence. The context is safe to reuse after errors — the
-                // next set_sequence call will reset.
-                let rc =
-                    prodigal_set_sequence(self.ctx, c_seq.as_ptr(), seq_len, c_header.as_ptr());
-                if rc != PRODIGAL_OK {
-                    let err_msg = CStr::from_ptr(prodigal_last_error(self.ctx))
-                        .to_string_lossy()
-                        .into_owned();
-                    let code_msg = CStr::from_ptr(prodigal_strerror(rc))
-                        .to_string_lossy()
-                        .into_owned();
-                    return Response::error(format!("{code_msg}: {err_msg}"));
-                }
-
-                let mut genes: *mut ProdigalGenesSoa = ptr::null_mut();
-                let mut stats: ProdigalStats = std::mem::zeroed();
-
-                let rc = prodigal_find_genes(self.ctx, &mut genes, &mut stats);
-                if rc != PRODIGAL_OK {
-                    let err_msg = CStr::from_ptr(prodigal_last_error(self.ctx))
-                        .to_string_lossy()
-                        .into_owned();
-                    let code_msg = CStr::from_ptr(prodigal_strerror(rc))
-                        .to_string_lossy()
-                        .into_owned();
-                    return Response::error(format!("{code_msg}: {err_msg}"));
-                }
-
+    /// Find the genes of every contig, and respond with them.
+    fn predict(&mut self, contigs: &Contigs) -> Result<Response, String> {
+        let mut accumulator = GeneAccumulator::new();
+        let mut last_stats: ProdigalStats = unsafe { std::mem::zeroed() };
+        for (name, seq) in contigs.iter() {
+            let contig = |e: String| format!("contig '{name}': {e}");
+            self.load(seq).map_err(contig)?;
+            let mut genes: *mut ProdigalGenesSoa = ptr::null_mut();
+            unsafe {
+                let rc = prodigal_find_genes(self.0, &mut genes, &mut last_stats);
+                self.check(rc).map_err(contig)?;
                 if !genes.is_null() {
-                    if (*genes).n_genes > 0 {
-                        accumulator.append_from_soa(name, &*genes);
-                    }
+                    accumulator.append_from_soa(name, &*genes);
                     prodigal_genes_free(genes);
                 }
-                last_stats = stats;
             }
-
-            let total_genes = accumulator.n_genes();
-
-            let shm_out = match ProdigalTool::write_output(accumulator) {
-                Ok(v) => v,
-                Err(e) => return Response::error(e),
-            };
-
-            let result = serde_json::json!({
-                "n_genes": total_genes,
-                "n_sequences": names.len(),
-                "stats": {
-                    "gc_content": last_stats.gc_content,
-                    "translation_table": last_stats.translation_table,
-                    "uses_sd": last_stats.uses_sd,
-                    "best_meta_bin": last_stats.best_meta_bin,
-                    "best_meta_desc": c_buf_to_string(&last_stats.best_meta_desc),
-                }
-            });
-
-            Response::ok(result, vec![shm_out])
         }
+
+        let n_genes = accumulator.n_genes();
+        let batch = accumulator.into_record_batch()?;
+        let shm_out = crate::arrow_ipc::write_batch_to_output_shm(&batch, "genes")?;
+        let result = serde_json::json!({
+            "n_genes": n_genes,
+            "n_sequences": contigs.iter().count(),
+            "stats": {
+                "gc_content": last_stats.gc_content,
+                "translation_table": last_stats.translation_table,
+                "uses_sd": last_stats.uses_sd,
+                "best_meta_bin": last_stats.best_meta_bin,
+                "best_meta_desc": c_buf_to_string(&last_stats.best_meta_desc),
+            }
+        });
+        Ok(Response::ok(result, vec![shm_out]))
+    }
+}
+
+/// What a request's batches run on: execute() runs one, a streaming
+/// session every batch of its config.
+enum Session {
+    /// One context for every batch: in metagenomic mode the bins are set up
+    /// at the first contig and reused for every batch after
+    Shared(Context),
+    /// A context for each batch, trained on the batch's contigs
+    /// (single-genome mode, train_on_batch)
+    TrainOnBatch(Settings),
+}
+
+// Safety: The C context is not thread-safe, but no references to it are
+// handed out: only Session's &mut self methods reach it, so exclusive
+// access is enforced at the type level. The config's pointers are null or
+// a static function.
+unsafe impl Send for Session {}
+
+impl Session {
+    fn new(settings: Settings) -> Result<Self, String> {
+        Ok(if settings.meta_mode() {
+            Self::Shared(Context::new(&settings)?)
+        } else {
+            Self::TrainOnBatch(settings)
+        })
+    }
+
+    fn run(&mut self, contigs: &Contigs) -> Result<Response, String> {
+        match self {
+            Self::Shared(ctx) => ctx.predict(contigs),
+            Self::TrainOnBatch(settings) => {
+                let mut ctx = Context::new(settings)?;
+                ctx.train(contigs)?;
+                ctx.predict(contigs)
+            }
+        }
+    }
+}
+
+impl StreamingContext for Session {
+    fn run_batch(&mut self, shm_input: &str, shm_input_size: usize) -> Response {
+        Contigs::read(shm_input, shm_input_size)
+            .and_then(|contigs| self.run(&contigs))
+            .unwrap_or_else(Response::error)
     }
 }
 
@@ -667,15 +729,26 @@ impl GplTool for ProdigalTool {
             // 2: trans_table lists the supported tables, and the metagenomic
             // limits of trans_table / force_nonsd / start_weight are stated
             // (Prodigal 2.6.5 refuses other values); rbs_* say "None".
-            describe_version: 2,
+            // 3: train_on_batch; trans_table's allowed values are integers;
+            // the input's nulls and dropped characters are refused.
+            describe_version: 3,
             description: "Prokaryotic gene prediction for metagenomic and single-genome sequences",
             config_params: vec![
                 ConfigParam {
                     name: "meta_mode",
                     param_type: "boolean",
                     default: serde_json::json!(true),
-                    description:
-                        "Use pre-trained metagenomic models (true) or train on input (false)",
+                    description: "Use pre-trained metagenomic models (true) or train on the \
+                                  input (false, which needs train_on_batch)",
+                    allowed_values: vec![],
+                },
+                ConfigParam {
+                    name: "train_on_batch",
+                    param_type: "boolean",
+                    default: serde_json::json!(false),
+                    description: "Single-genome mode (meta_mode=false) only, and required \
+                                  there: train on each batch's own contigs, so each batch \
+                                  must hold a whole genome",
                     allowed_values: vec![],
                 },
                 ConfigParam {
@@ -685,7 +758,9 @@ impl GplTool for ProdigalTool {
                     description: "NCBI translation table number (11: bacteria, archaea, \
                                   plant plastids). Metagenomic mode takes 11 only (its bins \
                                   choose 11 or 4 per contig); the others need single-genome mode",
-                    allowed_values: vec!["4", "5", "9", "11", "13", "15", "21", "25", "26", "32"],
+                    allowed_values: [4, 5, 9, 11, 13, 15, 21, 25, 26, 32]
+                        .map(Into::into)
+                        .to_vec(),
                 },
                 ConfigParam {
                     name: "closed_ends",
@@ -736,7 +811,9 @@ impl GplTool for ProdigalTool {
                     name: "sequence",
                     arrow_type: "Utf8",
                     nullable: false,
-                    description: "Nucleotide sequence (sequences may have different lengths)",
+                    description: "Nucleotide sequence (sequences may have different \
+                                  lengths); a character outside 'A'..'z', which Prodigal \
+                                  would drop, is an error",
                 },
             ],
             output_schema: vec![
@@ -892,172 +969,9 @@ impl GplTool for ProdigalTool {
         shm_input: &str,
         shm_input_size: usize,
     ) -> Response {
-        // Read input sequences from Arrow IPC in shared memory
-        let (names, sequences) = match Self::read_input(shm_input, shm_input_size) {
-            Ok(data) => data,
-            Err(e) => return Response::error(e),
-        };
-
-        if names.is_empty() {
-            return Response::error("At least 1 sequence required");
-        }
-
-        // Parse config
-        let parsed = ProdigalParsedConfig::from_json(config);
-
-        unsafe {
-            let ctx = match parsed.create_context() {
-                Ok(ctx) => ctx,
-                Err(e) => return Response::error(e),
-            };
-
-            // Single-genome mode: train on all input sequences first
-            if !parsed.meta_mode {
-                let c_seqs: Vec<CString> = match sequences
-                    .iter()
-                    .map(|s| CString::new(s.as_str()))
-                    .collect::<Result<Vec<_>, _>>()
-                {
-                    Ok(v) => v,
-                    Err(_) => {
-                        prodigal_destroy(ctx);
-                        return Response::error("Sequence contains interior null byte");
-                    }
-                };
-                let c_headers: Vec<CString> = match names
-                    .iter()
-                    .map(|n| CString::new(n.as_str()))
-                    .collect::<Result<Vec<_>, _>>()
-                {
-                    Ok(v) => v,
-                    Err(_) => {
-                        prodigal_destroy(ctx);
-                        return Response::error("Sequence name contains interior null byte");
-                    }
-                };
-                let seq_lens: Vec<i32> = sequences.iter().map(|s| s.len() as i32).collect();
-                let seq_ptrs: Vec<*const c_char> = c_seqs.iter().map(|s| s.as_ptr()).collect();
-                let hdr_ptrs: Vec<*const c_char> = c_headers.iter().map(|h| h.as_ptr()).collect();
-
-                let rc = prodigal_set_training_sequences(
-                    ctx,
-                    seq_ptrs.as_ptr(),
-                    hdr_ptrs.as_ptr(),
-                    seq_lens.as_ptr(),
-                    sequences.len() as i32,
-                );
-                if rc != PRODIGAL_OK {
-                    let err_msg = CStr::from_ptr(prodigal_last_error(ctx))
-                        .to_string_lossy()
-                        .into_owned();
-                    let code_msg = CStr::from_ptr(prodigal_strerror(rc))
-                        .to_string_lossy()
-                        .into_owned();
-                    prodigal_destroy(ctx);
-                    return Response::error(format!("{code_msg}: {err_msg}"));
-                }
-
-                let rc = prodigal_train(ctx);
-                if rc != PRODIGAL_OK {
-                    let err_msg = CStr::from_ptr(prodigal_last_error(ctx))
-                        .to_string_lossy()
-                        .into_owned();
-                    let code_msg = CStr::from_ptr(prodigal_strerror(rc))
-                        .to_string_lossy()
-                        .into_owned();
-                    prodigal_destroy(ctx);
-                    return Response::error(format!("{code_msg}: {err_msg}"));
-                }
-            }
-
-            // Find genes per contig
-            let mut accumulator = GeneAccumulator::new();
-            let mut last_stats: ProdigalStats = std::mem::zeroed();
-
-            for (name, sequence) in names.iter().zip(sequences.iter()) {
-                let c_seq = match CString::new(sequence.as_str()) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        prodigal_destroy(ctx);
-                        return Response::error(format!(
-                            "Sequence '{name}' contains interior null byte"
-                        ));
-                    }
-                };
-                let c_header = match CString::new(name.as_str()) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        prodigal_destroy(ctx);
-                        return Response::error(format!(
-                            "Sequence name '{name}' contains interior null byte"
-                        ));
-                    }
-                };
-                let seq_len = sequence.len() as i32;
-
-                let rc = prodigal_set_sequence(ctx, c_seq.as_ptr(), seq_len, c_header.as_ptr());
-                if rc != PRODIGAL_OK {
-                    let err_msg = CStr::from_ptr(prodigal_last_error(ctx))
-                        .to_string_lossy()
-                        .into_owned();
-                    let code_msg = CStr::from_ptr(prodigal_strerror(rc))
-                        .to_string_lossy()
-                        .into_owned();
-                    prodigal_destroy(ctx);
-                    return Response::error(format!("{code_msg}: {err_msg}"));
-                }
-
-                let mut genes: *mut ProdigalGenesSoa = ptr::null_mut();
-                let mut stats: ProdigalStats = std::mem::zeroed();
-
-                let rc = prodigal_find_genes(ctx, &mut genes, &mut stats);
-                if rc != PRODIGAL_OK {
-                    let err_msg = CStr::from_ptr(prodigal_last_error(ctx))
-                        .to_string_lossy()
-                        .into_owned();
-                    let code_msg = CStr::from_ptr(prodigal_strerror(rc))
-                        .to_string_lossy()
-                        .into_owned();
-                    prodigal_destroy(ctx);
-                    return Response::error(format!("{code_msg}: {err_msg}"));
-                }
-
-                if !genes.is_null() {
-                    if (*genes).n_genes > 0 {
-                        accumulator.append_from_soa(name, &*genes);
-                    }
-                    prodigal_genes_free(genes);
-                }
-                last_stats = stats;
-            }
-
-            // Capture total gene count before moving accumulator
-            let total_genes = accumulator.n_genes();
-
-            // Write accumulated genes to output shm
-            let shm_out = match Self::write_output(accumulator) {
-                Ok(v) => v,
-                Err(e) => {
-                    prodigal_destroy(ctx);
-                    return Response::error(e);
-                }
-            };
-
-            let result = serde_json::json!({
-                "n_genes": total_genes,
-                "n_sequences": names.len(),
-                "stats": {
-                    "gc_content": last_stats.gc_content,
-                    "translation_table": last_stats.translation_table,
-                    "uses_sd": last_stats.uses_sd,
-                    "best_meta_bin": last_stats.best_meta_bin,
-                    "best_meta_desc": c_buf_to_string(&last_stats.best_meta_desc),
-                }
-            });
-
-            prodigal_destroy(ctx);
-
-            Response::ok(result, vec![shm_out])
+        match Settings::parse(config).and_then(Session::new) {
+            Ok(mut session) => session.run_batch(shm_input, shm_input_size),
+            Err(e) => Response::error(e),
         }
     }
 
@@ -1065,20 +979,8 @@ impl GplTool for ProdigalTool {
         &self,
         config: &serde_json::Value,
     ) -> Result<Option<Box<dyn StreamingContext>>, String> {
-        let parsed = ProdigalParsedConfig::from_json(config);
-
-        if !parsed.meta_mode {
-            return Err(
-                "Prodigal single-genome mode requires all sequences for training; \
-                 use meta_mode for streaming"
-                    .to_string(),
-            );
-        }
-
-        unsafe {
-            let ctx = parsed.create_context()?;
-            Ok(Some(Box::new(ProdigalStreamingContext { ctx })))
-        }
+        let session = Session::new(Settings::parse(config)?)?;
+        Ok(Some(Box::new(session)))
     }
 }
 
@@ -1087,7 +989,6 @@ mod tests {
     use super::*;
     use crate::shm::SharedMemory;
     use crate::test_util::{read_arrow_from_shm, unique_shm_name, write_arrow_to_shm};
-    use arrow::array::Array;
 
     // Test sequences from Prodigal's anthus_aco.fas (960 bp each)
     const TEST_SEQ_1: &str = "ACAGGTTAGAAACTACTCTGTTTTCTGGCTCCTTGTTTAATGCCCTGTCCTATTTTATTGCGAAAATTGTCTGTTTTTCACAGAAAACTGAGAGTAGTCAAGGGATTCCTTGTCCTTTGCTTTGGTCTGCACAGCTGTCTTGTTTTAAGGCCAAGTGGAATGAGACAGCTGACTCTTCAGGTGTGAAAACTTGGATGTAGGTGTAGATTGGCTCTCAGTTGACCTCCAGCTGGTGCAGATTCTTCAGTTTGTTTGATGGAGCTTTGAGAAGTCCTTTCAGACTGAAGGATACTCTGAATTTTAGCTATGGAGATAATGTGGATGTTGTGTGTTTAAGTCCTGTTTGCAGTTTTTTTCTGTTCAGTCAGTTATTTTACTGTGTGAGTCAGGACCCTTAGAAGCCCTCAGTGGCAACCACAGAGCGCACAGTTAATTTTCTGTGCAAGAAAATTAAGATCATACTCTGTGTCCAGGAAAGTCAAGAATATTCCTGGTTTTCTCTACTGTAAAATTTTATCTTGTAACTTGTGTTTGGGTCTGCATGATTATTCAAAAATCTTAGTAGATTTGGAAGGATGTTGCATATTATGGAAACAAAGTTGGAAAAAGTTTGTATCAGTTGCAGTATTTCTTCACATCATTTNTTAACNNCNTNNNNNNNNNGCTTCTGCCACTTGAAAAGACAAATTAAAAACNAATTTATAATGCTTATATGCTTTAGTTACATTNGGGTCTTTCAGTAACTTTAGTGCTTTTGATAGCCATACCTGTGAGNTTGACAGTGTCTAAAATTAGAAGTGTTCCTTTTCTTCTGCTCTTCCCATTCTCGTGTGTCTTCAATAGTTTCTGCAAATAATGATGTGCAGACTTAGCATTGATTCAACAGCAGAGGTAAGCATACCTGTGGCTTACTTGGCTTCAGCTTATCCAGCAGTGCCAACCACTCTCTGTTTGTCTTAC";
@@ -1103,6 +1004,76 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    /// An input batch whose columns may hold nulls.
+    fn make_nullable_batch(names: &[Option<&str>], sequences: &[Option<&str>]) -> RecordBatch {
+        let schema = Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("sequence", DataType::Utf8, true),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(names.to_vec())),
+                Arc::new(StringArray::from(sequences.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The fork's ground-truth input (22 contigs of 960 bp): (name, sequence).
+    fn anthus() -> Vec<(String, String)> {
+        let fasta = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/ext/prodigal/anthus_aco.fas"
+        ));
+        fasta
+            .split('>')
+            .skip(1)
+            .map(|record| {
+                let (header, seq) = record.split_once('\n').unwrap();
+                (header.trim().to_string(), seq.split_whitespace().collect())
+            })
+            .collect()
+    }
+
+    /// execute() on a batch: the result JSON and the genes, or the error.
+    fn predict_batch(
+        config: serde_json::Value,
+        batch: &RecordBatch,
+    ) -> Result<(serde_json::Value, RecordBatch), String> {
+        let input_name = unique_shm_name("pd-run");
+        let input = write_arrow_to_shm(&input_name, batch);
+        let response = ProdigalTool.execute(&config, &input_name, input.len());
+        if !response.success {
+            return Err(response.error.unwrap());
+        }
+        let out = &response.shm_outputs[0];
+        let mut genes = read_arrow_from_shm(&out.name, out.size);
+        let _ = SharedMemory::unlink(&out.name);
+        Ok((response.result.unwrap(), genes.remove(0)))
+    }
+
+    fn predict(
+        config: serde_json::Value,
+        names: &[&str],
+        sequences: &[&str],
+    ) -> Result<(serde_json::Value, RecordBatch), String> {
+        predict_batch(config, &make_input_batch(names, sequences))
+    }
+
+    /// (seq_name, begin, end, strand) of every gene.
+    fn coordinates(genes: &RecordBatch) -> Vec<(String, i32, i32, i32)> {
+        let names = genes.column(0).as_any().downcast_ref::<StringArray>();
+        let int = |i: usize| genes.column(i).as_any().downcast_ref::<Int32Array>();
+        let (begin, end, strand) = (int(1).unwrap(), int(2).unwrap(), int(3).unwrap());
+        (0..genes.num_rows())
+            .map(|i| {
+                let name = names.unwrap().value(i).to_string();
+                (name, begin.value(i), end.value(i), strand.value(i))
+            })
+            .collect()
     }
 
     #[test]
@@ -1195,6 +1166,7 @@ mod tests {
         let tool = ProdigalTool;
         let config = serde_json::json!({
             "meta_mode": false,
+            "train_on_batch": true,
             "trans_table": 11,
         });
 
@@ -1242,19 +1214,6 @@ mod tests {
             result.unwrap().is_some(),
             "Expected Some(ctx) for meta_mode streaming"
         );
-    }
-
-    #[test]
-    fn test_prodigal_streaming_rejects_single_genome() {
-        let tool = ProdigalTool;
-        let config = serde_json::json!({"meta_mode": false});
-        match tool.create_streaming_context(&config) {
-            Err(err) => assert!(
-                err.contains("single-genome") || err.contains("training"),
-                "Expected single-genome rejection, got: {err}"
-            ),
-            Ok(_) => panic!("Expected error for single-genome streaming"),
-        }
     }
 
     #[test]
@@ -1346,6 +1305,7 @@ mod tests {
             ProdigalConfig::c_layout(),
             ProdigalGenesSoa::c_layout(),
             ProdigalStats::c_layout(),
+            ProdigalSeqInfo::c_layout(),
             ProdigalAbiField::c_layout(),
         ] {
             let c: Vec<_> = c_rows
@@ -1364,8 +1324,7 @@ mod tests {
     #[test]
     fn test_omitted_fields_keep_library_defaults() {
         let defaults = unsafe { ProdigalConfig::library_defaults() }.unwrap();
-        let pd =
-            unsafe { ProdigalParsedConfig::from_json(&serde_json::json!({})).c_config() }.unwrap();
+        let pd = Settings::parse(&serde_json::json!({})).unwrap().config;
         assert_eq!(pd.trans_table, defaults.trans_table);
         assert_eq!(pd.start_weight.to_bits(), defaults.start_weight.to_bits());
 
@@ -1392,17 +1351,12 @@ mod tests {
     }
 
     /// --describe lists exactly the translation tables the library accepts
-    /// (single-genome mode; metagenomic mode takes 11 only).
+    /// (single-genome mode; metagenomic mode takes 11 only), as integers.
     #[test]
     fn test_describe_trans_tables_are_the_librarys() {
         let desc = ProdigalTool.describe();
         let param = desc.config_params.iter().find(|p| p.name == "trans_table");
-        let listed: Vec<c_int> = param
-            .expect("trans_table param")
-            .allowed_values
-            .iter()
-            .map(|v| v.parse().expect("integer"))
-            .collect();
+        let listed = serde_json::to_value(&param.expect("trans_table param").allowed_values);
         let accepted: Vec<c_int> = (1..=99)
             .filter(|&t| unsafe {
                 let mut pd = ProdigalConfig::library_defaults().unwrap();
@@ -1410,7 +1364,7 @@ mod tests {
                 prodigal_config_validate(&pd, ptr::null_mut(), 0) == PRODIGAL_OK
             })
             .collect();
-        assert_eq!(listed, accepted);
+        assert_eq!(listed.unwrap(), serde_json::json!(accepted));
     }
 
     #[test]
@@ -1423,7 +1377,7 @@ mod tests {
     #[test]
     fn test_refused_config_says_why() {
         let reason = |config: &serde_json::Value| unsafe {
-            let pd = ProdigalParsedConfig::from_json(config).c_config().unwrap();
+            let pd = Settings::c_config(config).unwrap();
             let mut msg: [c_char; 256] = [0; 256];
             let rc = prodigal_config_validate(&pd, msg.as_mut_ptr(), msg.len());
             assert_ne!(rc, PRODIGAL_OK, "{config}: the library accepts it");
@@ -1436,7 +1390,7 @@ mod tests {
             serde_json::json!({"meta_mode": true, "trans_table": 4}),
             serde_json::json!({"meta_mode": true, "force_nonsd": true}),
             serde_json::json!({"meta_mode": true, "start_weight": 5.0}),
-            serde_json::json!({"meta_mode": false, "trans_table": 1}),
+            serde_json::json!({"meta_mode": false, "train_on_batch": true, "trans_table": 1}),
         ] {
             let response = tool.execute(&config, &input_name, input_shm.len());
             assert!(!response.success, "{config}: expected a refusal");
@@ -1450,5 +1404,231 @@ mod tests {
             Err(err) => assert!(err.contains(&reason(&config)), "{err}"),
             Ok(_) => panic!("expected a refusal"),
         }
+    }
+
+    /// A knob of the wrong JSON type, an integer out of C int range, an
+    /// unknown knob or a config that is not an object is an error naming
+    /// it, before the input is read, on both routes; null is the default.
+    #[test]
+    fn test_config_is_strict() {
+        let tool = ProdigalTool;
+        for (config, named) in [
+            (serde_json::json!({"meta_mode": "false"}), "meta_mode"),
+            (serde_json::json!({"trans_table": "11"}), "trans_table"),
+            (serde_json::json!({"trans_table": 11.0}), "trans_table"),
+            // 2^32 + 11: as a C int it would wrap to 11
+            (
+                serde_json::json!({"trans_table": 4294967307_i64}),
+                "trans_table",
+            ),
+            (serde_json::json!({"closed_ends": 1}), "closed_ends"),
+            (serde_json::json!({"mask_regions": "yes"}), "mask_regions"),
+            (serde_json::json!({"force_nonsd": 0}), "force_nonsd"),
+            (serde_json::json!({"start_weight": "4.35"}), "start_weight"),
+            (serde_json::json!({"verbose": 1}), "verbose"),
+            (
+                serde_json::json!({"meta_mode": false, "train_on_batch": "yes"}),
+                "train_on_batch",
+            ),
+            (serde_json::json!({"metamode": false}), "metamode"),
+            (serde_json::json!(["meta_mode"]), "object"),
+        ] {
+            let response = tool.execute(&config, "/gb-no-such-input", 1);
+            let err = response.error.expect("refused");
+            assert!(err.contains(named), "{config}: {err}");
+            let err = tool.create_streaming_context(&config).err();
+            assert!(err.expect("refused").contains(named), "{config}");
+        }
+        // An integer too large for a C int says so, however large
+        for big in [
+            serde_json::json!(4294967307_i64),
+            serde_json::json!(u64::MAX),
+        ] {
+            let config = serde_json::json!({"trans_table": big});
+            let err = tool
+                .create_streaming_context(&config)
+                .err()
+                .expect("refused");
+            let wanted = format!("trans_table={big} exceeds C int range");
+            assert!(err.contains(&wanted), "{err}");
+        }
+        for config in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"trans_table": null, "closed_ends": null, "verbose": null}),
+        ] {
+            let ctx = tool.create_streaming_context(&config);
+            assert!(ctx.expect("accepted").is_some(), "{config}");
+        }
+    }
+
+    /// Single-genome mode trains on the batch only when asked to: a
+    /// batch may hold part of a genome. With train_on_batch there is no
+    /// shared context, so the daemon runs each batch through execute().
+    #[test]
+    fn test_single_mode_needs_train_on_batch() {
+        let tool = ProdigalTool;
+        for config in [
+            serde_json::json!({"meta_mode": false}),
+            serde_json::json!({"meta_mode": false, "train_on_batch": false}),
+        ] {
+            let err = tool.create_streaming_context(&config).err();
+            assert!(err.expect("refused").contains("train_on_batch"), "{config}");
+            let err = predict(config, &["c1"], &[TEST_SEQ_1]).unwrap_err();
+            assert!(err.contains("train_on_batch"), "{err}");
+        }
+        let config = serde_json::json!({"meta_mode": false, "train_on_batch": true});
+        let ctx = tool.create_streaming_context(&config);
+        assert!(ctx.expect("accepted").is_some());
+
+        // Metagenomic mode does not train
+        let config = serde_json::json!({"train_on_batch": true});
+        let err = tool
+            .create_streaming_context(&config)
+            .err()
+            .expect("refused");
+        assert!(
+            err.contains("train_on_batch") && err.contains("meta_mode"),
+            "{err}"
+        );
+    }
+
+    /// Trained on the whole batch, single-genome mode calls the CLI's genes
+    /// (the fork's ref_single.gff: `prodigal -p single` on anthus).
+    #[test]
+    fn test_single_mode_trains_on_the_batch() {
+        let contigs = anthus();
+        let names: Vec<&str> = contigs.iter().map(|c| c.0.as_str()).collect();
+        let seqs: Vec<&str> = contigs.iter().map(|c| c.1.as_str()).collect();
+        let config = serde_json::json!({"meta_mode": false, "train_on_batch": true});
+        let (result, genes) = predict(config, &names, &seqs).unwrap();
+
+        let gff = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/ext/prodigal/testdata/ground_truth/ref_single.gff"
+        ));
+        let expected: Vec<(String, i32, i32, i32)> = gff
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .map(|l| {
+                let f: Vec<&str> = l.split('\t').collect();
+                let strand = if f[6] == "+" { 1 } else { -1 };
+                (
+                    f[0].to_string(),
+                    f[3].parse().unwrap(),
+                    f[4].parse().unwrap(),
+                    strand,
+                )
+            })
+            .collect();
+        assert_eq!(coordinates(&genes), expected);
+        assert_eq!(result["n_genes"], expected.len());
+    }
+
+    /// A null name or sequence is an error naming the row or the contig.
+    #[test]
+    fn test_null_input_is_an_error() {
+        let batch = make_nullable_batch(&[Some("c1"), None], &[Some(TEST_SEQ_1), Some(TEST_SEQ_2)]);
+        let err = predict_batch(serde_json::json!({}), &batch).unwrap_err();
+        assert!(err.contains("row 2") && err.contains("name"), "{err}");
+
+        let batch = make_nullable_batch(&[Some("c1"), Some("c2")], &[Some(TEST_SEQ_1), None]);
+        let err = predict_batch(serde_json::json!({}), &batch).unwrap_err();
+        assert!(err.contains("'c2'") && err.contains("sequence"), "{err}");
+    }
+
+    /// Prodigal drops characters outside 'A'..'z', which would shift every
+    /// coordinate after them, so a contig holding one is an error naming
+    /// the contig, the character and its position (1-based), on both
+    /// routes. Ambiguity codes, lowercase and the rest of 'A'..'z' are
+    /// kept.
+    #[test]
+    fn test_dropped_character_is_an_error() {
+        let tool = ProdigalTool;
+        let with = |seq: &str, at: usize, c: char| format!("{}{c}{}", &seq[..at], &seq[at..]);
+        let mut meta = tool
+            .create_streaming_context(&serde_json::json!({}))
+            .unwrap()
+            .unwrap();
+        for (c, at) in [
+            ('-', 100),
+            ('7', 0),
+            (' ', 959),
+            ('\0', 500),
+            ('é', 300),
+            ('*', 960),
+        ] {
+            let bad = with(TEST_SEQ_2, at, c);
+            let input_name = unique_shm_name("pd-drop");
+            let batch = make_input_batch(&["c1", "c2"], &[TEST_SEQ_1, &bad]);
+            let input = write_arrow_to_shm(&input_name, &batch);
+            let err = meta
+                .run_batch(&input_name, input.len())
+                .error
+                .expect("refused");
+            let wanted = format!("{c:?} at position {}", at + 1);
+            assert!(err.contains("'c2'") && err.contains(&wanted), "{err}");
+        }
+        // The context is still usable
+        let input_name = unique_shm_name("pd-drop");
+        let input = write_arrow_to_shm(&input_name, &make_input_batch(&["c1"], &[TEST_SEQ_1]));
+        let response = meta.run_batch(&input_name, input.len());
+        assert!(response.success, "{:?}", response.error);
+        let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
+
+        // Single-genome mode
+        let mut contigs = anthus();
+        contigs[5].1 = with(&contigs[5].1, 42, '.');
+        let names: Vec<&str> = contigs.iter().map(|c| c.0.as_str()).collect();
+        let seqs: Vec<&str> = contigs.iter().map(|c| c.1.as_str()).collect();
+        let config = serde_json::json!({"meta_mode": false, "train_on_batch": true});
+        let err = predict(config, &names, &seqs).unwrap_err();
+        let wanted = format!("'{}'", names[5]);
+        assert!(
+            err.contains(&wanted) && err.contains("'.' at position 43"),
+            "{err}"
+        );
+
+        let kept = TEST_SEQ_1.replace("ACAG", "acRN").replace("GGTT", "[_^Y");
+        let result = predict(serde_json::json!({}), &["c1"], &[&kept]);
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    /// Any other error a contig causes names the contig.
+    #[test]
+    fn test_contig_errors_name_the_contig() {
+        for bad in ["", "0123456789"] {
+            let err = predict(serde_json::json!({}), &["c1", "c2"], &[TEST_SEQ_1, bad]);
+            let err = err.unwrap_err();
+            assert!(err.contains("'c2'"), "{bad:?}: {err}");
+        }
+    }
+
+    /// Each contig is read in place, within its own bounds: a contig's
+    /// genes are the same alone and followed by another in the batch.
+    #[test]
+    fn test_contigs_are_read_within_bounds() {
+        let config = serde_json::json!({});
+        let (_, alone) = predict(config.clone(), &["c1"], &[TEST_SEQ_1]).unwrap();
+        let (_, both) = predict(config, &["c1", "c2"], &[TEST_SEQ_1, TEST_SEQ_2]).unwrap();
+        let c1: Vec<_> = coordinates(&both)
+            .into_iter()
+            .filter(|g| g.0 == "c1")
+            .collect();
+        assert!(!c1.is_empty());
+        assert_eq!(coordinates(&alone), c1);
+    }
+
+    /// --describe advertises train_on_batch.
+    #[test]
+    fn test_describe_lists_train_on_batch() {
+        let desc = ProdigalTool.describe();
+        let param = desc
+            .config_params
+            .iter()
+            .find(|p| p.name == "train_on_batch");
+        let param = param.expect("train_on_batch param");
+        assert_eq!(param.param_type, "boolean");
+        assert_eq!(param.default, serde_json::json!(false));
     }
 }
