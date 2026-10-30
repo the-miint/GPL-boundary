@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 /// The ABI version these mirrors were written for (prodigal.h's
 /// PRODIGAL_ABI_VERSION); prodigal_config_init_v refuses any other.
-const PRODIGAL_ABI_VERSION: c_int = 1;
+const PRODIGAL_ABI_VERSION: c_int = 2;
 
 /// Declares a `#[repr(C)]` mirror of a prodigal.h struct and, for tests,
 /// its rows as `prodigal_abi_layout()` lists them, so
@@ -110,6 +110,7 @@ c_mirror! {
         pub n_genes: i32,
         pub n_nodes: i32,
         pub gc_content: c_double,
+        pub model_gc_content: c_double,
         pub translation_table: i32,
         pub uses_sd: i32,
         pub best_meta_bin: i32,
@@ -384,6 +385,14 @@ const CONTIGS: OutputDescription = OutputDescription {
             "The contig's GC fraction (ambiguous bases count as not GC)",
         ),
         FieldDescription::new(
+            "model_gc_content",
+            "Float64",
+            false,
+            "GC fraction of the model that called the genes: the metagenomic bin's, or \
+         the single-genome model's. The CLI prints 100 times it as Model Data \
+         gc_cont; model_desc's GC is rounded otherwise in bins 17, 38, 47 and 49",
+        ),
+        FieldDescription::new(
             "translation_table",
             "Int32",
             false,
@@ -554,6 +563,7 @@ struct ContigColumns {
     seq_name: StringBuilder,
     length: Int32Builder,
     gc_content: Float64Builder,
+    model_gc_content: Float64Builder,
     translation_table: Int32Builder,
     uses_sd: BooleanBuilder,
     meta_bin: Int32Builder,
@@ -568,6 +578,7 @@ impl ContigColumns {
         self.seq_name.append_value(seq_name);
         self.length.append_value(length);
         self.gc_content.append_value(stats.gc_content);
+        self.model_gc_content.append_value(stats.model_gc_content);
         self.translation_table.append_value(stats.translation_table);
         self.uses_sd.append_value(stats.uses_sd != 0);
         // -1 in single-genome mode, which has no bins
@@ -584,6 +595,7 @@ impl ContigColumns {
             Arc::new(self.seq_name.finish()),
             Arc::new(self.length.finish()),
             Arc::new(self.gc_content.finish()),
+            Arc::new(self.model_gc_content.finish()),
             Arc::new(self.translation_table.finish()),
             Arc::new(self.uses_sd.finish()),
             Arc::new(self.meta_bin.finish()),
@@ -1111,6 +1123,8 @@ impl GplTool for ProdigalTool {
 
     /// 2: genes gains seq_index, gene_index, score and protein, and its
     /// rbs_motif / rbs_spacer are NULL for "None"; the contigs output.
+    /// contigs' model_gc_content (the-miint/GPL-boundary#9) joined it in
+    /// place, before any consumer read schema 2.
     fn schema_version(&self) -> u32 {
         2
     }
@@ -1127,7 +1141,8 @@ impl GplTool for ProdigalTool {
             // the input's nulls and dropped characters are refused.
             // 4: training_path + training_sha256 (a model from prodigal-train).
             // 5: schema 2 (outputs genes and contigs, listed by label); the
-            // result's model replaces the last contig's stats.
+            // result's model replaces the last contig's stats. contigs'
+            // model_gc_content joined it in place (schema_version above).
             describe_version: 5,
             description: "Prokaryotic gene prediction for metagenomic and single-genome sequences",
             config_params: vec![
@@ -1498,7 +1513,9 @@ mod tests {
     fn test_contigs_are_the_clis() {
         let input = anthus();
         for (config, gff, _) in cli_runs() {
-            let contigs = predict_batch(config, &anthus_batch()).unwrap().contigs;
+            let Prediction {
+                result, contigs, ..
+            } = predict_batch(config, &anthus_batch()).unwrap();
             let truth = prodigal_truth(gff);
             let (expected, genes) = (gff_sequences(&truth), gff_genes(&truth));
             assert_eq!(contigs.num_rows(), expected.len(), "{gff}");
@@ -1506,13 +1523,16 @@ mod tests {
             let int = |name| column::<Int32Array>(&contigs, name);
             let names = column::<StringArray>(&contigs, "seq_name");
             let gc = column::<Float64Array>(&contigs, "gc_content");
+            let model_gc = column::<Float64Array>(&contigs, "model_gc_content");
             let uses_sd = column::<BooleanArray>(&contigs, "uses_sd");
             let (bin, desc) = (
                 int("meta_bin"),
                 column::<StringArray>(&contigs, "model_desc"),
             );
+            let mut rounded_otherwise = 0;
             for (i, cli) in expected.iter().enumerate() {
                 let at = format!("{gff} contig {i}");
+                let model_percent = model_gc.value(i) * 100.0;
                 assert_eq!(int("seq_index").value(i).to_string(), cli["seqnum"], "{at}");
                 // anthus_aco.fas has CRLF lines; the CLI keeps the CR
                 assert_eq!(names.value(i), cli["seqhdr"].trim_end(), "{at}");
@@ -1529,14 +1549,25 @@ mod tests {
                     assert_eq!(desc.value(i), cli["model"], "{at}");
                     let number = cli["model"].split('|').next().unwrap();
                     assert_eq!(bin.value(i).to_string(), number, "{at}");
+                    let desc_gc = cli["model"].split('|').nth(3).unwrap();
+                    rounded_otherwise += usize::from(desc_gc != format!("{model_percent:.1}"));
                 } else {
                     assert!(bin.is_null(i) && desc.is_null(i), "{at}");
+                    let model = result["model"]["gc_content"].as_f64();
+                    assert_eq!(Some(model_gc.value(i)), model, "{at}");
                 }
-                // The sequence's GC (the GFF has the model's)
+                // The model's GC, as the CLI prints it
+                assert_eq!(format!("{model_percent:.2}"), cli["gc_cont"], "{at}");
+                // The sequence's GC, which the GFF doesn't have
                 let seq = input[i].1.as_bytes();
                 let n_gc = seq.iter().filter(|b| b"GCgc".contains(b)).count();
                 let want = n_gc as f64 / seq.len() as f64;
                 assert!((gc.value(i) - want).abs() < 1e-12, "{at}");
+            }
+            // model_desc's GC is rounded otherwise in bins 17, 38, 47 and 49:
+            // anthus has bin 49, so model_gc_content isn't read from it
+            if expected[0]["run_type"] == "Metagenomic" {
+                assert!(rounded_otherwise > 0, "{gff}: no bin to tell them apart");
             }
         }
     }

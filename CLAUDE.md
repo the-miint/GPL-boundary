@@ -545,6 +545,7 @@ Label "contigs", one row per input contig, including contigs with no genes:
 - `seq_name: Utf8` -- contig name
 - `length: Int32` -- contig length (input refused if Prodigal would drop a character, so it is the input's)
 - `gc_content: Float64` -- the contig's GC fraction
+- `model_gc_content: Float64` -- GC fraction of the model that called the genes, the bin's or the single-genome model's (the CLI's Model Data `gc_cont` is 100 times it; the GC in `model_desc` is rounded otherwise in bins 17, 38, 47 and 49)
 - `translation_table: Int32` -- table the genes were called with (model's or bin's)
 - `uses_sd: Boolean` -- that model or bin scores Shine-Dalgarno motifs
 - `meta_bin: Int32` (nullable) -- metagenomic bin, 0..49; NULL in single-genome mode
