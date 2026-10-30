@@ -18,7 +18,7 @@ Prebuilt binaries are published on every `v*` git tag for:
 | Platform | Target triple | Notes |
 |----------|---------------|-------|
 | Linux x86_64 | `x86_64-unknown-linux-gnu` | glibc 2.35+ (Ubuntu 22.04+, Debian 12+, RHEL 9+) |
-| macOS Apple Silicon | `aarch64-apple-darwin` | macOS 14+ |
+| macOS Apple Silicon | `aarch64-apple-darwin` | macOS 15+ |
 
 Install the latest release with:
 
