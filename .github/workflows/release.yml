@@ -29,7 +29,10 @@ jobs:
           # runners have very thin capacity (queue waits exceed an hour),
           # and Apple Silicon is the modern default. Intel Mac users build
           # from source via the README's "Building from source" section.
-          - os: macos-14
+          # macos-14 images are retired on 2026-11-02. The binary links
+          # Homebrew's libomp statically, built for the runner's macOS, so
+          # the runner sets the oldest macOS the binary supports.
+          - os: macos-15
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
