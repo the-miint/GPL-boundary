@@ -126,7 +126,7 @@ Only rules whose trigger appears in the diff can fire.
 | `tests/**`, a `#[test]`, `src/test_util.rs`, a fixture | R5 |
 | A numeric literal or tolerance in an assertion; a parity or golden test | R5 |
 | `build.rs`, `Cargo.toml` / `Cargo.lock`, `.gitmodules`, an `ext/*` pointer bump, `vendor/**` | R6 |
-| `.github/workflows/**`, `scripts/**`, `Makefile`, `install.sh` | R6, R1 |
+| `.github/workflows/**`, `scripts/**`, `tests/shell/**`, `Makefile`, `install.sh` | R6, R1 |
 | `#[cfg(target_os = …)]`, a `libc::` call, `/proc`, macOS-specific code | R6 |
 | A guard, a `Response::error`, a non-test `unwrap` / `expect` / `panic!`, a substituted default | R1 |
 | Two structurally similar code paths; a repeated literal or error message; a helper in a tool-named module | R7 |
@@ -226,6 +226,7 @@ A test that cannot fail when the behaviour it is named for breaks is wrong.
 
 - **One `cc::Build` per tool**, with `-fvisibility=hidden` and a `cargo:rerun-if-changed` for every compiled source and header (`GUIDANCE_INTEGRATE.md`, "Step 2" and "Common mistakes"). Two tools sharing a build collide on symbols.
 - **Linux and macOS are both supported.** Shared-memory semantics differ (`CLAUDE.md`, "Arrow IPC write strategy"); OpenMP is found differently (`CLAUDE.md`, "FastTree threads"). Linux-only code (`/proc`, a second `ftruncate`) is gated with `#[cfg]` and documented as Linux-only, as the `metrics` fields are.
+- **Shell runs under bash 3.2 on macOS**, with the BSD tools. A script or shell test avoids what bash 3.2 handles differently from bash 5; one case: an ANSI-C `$'…'` escape that decodes to a backtick or `$` inside a double-quoted `${…}` is then expanded as a command or a parameter. A single-quoted variable carries such text safely. Probe with `docker run bash:3.2` (bash 3.2 with busybox tools; the macOS CI lane covers the BSD tools).
 - **A submodule pin** points at a commit on the fork branch `.gitmodules` names, respects the documented floors (FastTree at or after `2a6c14b`, `CLAUDE.md`, "FastTree threads"), is exercised by this PR, and its log for the range is read. A config struct that grew in the C API grows in its Rust mirror, with the size test updated.
 - **A new dependency is its own decision.** A crate or a system library states what it buys over the best path without it, and is checked against the release build (`.github/workflows/release.yml`), `install.sh`, `CLAUDE.md` "Build" and `README.md` "Building from source" and "Building".
 

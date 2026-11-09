@@ -142,7 +142,11 @@ report "the no-agent-review label passes without a block" \
     "the label is the only opt-out for a PR whose author cannot run the loop" "$ok"
 
 body="$(block "$SHA_first")"
-body="${body/$'- Declined:\n  - none'/$'- Declined:\n  - a copy into a Vec<u8>, \x60src/x.rs\x60 — test-only path'}"
+# The entry sits in a single-quoted variable: bash 3.2 decodes a backtick written
+# as $'\x60' inside "${...}" and then runs it as a command substitution.
+# shellcheck disable=SC2016 # the backticks are literal
+entry='  - a copy into a Vec<u8>, `src/x.rs` — test-only path'
+body="${body/$'- Declined:\n  - none'/$'- Declined:\n'$entry}"
 invoke "$body"
 ok=0
 [[ "$body" == *"Vec<u8>"* && $EXIT -eq 0 ]] && ok=1
