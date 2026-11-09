@@ -11,9 +11,9 @@
 # Passes when the 'no-agent-review' label is present, or when the description has a
 # "## Reviewer loop" section whose "Reviewed at:" line names one of the PR's own
 # commits, whose Fixed, Declined, Deferred and Not probed lines are present, and
-# whose Reviewed at and Fixed lines hold no template placeholder. It
-# checks that the block is there and points at this branch; it cannot check that the
-# loop was run.
+# whose Reviewed at and Fixed lines are filled in: no template placeholder, a count
+# of fixes, the number of rounds and the stop rule. It checks that the block is
+# there and points at this branch; it cannot check that the loop was run.
 set -euo pipefail
 
 fail() {
@@ -37,9 +37,10 @@ esac
 # can leave the writer killed by SIGPIPE, which would read as "no match".
 body=${PR_BODY:-}
 body=${body//$'\r'/}
-grep -q '^## Reviewer loop[[:space:]]*$' <<<"$body" \
+heading_re='^## Reviewer loop[[:space:]]*$'
+grep -q "$heading_re" <<<"$body" \
     || fail "the PR description has no '## Reviewer loop' section."
-section=$(awk '/^## Reviewer loop[[:space:]]*$/ {on=1; next} /^## / {on=0} on' <<<"$body")
+section=$(awk -v h="$heading_re" '$0 ~ h {on=1; next} /^## / {on=0} on' <<<"$body")
 
 # shellcheck disable=SC2016 # the backticks are literal: the sha may be wrapped in them
 sha=$(sed -n 's/^- Reviewed at:[[:space:]]*`\{0,1\}\([0-9a-f]\{7,40\}\)`\{0,1\}.*/\1/p' \
@@ -73,6 +74,14 @@ done
 # entry lines are not checked, since they can name a type such as Vec<u8>.
 if grep -qE '^- (Reviewed at|Fixed):.*<[^>]*>' <<<"$section"; then
     fail "the Reviewed at or Fixed line still holds a template placeholder ('<...>')."
+fi
+grep -qE '^- Fixed:[[:space:]]*[0-9]+' <<<"$section" \
+    || fail "the Fixed line does not give a count."
+reviewed=$(grep '^- Reviewed at:' <<<"$section")
+reviewed=${reviewed%%$'\n'*}
+if ! grep -qE 'rounds:[[:space:]]*[0-9]+' <<<"$reviewed" \
+    || ! grep -qE 'stopped:[[:space:]]*[^[:space:]]' <<<"$reviewed"; then
+    fail "the Reviewed at line does not give 'rounds: <number>' and 'stopped: <stop rule>'."
 fi
 
 echo "Reviewer loop block present; reviewed at ${sha}."

@@ -6,8 +6,9 @@
 # Each scenario runs the script inside a throwaway repository holding a base branch,
 # a PR branch two commits ahead of the point it branched from (the base has moved on
 # since), and a third branch with a commit on neither, so "is this sha one of the PR's
-# own commits" is decided by real git ancestry. The repository lives under
-# target/scratch/, is removed when all scenarios pass, and is kept otherwise.
+# own commits" is decided by real git ancestry. The repository lives under the
+# cargo target directory's scratch/ (target/scratch/ unless CARGO_TARGET_DIR says
+# otherwise), is removed when all scenarios pass, and is kept otherwise.
 #
 # Usage: bash tests/shell/check_review_loop.sh [script-under-test]
 
@@ -27,6 +28,8 @@ ALL_PASSED=0
 
 SCRATCH="${CARGO_TARGET_DIR:-$ROOT/target}/scratch"
 mkdir -p "$SCRATCH"
+# Absolute, since invoke() redirects into it after a cd.
+SCRATCH="$(cd "$SCRATCH" && pwd -P)"
 TMP_ROOT="$(mktemp -d "$SCRATCH/check_review_loop.XXXXXX")"
 trap 'if [ "$ALL_PASSED" = 1 ]; then rm -rf "$TMP_ROOT"; fi' EXIT
 mkdir -p "$TMP_ROOT/repo"
@@ -80,6 +83,14 @@ Something.
 '
 block() { printf '%s' "${BLOCK//@SHA@/$1}"; }
 
+# fill TEXT: TEXT with the block's Reviewed at and Fixed lines filled in, as an
+# author fills in the template or the skill's example.
+fill() {
+    # shellcheck disable=SC2001 # a line-anchored edit, which ${var//} cannot express
+    sed -e "s/^- Reviewed at:.*/- Reviewed at: $SHA_second · rounds: 1 · stopped: nothing new/" \
+        -e 's/^- Fixed:.*/- Fixed: 0/' <<< "$1"
+}
+
 # invoke BODY [LABELS] [BASE]: run the script as the workflow does, with the PR head
 # at the `pr` branch. BASE defaults to `base`; an empty BASE leaves BASE_SHA unset.
 invoke() {
@@ -126,6 +137,13 @@ ok=0
 [[ $EXIT -eq 0 && "$OUT" == *"no-agent-review"* ]] && ok=1
 report "the no-agent-review label passes without a block" \
     "the label is the only opt-out for a PR whose author cannot run the loop" "$ok"
+
+body="$(block "$SHA_first")"
+invoke "${body/$'- Declined:\n  - none'/$'- Declined:\n  - a copy into a Vec<u8>, \x60src/x.rs\x60 — test-only path'}"
+ok=0
+[[ $EXIT -eq 0 ]] && ok=1
+report "an entry line naming a type such as Vec<u8> passes" \
+    "only the Reviewed at and Fixed lines are checked for placeholders, since an entry can quote code" "$ok"
 
 # 100 KB is over a pipe buffer and under Linux's 128 KiB cap on one environment
 # string. Against a piped `grep -q` this fails on most Linux runs but not every one,
@@ -183,7 +201,7 @@ done
 body="$(block "$SHA_first")"
 heading='## Reviewer loop'
 other='## Something else'
-invoke "${body/"$heading"/"$other"}"
+invoke "${body/"$heading"/$other}"
 ok=0
 [[ $EXIT -eq 1 && "$ERR" == *"no '## Reviewer loop' section"* ]] && ok=1
 report "the block's lines under another heading do not count" \
@@ -196,7 +214,7 @@ report "an empty section is reported as unfilled, not missing" \
     "the author added the heading and needs to be told what to put under it" "$ok"
 
 body="$(block "$SHA_first")"
-invoke $'## Reviewer loop\n\n'"${body/"$heading"/"$other"}"
+invoke $'## Reviewer loop\n\n'"${body/"$heading"/$other}"
 ok=0
 [[ $EXIT -eq 1 && "$ERR" == *"does not name a commit sha"* ]] && ok=1
 report "a filled block under another heading does not fill an empty section" \
@@ -225,6 +243,37 @@ ok=0
 report "a placeholder left on the Fixed line is refused" \
     "an unfilled count records nothing about what the loop changed" "$ok"
 
+invoke "" "no-agent-review-requested"
+ok=0
+[[ $EXIT -eq 1 && "$ERR" == *"no '## Reviewer loop' section"* ]] && ok=1
+report "a label that only starts with no-agent-review does not skip the check" \
+    "the opt-out is one exact label; a near-miss label is not a decision to skip the loop" "$ok"
+
+for fixed in "- Fixed:" "- Fixed: TBD"; do
+    body="$(block "$SHA_first")"
+    invoke "${body/"- Fixed: 3"/$fixed}"
+    ok=0
+    [[ $EXIT -eq 1 && "$ERR" == *"does not give a count"* ]] && ok=1
+    report "a Fixed line reading '$fixed' is refused" \
+        "the count is the record of what the loop changed; a line without one records nothing" "$ok"
+done
+
+body="$(block "$SHA_first")"
+invoke "${body/" · rounds: 2 · stopped: nothing new"/}"
+ok=0
+[[ $EXIT -eq 1 && "$ERR" == *"does not give 'rounds:"* ]] && ok=1
+report "a Reviewed at line holding only the sha is refused" \
+    "the rounds and the stop rule say how the loop ended; a sha alone does not" "$ok"
+
+EXIT=0 OUT="" ERR=""
+if tpl="$(cat "$TEMPLATE")"; then
+    invoke "${tpl/<sha>/$SHA_second}"
+fi
+ok=0
+[[ -n "${tpl:-}" && $EXIT -eq 1 && "$ERR" == *"template placeholder"* ]] && ok=1
+report "the PR template with only its sha filled in is refused" \
+    "pasting a sha into the untouched template is the shortcut the placeholder check exists to stop" "$ok"
+
 invoke "$(block "$SHA_base")" "" no-such-ref
 ok=0
 [[ $EXIT -eq 2 && "$ERR" == *"cannot resolve 'no-such-ref'"* ]] && ok=1
@@ -240,12 +289,11 @@ report "an unset BASE_SHA is an error, not a default" \
 # --- the published block shape ---
 
 EXIT=0 OUT="" ERR=""
-if filled="$(sed -e "s/^- Reviewed at:.*/- Reviewed at: $SHA_second · rounds: 1 · stopped: nothing new/" \
-    -e 's/^- Fixed:.*/- Fixed: 0/' "$TEMPLATE")"; then
-    invoke "$filled"
+if tpl="$(cat "$TEMPLATE")"; then
+    invoke "$(fill "$tpl")"
 fi
 ok=0
-[[ -n "${filled:-}" && $EXIT -eq 0 ]] && ok=1
+[[ -n "${tpl:-}" && $EXIT -eq 0 ]] && ok=1
 report "the PR template passes once its sha and count are filled in" \
     "the template carries a copy of the block, and it has to be the shape the script accepts" "$ok"
 
@@ -254,9 +302,7 @@ EXIT=0 OUT="" ERR=""
 example="$(awk '/^## Then write the PR-body block/ {s = 1} s && /^```markdown$/ {on = 1; next} on && /^```$/ {exit} on' \
     "$SKILL" 2> /dev/null)" || true
 if [ -n "$example" ]; then
-    # shellcheck disable=SC2001 # a line-anchored edit, which ${var//} cannot express
-    invoke "$(sed -e "s/^- Reviewed at:.*/- Reviewed at: $SHA_second · rounds: 1 · stopped: nothing new/" \
-        -e 's/^- Fixed:.*/- Fixed: 0/' <<< "$example")"
+    invoke "$(fill "$example")"
 fi
 ok=0
 [[ -n "$example" && $EXIT -eq 0 ]] && ok=1

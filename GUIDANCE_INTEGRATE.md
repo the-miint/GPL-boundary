@@ -402,7 +402,7 @@ pub mod newtool;   // add this
 ```bash
 cargo build                       # compiles C sources + links
 cargo test                        # all tests including new smoke tests
-make check                        # fmt + clippy + test (full CI check)
+make check                        # fmt + clippy + test + test-scripts (full CI check)
 ```
 
 Verify introspection:

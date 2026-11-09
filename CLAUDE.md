@@ -164,7 +164,7 @@ We do not exhaustively test submodules; that is their own CI's job.
 cargo build          # builds fasttree C lib via cc crate + links it
 cargo test           # unit + integration tests (uses real POSIX shared memory)
 make check           # fmt + clippy + test + test-scripts
-make test-scripts    # shell tests for scripts/ and the review tooling (git + bash only)
+make test-scripts    # shell tests for the review tooling (no Rust toolchain needed)
 ```
 
 The `build.rs` compiles C/C++ sources from submodules using the `cc` crate
@@ -201,8 +201,8 @@ tests/
   build_sanity.rs    # Integration tests: binary links and runs correctly
   bowtie2_build.rs   # Integration tests: bowtie2 index builder + round-trip with align
   streaming.rs       # Integration tests: NDJSON streaming protocol
-  shell/             # Shell tests for scripts/ and the review tooling (make test-scripts)
-scripts/             # Developer and CI scripts (the pre-commit hook, the review-loop-check script)
+  shell/             # Shell tests for the review tooling (make test-scripts)
+scripts/             # Developer and CI scripts
 .claude/
   skills/gpl-boundary-review/      # The review loop (see "Reviewing a branch")
   agents/gpl-boundary-reviewer.md  # The reviewer's rules
@@ -306,8 +306,9 @@ thread.
 ## Reviewing a branch
 
 Every PR runs the review loop on its own changes before it is opened, and so does
-every PR to a tool fork (`../bowtie2`, `../fasttree`, `../Prodigal`), whose loop is
-driven from this repository in fork mode. The `gpl-boundary-review` skill
+every PR to a tool fork (a submodule's `-miint` fork checked out beside this
+repository, such as `../bowtie2`), whose loop is driven from this repository in fork
+mode. The `gpl-boundary-review` skill
 (`.claude/skills/gpl-boundary-review/SKILL.md`) owns the loop: one `/code-review`
 pass, then fresh `gpl-boundary-reviewer` rounds until a stop rule holds; the rules
 live in `.claude/agents/gpl-boundary-reviewer.md`. The loop ends by printing a
@@ -322,7 +323,7 @@ in the PR that fixes the instance: a bullet under the rule that owns it and a
 Trigger-map row so it can fire, with no names, quotes or PR numbers. A PR that
 introduces a new contract (a transport, an ABI, a build target) adds the rules for it
 in the same PR. `tests/shell/check_reviewer_files.sh` checks that every rule has a
-family and a Trigger-map row.
+family (or is the coordinator's) and a Trigger-map row.
 
 ## Protocol
 

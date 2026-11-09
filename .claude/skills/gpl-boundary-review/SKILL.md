@@ -1,6 +1,6 @@
 ---
 name: gpl-boundary-review
-description: 'Run the gpl-boundary-reviewer agent to convergence on the current branch — one /code-review pass, then review, fix, re-review — with a disposition ledger and a stop rule; or run one checkpoint round on a named contract. Works on this repository and on the tool forks checked out beside it (../bowtie2, ../fasttree, ../Prodigal). Use whenever a review of pending changes is asked for: "gpl-boundary-reviewer", "review this branch", "review my changes", "review before the PR", "checkpoint review". Owns the loop only; the rules live in the agent.'
+description: 'Run the gpl-boundary-reviewer agent to convergence on the current branch — one /code-review pass, then review, fix, re-review — with a disposition ledger and a stop rule; or run one checkpoint round on a named contract. Works on this repository and on the tool forks checked out beside it. Use whenever a review of pending changes is asked for: "gpl-boundary-reviewer", "review this branch", "review my changes", "review before the PR", "checkpoint review". Owns the loop only; the rules live in the agent.'
 ---
 
 # Reviewing a branch to convergence
@@ -11,7 +11,7 @@ rules, the trigger map, and the report format live in
 `.claude/agents/gpl-boundary-reviewer.md` — do not restate them here or in your
 prompts.
 
-**You are the caller.** The reviewer is read-only by design: its instructions rule
+**You are the caller.** The reviewer is read-only: its instructions rule
 out building, running tests or probes, and editing files. Everything it hands back
 that requires *doing* — applying a fix, rebuilding, running a test, running a
 `[needs-probe]` — is yours.
@@ -21,14 +21,14 @@ stacked on another branch.
 
 ## Fork mode
 
-The tool forks this repository builds from are reviewed with the same loop and the
-same agent: `../bowtie2`, `../fasttree` and `../Prodigal`, each a checkout of the
-repository behind a submodule under `ext/`. Drive the loop from a session in this
-repository, where the agent is defined.
+A tool fork is the repository behind a submodule under `ext/` whose `.gitmodules`
+branch ends in `-miint`, checked out beside this one (`../<name>`, for example
+`../bowtie2`). Its changes are reviewed with the same loop and the same agent. Drive
+the loop from a session in this repository, where the agent is defined.
 
 - **The base** is the branch `.gitmodules` names for that submodule
-  (`git config -f .gitmodules submodule.ext/<name>.branch`). Read it there; do not
-  assume one.
+  (`git config -f .gitmodules submodule.<path>.branch`, with the submodule's path,
+  such as `ext/prodigal` for `../Prodigal`). Read it there; do not assume one.
 - **The reviewer gets the checkout's path and its base** in the prompt, and runs
   every git command with `git -C <path>`.
 - **The fork's local files are never staged.** A fork checkout holds built
@@ -248,6 +248,8 @@ included. A fork's PR carries the same block, though no check reads it there:
   on that line ("plus 1 later commit: format fix") instead of moving the sha. A rebase
   rewrites the reviewed commit: name its rebased counterpart, and say so on the line
   ("rebased from abc1234 onto the new base").
+- `rounds` counts reviewer rounds, not the `/code-review` pass. `Fixed` counts the
+  findings fixed across the `/code-review` pass and every round.
 - Write `none` under a heading with no entries; do not drop the heading.
 - A deferred item names its issue by number. Every deferred issue is opened before
   the PR is, so the description carries `#N` from its first version; `issue to file`

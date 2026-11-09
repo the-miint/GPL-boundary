@@ -16,14 +16,14 @@ A question that needs a build, a test run or a probe leaves your report as a **V
 
 **Cost discipline:**
 - Get the diff once. Work from the changed-path list. A changed `ext/*` submodule is a pointer bump: read `git diff <base>...HEAD -- ext/<name>` and the submodule's own log for that range (`git -C ext/<name> log --oneline <old>..<new>`, or the same in the fork's checkout under `../`), never its tree. A commit neither checkout holds is read through `gh api repos/the-miint/<repo>/contents/<path>?ref=<sha>`; never clone or fetch.
-- Open a sibling file only for a rule that fired or a PR-level check, and read only the span you need. Never whole-file-read a file over 40 KB — `CLAUDE.md`, the larger adapters in `src/tools/` (`ls -lS src/tools`), any source under `ext/` or in a fork: `rg -n` for the symbol, then read around the hit.
+- Open a sibling file only for a rule that fired or a PR-level check, and read only the span you need. Never whole-file-read a file over 40 KB (this file excepted: a fanned-out reviewer reads it in full) — `CLAUDE.md`, the larger adapters in `src/tools/` (`ls -lS src/tools`), any source under `ext/` or in a fork: `rg -n` for the symbol, then read around the hit.
 - Review inline unless **How to run** directs a fan-out, and pass this posture to every subagent.
 
 ## How to run
 
 You are the coordinator.
 
-1. **Get the diff once:** `git diff <base>...HEAD`, with the base the caller names (`main` unless the PR is stacked). In **fork mode** the caller names a checkout (`../bowtie2`, `../fasttree` or `../Prodigal`) and its base, the branch `.gitmodules` names for that submodule; run every git command with `-C <path>`. Note the changed paths.
+1. **Get the diff once:** `git diff <base>...HEAD`, with the base the caller names (`main` unless the PR is stacked). In **fork mode** the caller names a tool fork's checkout (R9 says which repositories those are) and its base, the branch `.gitmodules` names for that submodule; run every git command with `-C <path>`. Note the changed paths.
 2. **Run the Trigger map** against the changed paths. A rule with no trigger in this diff is skipped.
 3. **Map fired rules to families** (table below) and count the families with at least one fired rule.
    - 0–2 families: review inline yourself. Skip to step 6.
@@ -80,7 +80,7 @@ These apply to the code under review and to your own findings.
 - **Third-party behaviour is established by a probe, never by reasoning.** Not from `--help`, docs, source comments, or what seems reasonable. A probe pins the submodule commit or crate version, includes a control that isolates the one variable, could have failed, and ends as a test so the finding survives a version bump. A comment saying a tool's behaviour "is not established" is a defect, not a disclaimer.
 - **`CLAUDE.md`, `README.md` and `--describe` are miint's contract.** miint reads them to decide what it sends and how it decodes the reply. A change that alters documented behaviour is a contract change: the PR description names it, and the version field that moved (R2).
 - **Fail loud.** A tool reports failure through `Response::error` (`CLAUDE.md`, "Key conventions"). A skipped test, a swallowed error, a default substituted for bad input, and an empty result read as success are findings wherever they appear.
-- **Expected values are not edited without a reason.** A changed expected value in an existing test is always a finding: state the old value and the new one, and ask why the old one was wrong and whether the change was approved. A golden regenerated from the native tool follows `GUIDANCE_PARITY_TESTS.md`.
+- **Expected values are not edited without a reason.** A changed expected value in an existing test is always a finding: state the old value and the new one, and ask why the old one was wrong and whether the change was approved. A FastTree golden is regenerated as `GUIDANCE_PARITY_TESTS.md` describes.
 - **No editorializing**, in code comments, docs, commit messages or your findings. Text says what the code does, what was measured and under what conditions, and what depends on what. It does not rate the code ("load-bearing", "the right call"), persuade ("note that", "deliberately", "DO NOT"), claim effort ("trivial", "a quick fix"), or use capitals for tone. State the mechanism and the consequence.
 
 ## Verification handoff
@@ -134,7 +134,7 @@ Only rules whose trigger appears in the diff can fire.
 | A user-facing string: an error message, `describe()` text, a CLI message | R8, R10 |
 | A coordinate or interval column; a renamed column or knob | R10, R2 |
 | A timing, throughput or memory claim in a comment, doc, commit message or PR description | R11 |
-| Any diff in a fork checkout (`../bowtie2`, `../fasttree`, `../Prodigal`) | R9, R5, R8 |
+| Any diff in a tool fork's checkout (fork mode) | R9, R5, R8 |
 | An external tool's behaviour that correctness depends on | Outside the rule set |
 
 ## PR-level checks
@@ -150,7 +150,7 @@ Always run, in this order.
    File under **R7**, one grouped finding. A site you could not settle after the lookup goes to the handoff, stating what you searched.
 2. **Docs follow the code.** For every knob, column, schema, version field, error message, CLI flag, env var, make target or documented behaviour the diff adds, renames, removes or changes, `rg` the tracked Markdown: `CLAUDE.md`, `README.md`, `GUIDANCE*.md`, `.claude/**`, and the `describe()` text. Flag a doc that still describes the old state; a `--describe` edit whose `describe_version` did not move, or whose landmark in `test_describe_version_landmarks` did not move with it (`CLAUDE.md`, "Tool config introspection"); a schema change without its `schema_version` bump and its `CLAUDE.md` "Arrow schemas" entry. File under **R8**, `[verified]` with the `rg`.
 3. **Duplication.** Scan the diff for a new block near-identical to an existing one, a constant, literal or error message defined a second time, and a comment or doc restating `CLAUDE.md` or a `GUIDANCE*.md`. One grouped finding per owning rule (R7 for code, R8 for prose).
-4. **Tests CI does not run.** CI runs `cargo test` and the script tests on Linux and macOS, and clippy and fmt on Linux. List every test the diff adds or changes, and every test covering a changed `src/` file, that CI skips: an `#[ignore]`d test, a test gated on an env var or a file CI does not provide, a fork's own CI lanes when a pin moves, and anything only one platform reaches. Each becomes a handoff entry asking whether the caller ran it and with what result.
+4. **Tests CI does not run.** CI is `.github/workflows/ci.yml`, which runs only for PRs to `main`; read it for which jobs run on which platform. List every test the diff adds or changes, and every test covering a changed `src/` file, that CI skips: an `#[ignore]`d test, a test gated on an env var or a file CI does not provide, a fork's own CI lanes when a pin moves, anything only one platform reaches, and everything when the PR is stacked on a branch other than `main`. Each becomes a handoff entry asking whether the caller ran it and with what result.
 5. **Planning marks and stray files.**
    - Committed code, tests, docs and `.claude/**` carry no planning handles: decision, milestone, phase or TDD-cycle labels (`M3`, `Phase 4`, `Cycle 2.3`), and prose that points into planning notes ("in a later milestone", "none exist yet" for something the same branch ships). State the rule the handle stood for. Sweep and read each hit: `rg -n -e '\bM[0-9]+\b' -e '[Pp]hase [0-9]' -e '[Cc]ycle [0-9]' -e 'localdocs' -e '[Mm]ilestone' $(git diff --name-only <base>...HEAD)`. File under **R8**.
    - The diff adds no file from a local working area or a build: nothing under `localdocs/` or `target/`, no planning document, no `REPORT-*.md` drafted for a round trip with a fork that has since resolved, no built binary or index (`.bt2`, a `FastTree` binary, a fork's `Testing/`). File under **R8**.
@@ -159,7 +159,7 @@ Always run, in this order.
    - each issue the PR closes has its own closing keyword (`Closes #1, closes #2`); GitHub acts only on the first issue of a comma-separated list, and an issue addressed in part is named without one;
    - a contract change is named, with the version field that moved;
    - a submodule bump names the fork PR it brings in.
-8. **CI gates the diff must satisfy:** `cargo fmt -- --check`; `cargo clippy -- -D warnings` on stable Rust, which can be newer than a local toolchain and carry lints it lacks; `cargo test` on Linux and macOS; the `scripts` job (`make test-scripts`); and `review-loop-check` (`CLAUDE.md`, "Reviewing a branch"). In fork mode, the fork's own CI.
+8. **CI gates the diff must satisfy:** the jobs in `.github/workflows/ci.yml`, whose clippy runs on stable Rust, which can be newer than a local toolchain and carry lints it lacks; and `review-loop-check` (`CLAUDE.md`, "Reviewing a branch"). In fork mode, the fork's own CI.
 
 ## Rules
 
@@ -216,7 +216,7 @@ A test that cannot fail when the behaviour it is named for breaks is wrong.
 
 - **Real shared memory, no mocks** (`CLAUDE.md`, "Key conventions"). A smoke test writes Arrow IPC to a real segment, runs the tool, and reads the output back.
 - **Streaming tools get multi-batch tests** that show the context survives across `run_batch` calls, and an error in one batch does not poison the next.
-- **Expected values are derived, not typed.** A numeric expected value comes from the native tool's output (`GUIDANCE_PARITY_TESTS.md`), a committed golden, or a derivation the test states; ask where an unexplained value came from. It is computed by a different route than the code under test.
+- **Expected values are derived, not typed.** A numeric expected value comes from the native tool's output (for FastTree, by the procedure in `GUIDANCE_PARITY_TESTS.md`), a committed golden, or a derivation the test states; ask where an unexplained value came from. It is computed by a different route than the code under test.
 - **Tolerances come from the reference** [soft]: what the tool's own tests assert, and what differs across platforms or thread counts.
 - **The fixture reaches the code.** It carries the variants the code branches on: paired-end and single-end, quality present and absent, NULL rows, an empty batch, a contig with no genes, more than one batch.
 - **Determinism.** A seeded tool is tested at a fixed seed, and a test that claims determinism runs twice and compares.
@@ -224,10 +224,10 @@ A test that cannot fail when the behaviour it is named for breaks is wrong.
 
 ### R6 — Build, submodules and portability [strong]
 
-- **One `cc::Build` per tool**, with `-fvisibility=hidden` and a `cargo:rerun-if-changed` for every compiled source and header (`GUIDANCE_INTEGRATE.md`, "Common mistakes"). Two tools sharing a build collide on symbols.
+- **One `cc::Build` per tool**, with `-fvisibility=hidden` and a `cargo:rerun-if-changed` for every compiled source and header (`GUIDANCE_INTEGRATE.md`, "Step 2" and "Common mistakes"). Two tools sharing a build collide on symbols.
 - **Linux and macOS are both supported.** Shared-memory semantics differ (`CLAUDE.md`, "Arrow IPC write strategy"); OpenMP is found differently (`CLAUDE.md`, "FastTree threads"). Linux-only code (`/proc`, a second `ftruncate`) is gated with `#[cfg]` and documented as Linux-only, as the `metrics` fields are.
 - **A submodule pin** points at a commit on the fork branch `.gitmodules` names, respects the documented floors (FastTree at or after `2a6c14b`, `CLAUDE.md`, "FastTree threads"), is exercised by this PR, and its log for the range is read. A config struct that grew in the C API grows in its Rust mirror, with the size test updated.
-- **A new dependency is its own decision.** A crate or a system library states what it buys over the best path without it, and is checked against the release build (`.github/workflows/release.yml`), `install.sh` and the "Build" sections of `CLAUDE.md` and `README.md`.
+- **A new dependency is its own decision.** A crate or a system library states what it buys over the best path without it, and is checked against the release build (`.github/workflows/release.yml`), `install.sh`, `CLAUDE.md` "Build" and `README.md` "Building from source" and "Building".
 
 ### R7 — Reuse and convergence [strong]
 
@@ -253,7 +253,7 @@ When two similar code paths solve the same problem differently, factor out the s
 
 ### R9 — Fork mode: the C and C++ library contract [strong]
 
-Applies to a diff in a fork checkout (`../bowtie2`, `../fasttree`, `../Prodigal`). `GUIDANCE_API_LIBRARY.md` is the contract; point at its sections.
+Applies to a diff in a tool fork's checkout: the repository behind a submodule under `ext/` whose `.gitmodules` branch ends in `-miint`, checked out beside this one (`../<name>`, for example `../bowtie2`). `GUIDANCE_API_LIBRARY.md` is the contract; point at its sections.
 
 - **The API surface** ("Required C API surface", "Config struct design"). `config_init`, create, run, destroy, output free, `strerror` and `last_error`; the config struct carries `struct_size` first; booleans are `int`; `config_init` alone yields a valid run, with no field the caller must set.
 - **No process-wide side effects.** No global mutable state (bowtie2's documented alignment mutex is the exception this repository works around with subprocess workers), no `exit` or `abort`, no stdout or stderr outside the log callback, deterministic for a given seed.

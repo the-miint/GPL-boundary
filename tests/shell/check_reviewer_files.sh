@@ -6,12 +6,14 @@
 #   - every rule the families table or the Trigger map names has a "### R<n>"
 #     heading, every heading has a family (or is coordinator-only) and a
 #     Trigger-map row, and no rule has two families;
-#   - the skill and the agent name each other's paths, and their frontmatter
-#     names are the ones callers spawn them by;
+#   - the skill and the agent name each other's paths, their frontmatter names are
+#     the ones callers spawn them by, and the check script and the PR template
+#     name the skill;
 #   - CLAUDE.md has a "Reviewing a branch" section naming both files and the
 #     opt-out label;
-#   - the agent, the skill, the PR template and CLAUDE.md's "Reviewing a branch"
-#     section carry no planning handles.
+#   - the committed Markdown under .claude/, the PR template and CLAUDE.md's
+#     "Reviewing a branch" section carry no planning handles, by the pattern the
+#     agent's own sweep uses.
 #
 # Usage: bash tests/shell/check_reviewer_files.sh
 
@@ -65,7 +67,7 @@ missing_from() { comm -23 <(printf '%s\n' "$1" | sed '/^$/d' | sort -u) <(printf
 families="$(section "$AGENT" '### Rule families')"
 family_rows="$(grep '^|' <<< "$families")"
 family_rules="$(rules_in <<< "$family_rows")"
-coordinator_rules="$(grep -v '^|' <<< "$families" | grep -i 'coordinator' | rules_in)"
+coordinator_rules="$(grep -v '^|' <<< "$families" | grep 'never fanned out' | rules_in)"
 trigger_rules="$(section "$AGENT" '## Trigger map' | grep '^|' | rules_in)"
 headings="$(grep -oE '^### R[0-9]+' "$AGENT" 2> /dev/null | rules_in)"
 
@@ -117,6 +119,12 @@ report "the frontmatter names are gpl-boundary-review and gpl-boundary-reviewer"
     "the skill spawns the agent by name, and the check script's message names the skill" "$ok" \
     "skill: '$(frontmatter_name "$SKILL")' agent: '$(frontmatter_name "$AGENT")'"
 
+ok=0
+grep -qF "$SKILL_REL" "$ROOT/scripts/check-review-loop.sh" 2> /dev/null \
+    && grep -qF "$SKILL_REL" "$TEMPLATE" 2> /dev/null && ok=1
+report "the check script and the PR template name the skill's path" \
+    "a PR the check refuses is told to run the skill; a stale path sends the author nowhere" "$ok"
+
 # --- CLAUDE.md points at the loop ---
 
 review_section="$(section "$CLAUDE_MD" '## Reviewing a branch')"
@@ -130,13 +138,14 @@ report "CLAUDE.md's 'Reviewing a branch' section names the skill, the agent and 
 
 # The handle pattern is the one the agent's "Planning marks" check sweeps with: the
 # -e arguments of its rg command, with rg's \b written as an explicit word boundary
-# so BSD grep reads it too. That check quotes the pattern, so its own lines, up to
-# the next numbered check or heading, are blanked before the agent is scanned (line
-# numbers kept).
-planning_block() {
-    awk '/^[0-9]+\. \*\*Planning marks/ {on = 1; print; next} on && (/^[0-9]+\. / || /^#/) {exit} on' \
-        "$AGENT" 2> /dev/null
-}
+# so BSD grep reads it too. That check quotes the pattern, so its own lines are
+# blanked before the agent is scanned (line numbers kept). The check runs from its
+# numbered line to the next numbered check or heading.
+plan_from="" plan_to=""
+read -r plan_from plan_to < <(awk '
+    /^[0-9]+\. \*\*Planning marks/ {from = NR; next}
+    from && !to && (/^[0-9]+\. / || /^#/) {to = NR - 1}
+    END {if (from) print from, (to ? to : NR)}' "$AGENT" 2> /dev/null) || true
 to_ere() {
     local p="$1" w='[^A-Za-z0-9_]'
     case "$p" in '\b'*) p="(^|$w)${p#'\b'}" ;; esac
@@ -144,19 +153,35 @@ to_ere() {
     printf '%s' "$p"
 }
 HANDLES=""
-while IFS= read -r arg; do
-    [ -n "$arg" ] && HANDLES+="${HANDLES:+|}$(to_ere "$arg")"
-done < <(planning_block | grep -oE "\-e '[^']*'" | sed "s/^-e '//; s/'\$//")
+if [ -n "$plan_from" ]; then
+    while IFS= read -r arg; do
+        [ -n "$arg" ] && HANDLES+="${HANDLES:+|}$(to_ere "$arg")"
+    done < <(sed -n "${plan_from},${plan_to}p" "$AGENT" | grep -oE "[-]e '[^']*'" | sed "s/^-e '//; s/'\$//")
+fi
+
+# A positive control: the pattern as this platform's grep reads it matches the
+# handles the agent names, and not a word that only starts like one.
+ok=0
+if [ -n "$HANDLES" ]; then
+    n="$(printf '%s\n' 'see M3.' 'Phase 4' 'Cycle 2.3' 'in localdocs/' 'a Milestone' | grep -cE "$HANDLES")"
+    [ "$n" = 5 ] && ! grep -qE "$HANDLES" <<< 'M3x and M3_y' && ok=1
+fi
+report "the handle pattern read from the agent matches the handles it names" \
+    "a pattern this grep misreads, or an empty one, would let every handle through" "$ok" \
+    "pattern: '${HANDLES}'"
 
 hits=""
 scan() {  # scan LABEL: stdin is the text
-    local found
-    found="$(grep -nE "$HANDLES" | sed "s|^|$1:|")" || true
-    [ -n "$found" ] && hits+="$found"$'\n'
+    local found status=0
+    found="$(grep -nE "$HANDLES")" || status=$?
+    if [ "$status" -ge 2 ]; then
+        hits+="$1: grep could not apply the pattern"$'\n'
+    elif [ -n "$found" ]; then
+        hits+="$1:${found//$'\n'/$'\n'$1:}"$'\n'
+    fi
 }
-if [[ -f "$AGENT" && -f "$SKILL" && -n "$HANDLES" ]]; then
-    scan "$AGENT_REL" < <(awk '/^[0-9]+\. \*\*Planning marks/ {skip = 1; print ""; next}
-        skip && (/^[0-9]+\. / || /^#/) {skip = 0} {print (skip ? "" : $0)}' "$AGENT")
+if [[ -f "$AGENT" && -f "$SKILL" && -f "$TEMPLATE" && -n "$HANDLES" ]]; then
+    scan "$AGENT_REL" < <(awk -v a="$plan_from" -v b="$plan_to" '{print (NR >= a && NR <= b ? "" : $0)}' "$AGENT")
     scan "$SKILL_REL" < "$SKILL"
     # Other committed Markdown under .claude/; untracked local files (a worktree, a
     # personal command) are not the repository's.
@@ -168,10 +193,10 @@ if [[ -f "$AGENT" && -f "$SKILL" && -n "$HANDLES" ]]; then
     scan "CLAUDE.md (Reviewing a branch, line numbers relative)" < <(section "$CLAUDE_MD" '## Reviewing a branch')
 fi
 ok=0
-[[ -f "$AGENT" && -f "$SKILL" && -n "$HANDLES" && -z "$hits" ]] && ok=1
+[[ -f "$AGENT" && -f "$SKILL" && -f "$TEMPLATE" && -n "$HANDLES" && -z "$hits" ]] && ok=1
 report "the review tooling carries no planning handles" \
     "these files are committed and read by every future reviewer; a handle points into notes they do not have" "$ok" \
-    "${hits:-agent or skill missing, or the agent Planning marks check names no rg sweep}"
+    "${hits:-a file is missing, or the agent Planning marks check names no rg sweep}"
 
 echo ""
 if [ $FAILED -eq 0 ]; then
