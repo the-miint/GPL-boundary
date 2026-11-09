@@ -163,7 +163,8 @@ We do not exhaustively test submodules; that is their own CI's job.
 ```bash
 cargo build          # builds fasttree C lib via cc crate + links it
 cargo test           # unit + integration tests (uses real POSIX shared memory)
-make check           # fmt + clippy + test
+make check           # fmt + clippy + test + test-scripts
+make test-scripts    # shell tests for scripts/ and the review tooling (git + bash only)
 ```
 
 The `build.rs` compiles C/C++ sources from submodules using the `cc` crate
@@ -200,6 +201,11 @@ tests/
   build_sanity.rs    # Integration tests: binary links and runs correctly
   bowtie2_build.rs   # Integration tests: bowtie2 index builder + round-trip with align
   streaming.rs       # Integration tests: NDJSON streaming protocol
+  shell/             # Shell tests for scripts/ and the review tooling (make test-scripts)
+scripts/             # Developer and CI scripts (the pre-commit hook, the review-loop-check script)
+.claude/
+  skills/gpl-boundary-review/      # The review loop (see "Reviewing a branch")
+  agents/gpl-boundary-reviewer.md  # The reviewer's rules
 build.rs             # Per-tool C compilation functions via cc crate
 ```
 
@@ -285,7 +291,8 @@ thread.
 - **Tool registration**: tools self-register via `inventory::submit!`. No
   manual dispatch match arms. Duplicate names are caught at startup.
 - **CI**: GitHub Actions on Linux + macOS. Runs `cargo test`, `cargo clippy`,
-  `cargo fmt --check`.
+  `cargo fmt --check` and `make test-scripts`; `review-loop-check` reads the
+  PR description (see "Reviewing a branch").
 - **No Newick output**: fasttree returns SOA tree structure as Arrow columnar
   data, not Newick strings.
 - **Arrow IPC stream format** (not file format) for shared memory exchange.
@@ -295,6 +302,27 @@ thread.
 - **Streaming tests**: streaming-capable tools must have multi-batch smoke tests
   verifying the context survives across `run_batch()` calls
 - **StreamingContext Drop**: must call the C library's `destroy()` function
+
+## Reviewing a branch
+
+Every PR runs the review loop on its own changes before it is opened, and so does
+every PR to a tool fork (`../bowtie2`, `../fasttree`, `../Prodigal`), whose loop is
+driven from this repository in fork mode. The `gpl-boundary-review` skill
+(`.claude/skills/gpl-boundary-review/SKILL.md`) owns the loop: one `/code-review`
+pass, then fresh `gpl-boundary-reviewer` rounds until a stop rule holds; the rules
+live in `.claude/agents/gpl-boundary-reviewer.md`. The loop ends by printing a
+`## Reviewer loop` block for the PR description, and the `review-loop-check`
+workflow (`scripts/check-review-loop.sh`) fails a PR whose block is missing or names
+a commit that is not one of the PR's own. A PR that cannot run the loop carries the
+`no-agent-review` label and says why under that heading. The check shows that the
+block is present, not that the loop ran, and nothing checks a fork's PR.
+
+When a human review turns up a pattern the reviewer missed, add it to the agent file
+in the PR that fixes the instance: a bullet under the rule that owns it and a
+Trigger-map row so it can fire, with no names, quotes or PR numbers. A PR that
+introduces a new contract (a transport, an ABI, a build target) adds the rules for it
+in the same PR. `tests/shell/check_reviewer_files.sh` checks that every rule has a
+family and a Trigger-map row.
 
 ## Protocol
 

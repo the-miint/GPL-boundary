@@ -8,6 +8,8 @@
 #     Trigger-map row, and no rule has two families;
 #   - the skill and the agent name each other's paths, and their frontmatter
 #     names are the ones callers spawn them by;
+#   - CLAUDE.md has a "Reviewing a branch" section naming both files and the
+#     opt-out label;
 #   - the agent, the skill, the PR template and CLAUDE.md's "Reviewing a branch"
 #     section carry no planning handles.
 #
@@ -114,6 +116,15 @@ ok=0
 report "the frontmatter names are gpl-boundary-review and gpl-boundary-reviewer" \
     "the skill spawns the agent by name, and the check script's message names the skill" "$ok" \
     "skill: '$(frontmatter_name "$SKILL")' agent: '$(frontmatter_name "$AGENT")'"
+
+# --- CLAUDE.md points at the loop ---
+
+review_section="$(section "$CLAUDE_MD" '## Reviewing a branch')"
+ok=0
+grep -qF "$SKILL_REL" <<< "$review_section" && grep -qF "$AGENT_REL" <<< "$review_section" \
+    && grep -qF 'no-agent-review' <<< "$review_section" && ok=1
+report "CLAUDE.md's 'Reviewing a branch' section names the skill, the agent and the label" \
+    "CLAUDE.md is what a session reads first; without the section, nothing tells it a PR needs the loop or how to opt out" "$ok"
 
 # --- planning handles ---
 
