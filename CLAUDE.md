@@ -306,15 +306,14 @@ thread.
 ## Reviewing a branch
 
 Every PR runs the review loop on its own changes before it is opened, and so does
-every PR to a tool fork (a submodule's `-miint` fork checked out beside this
-repository, such as `../bowtie2`), whose loop is driven from this repository in fork
-mode. The `gpl-boundary-review` skill
+every PR to a tool fork (R9 in the agent defines them; `../bowtie2` is one), whose
+loop is driven from this repository in fork mode. The `gpl-boundary-review` skill
 (`.claude/skills/gpl-boundary-review/SKILL.md`) owns the loop: one `/code-review`
 pass, then fresh `gpl-boundary-reviewer` rounds until a stop rule holds; the rules
 live in `.claude/agents/gpl-boundary-reviewer.md`. The loop ends by printing a
 `## Reviewer loop` block for the PR description, and the `review-loop-check`
-workflow (`scripts/check-review-loop.sh`) fails a PR whose block is missing or names
-a commit that is not one of the PR's own. A PR that cannot run the loop carries the
+workflow (`scripts/check-review-loop.sh`) fails a PR whose block is missing or
+unfilled, or names a commit that is not one of the PR's own. A PR that cannot run the loop carries the
 `no-agent-review` label and says why under that heading. The check shows that the
 block is present, not that the loop ran, and nothing checks a fork's PR.
 

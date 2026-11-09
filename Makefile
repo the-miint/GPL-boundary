@@ -8,9 +8,8 @@ test:
 
 check: fmt clippy test test-scripts
 
-# The shell tests for the review tooling: the PR-description check and the
-# reviewer's prose files. They need git, bash and the POSIX text tools, not the
-# Rust toolchain or the submodules.
+# Shell tests. They need git, bash and the POSIX text tools, not the Rust
+# toolchain or the submodules.
 test-scripts:
 	bash tests/shell/check_review_loop.sh
 	bash tests/shell/check_reviewer_files.sh

@@ -83,12 +83,15 @@ Something.
 '
 block() { printf '%s' "${BLOCK//@SHA@/$1}"; }
 
-# fill TEXT: TEXT with the block's Reviewed at and Fixed lines filled in, as an
-# author fills in the template or the skill's example.
+# fill TEXT: TEXT with the placeholders on its Reviewed at and Fixed lines filled in,
+# as an author fills in the template or the skill's example. Only the placeholders
+# are replaced, so the labels the script keys on (rounds:, stopped:) stay under test.
 fill() {
-    # shellcheck disable=SC2001 # a line-anchored edit, which ${var//} cannot express
-    sed -e "s/^- Reviewed at:.*/- Reviewed at: $SHA_second · rounds: 1 · stopped: nothing new/" \
-        -e 's/^- Fixed:.*/- Fixed: 0/' <<< "$1"
+    # shellcheck disable=SC2001 # line-addressed edits, which ${var//} cannot express
+    sed -e "/^- Reviewed at:/s/<[^>]*sha[^>]*>/$SHA_second/" \
+        -e '/^- Reviewed at:/s/<N>/1/' \
+        -e '/^- Reviewed at:/s/<[^>]*>/x/g' \
+        -e '/^- Fixed:/s/<count>/0/' <<< "$1"
 }
 
 # invoke BODY [LABELS] [BASE]: run the script as the workflow does, with the PR head
@@ -139,9 +142,10 @@ report "the no-agent-review label passes without a block" \
     "the label is the only opt-out for a PR whose author cannot run the loop" "$ok"
 
 body="$(block "$SHA_first")"
-invoke "${body/$'- Declined:\n  - none'/$'- Declined:\n  - a copy into a Vec<u8>, \x60src/x.rs\x60 — test-only path'}"
+body="${body/$'- Declined:\n  - none'/$'- Declined:\n  - a copy into a Vec<u8>, \x60src/x.rs\x60 — test-only path'}"
+invoke "$body"
 ok=0
-[[ $EXIT -eq 0 ]] && ok=1
+[[ "$body" == *"Vec<u8>"* && $EXIT -eq 0 ]] && ok=1
 report "an entry line naming a type such as Vec<u8> passes" \
     "only the Reviewed at and Fixed lines are checked for placeholders, since an entry can quote code" "$ok"
 
@@ -258,12 +262,21 @@ for fixed in "- Fixed:" "- Fixed: TBD"; do
         "the count is the record of what the loop changed; a line without one records nothing" "$ok"
 done
 
+for cut in " · rounds: 2 · stopped: nothing new" " · stopped: nothing new" " · rounds: 2"; do
+    body="$(block "$SHA_first")"
+    invoke "${body/"$cut"/}"
+    ok=0
+    [[ $EXIT -eq 1 && "$ERR" == *"does not give 'rounds:"* ]] && ok=1
+    report "a Reviewed at line without '${cut# · }' is refused" \
+        "the rounds and the stop rule say how the loop ended; each one missing leaves that unrecorded" "$ok"
+done
+
 body="$(block "$SHA_first")"
-invoke "${body/" · rounds: 2 · stopped: nothing new"/}"
+invoke "${body/"rounds: 2"/rounds: TBD}"
 ok=0
 [[ $EXIT -eq 1 && "$ERR" == *"does not give 'rounds:"* ]] && ok=1
-report "a Reviewed at line holding only the sha is refused" \
-    "the rounds and the stop rule say how the loop ended; a sha alone does not" "$ok"
+report "a Reviewed at line reading 'rounds: TBD' is refused" \
+    "a round count that is not a number records nothing" "$ok"
 
 EXIT=0 OUT="" ERR=""
 if tpl="$(cat "$TEMPLATE")"; then
@@ -294,7 +307,7 @@ if tpl="$(cat "$TEMPLATE")"; then
 fi
 ok=0
 [[ -n "${tpl:-}" && $EXIT -eq 0 ]] && ok=1
-report "the PR template passes once its sha and count are filled in" \
+report "the PR template passes once its placeholders are filled in" \
     "the template carries a copy of the block, and it has to be the shape the script accepts" "$ok"
 
 # The fenced example under the skill's PR-body heading.
@@ -306,7 +319,7 @@ if [ -n "$example" ]; then
 fi
 ok=0
 [[ -n "$example" && $EXIT -eq 0 ]] && ok=1
-report "the skill's example block passes once its sha and count are filled in" \
+report "the skill's example block passes once its placeholders are filled in" \
     "the skill prints the block authors paste, and it has to be the shape the script accepts" "$ok"
 
 echo ""

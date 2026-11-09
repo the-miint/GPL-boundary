@@ -21,10 +21,9 @@ stacked on another branch.
 
 ## Fork mode
 
-A tool fork is the repository behind a submodule under `ext/` whose `.gitmodules`
-branch ends in `-miint`, checked out beside this one (`../<name>`, for example
-`../bowtie2`). Its changes are reviewed with the same loop and the same agent. Drive
-the loop from a session in this repository, where the agent is defined.
+A tool fork's changes are reviewed with the same loop and the same agent; R9 in the
+agent defines which repositories are tool forks (for example `../bowtie2`). Drive the
+loop from a session in this repository, where the agent is defined.
 
 - **The base** is the branch `.gitmodules` names for that submodule
   (`git config -f .gitmodules submodule.<path>.branch`, with the submodule's path,
@@ -225,7 +224,7 @@ between a clean stop and a forgotten one.
 ## Then write the PR-body block
 
 A PR records that this loop ran and what it left open. `review-loop-check` in CI fails
-a PR whose description lacks the block (the `no-agent-review` label opts out; see
+a PR whose description lacks the block or leaves it unfilled (the `no-agent-review` label opts out; see
 `CLAUDE.md`, "Reviewing a branch"). After the prose list, print the block filled in from
 the ledger (or, while a deferred finding has no issue number, what the last rule below
 says instead). It replaces the template's whole `## Reviewer loop` section, heading
