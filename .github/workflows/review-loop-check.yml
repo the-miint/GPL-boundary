@@ -1,0 +1,35 @@
+name: review-loop-check
+# A PR description records that the gpl-boundary-review loop ran on the branch and
+# what it left open (CLAUDE.md, "Reviewing a branch"). This reads the description
+# only, so it is its own workflow: `edited` re-runs it when the description changes
+# without re-running the build matrix.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  review-loop-check:
+    runs-on: ubuntu-latest
+    steps:
+      # The default checkout is the PR's merge commit, so the script comes from the
+      # merged tree (a branch cut before the script existed still gets it) and the
+      # history holds both the PR's commits and the base.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Require the Reviewer loop block in the PR description
+        env:
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git fetch --quiet origin "$BASE_REF"
+          BASE_SHA="origin/$BASE_REF" bash scripts/check-review-loop.sh
