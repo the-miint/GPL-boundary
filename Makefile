@@ -12,6 +12,7 @@ check: fmt clippy test test-scripts
 # bash only, not the Rust toolchain or the submodules.
 test-scripts:
 	bash tests/shell/check_review_loop.sh
+	bash tests/shell/check_reviewer_files.sh
 
 fmt:
 	cargo fmt -- --check

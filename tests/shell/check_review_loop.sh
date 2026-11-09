@@ -21,6 +21,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 SCRIPT="${1:-$ROOT/scripts/check-review-loop.sh}"
 TEMPLATE="$ROOT/.github/pull_request_template.md"
+SKILL="$ROOT/.claude/skills/gpl-boundary-review/SKILL.md"
 FAILED=0
 ALL_PASSED=0
 
@@ -232,6 +233,19 @@ ok=0
 [[ -n "${filled:-}" && $EXIT -eq 0 ]] && ok=1
 report "the PR template passes once its sha is filled in" \
     "the template carries a copy of the block, and it has to be the shape the script accepts" "$ok"
+
+# The fenced example under the skill's PR-body heading.
+EXIT=0 OUT="" ERR=""
+example="$(awk '/^## Then write the PR-body block/ {s = 1} s && /^```markdown$/ {on = 1; next} on && /^```$/ {exit} on' \
+    "$SKILL" 2> /dev/null)" || true
+if [ -n "$example" ]; then
+    # shellcheck disable=SC2001 # a line-anchored edit, which ${var//} cannot express
+    invoke "$(sed "s/^- Reviewed at:.*/- Reviewed at: $SHA_second · rounds: 1 · stopped: nothing new/" <<< "$example")"
+fi
+ok=0
+[[ -n "$example" && $EXIT -eq 0 ]] && ok=1
+report "the skill's example block passes once its sha is filled in" \
+    "the skill prints the block authors paste, and it has to be the shape the script accepts" "$ok"
 
 echo ""
 if [ $FAILED -eq 0 ]; then
