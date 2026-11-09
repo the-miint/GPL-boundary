@@ -71,7 +71,7 @@ The caller gives every entry under **Findings** a disposition, so what lands the
 - **Flag-but-defer what is wider than the PR.** A pre-existing problem in a sibling file, or a fix that would sprawl, is flagged with a proposed follow-up issue, not a request to expand the PR. Don't fail a PR for a problem it inherited. An existing sibling doing the same thing does not excuse a new site: flag the new one, offer the old ones as the follow-up.
 - **Write a deferral so it survives being handed on.** Each deferred or `[needs-probe]` finding states why it is out of scope ("pre-existing in a sibling adapter", "needs macOS") and whether it pre-dates this branch or was introduced by it. Bare "deferred" is not a reason. A deferred finding also carries a title for its follow-up issue and what would close it; the `gpl-boundary-review` skill says when that issue is opened.
 - **The reverse holds too: a change unrelated to the PR's purpose belongs in its own PR** [strong]: a submodule bump the PR does not exercise, a reformat of untouched code, an unrelated fix. If it regresses, the revert takes the PR's real change with it, and a bisect lands on a commit whose title names something else.
-- **Verify your premises.** A finding that rests on a claim about a file you have not read ("this diverges from how the prodigal adapter does it") is confirmed by opening that file, or softened to a question. A claim about what arrow-rs, a C library under `ext/`, the kernel's shared memory or any crate does with a type or a value is a premise too: it is `[needs-probe]`, and the probe must exercise the path the code uses. The submodule sources (`ext/`), `vendor/` and the crate sources in the cargo registry are readable; reading them settles what the code says, not what it does at run time.
+- **Verify your premises.** A finding that rests on a claim about a file you have not read ("this diverges from how the prodigal adapter does it") is confirmed by opening that file, or softened to a question. A claim about what arrow-rs, a C library under `ext/`, the kernel's shared memory or any crate does with a type or a value is a premise too: it is `[needs-probe]`, and the probe must exercise the path the code uses. The submodule sources (`ext/`) and the crate sources in the cargo registry are readable; reading them settles what the code says, not what it does at run time.
 
 ## Standing policies
 
@@ -125,7 +125,7 @@ Only rules whose trigger appears in the diff can fire.
 | `src/rusage.rs`, the `metrics` object | R2, R11 |
 | `tests/**`, a `#[test]`, `src/test_util.rs`, a fixture | R5 |
 | A numeric literal or tolerance in an assertion; a parity or golden test | R5 |
-| `build.rs`, `Cargo.toml` / `Cargo.lock`, `.gitmodules`, an `ext/*` pointer bump, `vendor/**` | R6 |
+| `build.rs`, `Cargo.toml` / `Cargo.lock`, `.gitmodules`, an `ext/*` pointer bump | R6 |
 | `.github/workflows/**`, `scripts/**`, `tests/shell/**`, `Makefile`, `install.sh` | R6, R1 |
 | `#[cfg(target_os = …)]`, a `libc::` call, `/proc`, macOS-specific code | R6 |
 | A guard, a `Response::error`, a non-test `unwrap` / `expect` / `panic!`, a substituted default | R1 |

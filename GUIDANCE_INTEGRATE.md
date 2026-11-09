@@ -179,8 +179,8 @@ const RESULTS: OutputDescription = OutputDescription {
         // Optional / "absent" values: use nullable columns rather than
         // sentinel values like -1 or 0. Translate the C library's
         // sentinel (documented in its header) to Arrow NULL on emission.
-        // See FastTree v2 (`branch_length`, `support`) and SortMeRNA v2
-        // (alignment-only columns gated on `aligned == 0`) for examples.
+        // See FastTree's `branch_length` and `support`, and bowtie2-align's
+        // XN/XM/XO/XG tags (gated on the unmapped flag), for examples.
         FieldDescription::new("score", "Float64", true, "Score; NULL if none"),
         FieldDescription::new("name", "Utf8", true, "Name; NULL if none"),
     ],
@@ -685,8 +685,9 @@ in the SOA→RecordBatch conversion. Non-nullable columns with
 in-band sentinels force every consumer to remember the per-column
 sentinel value, and produce silently-wrong joins when the sentinel
 collides with a valid value. See `src/tools/fasttree.rs` and
-`src/tools/sortmerna.rs` for the pattern: gate either on a clean
-sibling column (e.g. SortMeRNA's `aligned == 0`) or on a documented
+`src/tools/bowtie2_align.rs` for the pattern: gate either on a clean
+sibling column (e.g. bowtie2-align's XN/XM/XO/XG tags, NULL when the
+`flags` column has the unmapped bit 0x4) or on a documented
 out-of-range value (e.g. FastTree's `parent == -1` for root).
 
 ## Updating CLAUDE.md

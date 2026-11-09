@@ -2,53 +2,10 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    let rocksdb_include = build_rocksdb();
     build_fasttree();
     build_prodigal();
-    build_sortmerna(&rocksdb_include);
     build_bowtie2();
     link_math();
-}
-
-/// Build RocksDB as a static library from the vendored submodule.
-///
-/// Pinned to v8.11.5. We deviate from SortMeRNA's own pin (v7.10.2)
-/// because that release omits `<cstdint>` in headers that use
-/// `uint16_t`/`uint8_t` and fails to compile on GCC 13+. SortMeRNA only
-/// includes the most stable RocksDB headers (`db.h`, `options.h`,
-/// `slice.h`, `version.h`) — all API-stable across 7.x→8.x — so the bump
-/// is API-safe.
-///
-/// CMake flags mirror SortMeRNA's `cmake/presets/CMakePresets_rocksdb.json`:
-/// tests/tools/gflags off, only zlib compression on. `PORTABLE=1` is added
-/// to disable `-march=native` so the resulting binary runs on any CPU of
-/// the target architecture (required for distributed release builds).
-///
-/// Returns the include path (`<install>/include`) so `build_sortmerna` can
-/// add it to its C++ include search list. The `librocksdb.a` link-lib is
-/// emitted from `link_sortmerna_deps` to control link order: SortMeRNA's
-/// objects must appear before `-lrocksdb` so the linker resolves their
-/// references.
-fn build_rocksdb() -> PathBuf {
-    let dst = cmake::Config::new("ext/rocksdb")
-        .profile("Release")
-        .define("WITH_TESTS", "OFF")
-        .define("WITH_TOOLS", "OFF")
-        .define("WITH_BENCHMARK_TOOLS", "OFF")
-        .define("WITH_CORE_TOOLS", "OFF")
-        .define("WITH_GFLAGS", "OFF")
-        .define("ROCKSDB_BUILD_SHARED", "OFF")
-        .define("WITH_ZLIB", "ON")
-        .define("USE_RTTI", "1")
-        .define("PORTABLE", "1")
-        .define("FAIL_ON_WARNINGS", "OFF")
-        .build();
-
-    println!("cargo:rustc-link-search=native={}/lib", dst.display());
-
-    println!("cargo:rerun-if-changed=ext/rocksdb/CMakeLists.txt");
-
-    dst.join("include")
 }
 
 /// Compile FastTree C sources into a static library.
@@ -224,212 +181,6 @@ fn build_prodigal() {
     println!("cargo:rerun-if-changed=ext/prodigal");
 }
 
-/// Compile SortMeRNA C and C++ sources into static libraries.
-///
-/// SortMeRNA is C++17. RocksDB comes from the vendored static build
-/// (`build_rocksdb`); zlib is still expected from the system. Split into
-/// two cc::Build instances: one for C sources (cmph + ssw), one for C++17
-/// sources (alp + sortmerna core + smr_api).
-fn build_sortmerna(rocksdb_include: &PathBuf) {
-    let dir = PathBuf::from("ext/sortmerna");
-    let smr_src = dir.join("src/sortmerna");
-    let api_src = dir.join("src/smr_api");
-    let cmph_dir = dir.join("3rdparty/cmph");
-    let alp_dir = dir.join("3rdparty/alp");
-    let cq_dir = PathBuf::from("vendor/concurrentqueue"); // vendored header-only lib
-
-    // -- C sources: cmph (23 files) + ssw.c --
-    let cmph_files: Vec<PathBuf> = [
-        "bdz.c",
-        "bdz_ph.c",
-        "bmz.c",
-        "bmz8.c",
-        "brz.c",
-        "buffer_entry.c",
-        "buffer_manager.c",
-        "chd.c",
-        "chd_ph.c",
-        "chm.c",
-        "cmph.c",
-        "cmph_structs.c",
-        "compressed_rank.c",
-        "compressed_seq.c",
-        "fch.c",
-        "fch_buckets.c",
-        "graph.c",
-        "hash.c",
-        "jenkins_hash.c",
-        "miller_rabin.c",
-        "select.c",
-        "vqueue.c",
-        "vstack.c",
-    ]
-    .iter()
-    .map(|f| cmph_dir.join(f))
-    .collect();
-
-    let mut c_build = cc::Build::new();
-    for f in &cmph_files {
-        c_build.file(f);
-    }
-    c_build
-        .file(smr_src.join("ssw.c"))
-        .include(&cmph_dir)
-        .include(dir.join("include"))
-        .flag("-fvisibility=hidden")
-        .opt_level(3)
-        .warnings(false)
-        .compile("smr_c");
-
-    // -- C++17 sources: alp (15 files) + sortmerna core (31 files) + smr_api --
-    let alp_files: Vec<PathBuf> = [
-        "njn_dynprogprob.cpp",
-        "njn_dynprogproblim.cpp",
-        "njn_dynprogprobproto.cpp",
-        "njn_ioutil.cpp",
-        "njn_localmaxstat.cpp",
-        "njn_localmaxstatmatrix.cpp",
-        "njn_localmaxstatutil.cpp",
-        "njn_random.cpp",
-        "sls_alignment_evaluer.cpp",
-        "sls_alp.cpp",
-        "sls_alp_data.cpp",
-        "sls_alp_regression.cpp",
-        "sls_alp_sim.cpp",
-        "sls_basic.cpp",
-        "sls_pvalues.cpp",
-    ]
-    .iter()
-    .map(|f| alp_dir.join(f))
-    .collect();
-
-    // Core sortmerna .cpp files (excludes main.cpp, read_control.cpp, writer.cpp,
-    // minoccur.cpp [dead code: find_minoccur() is never called])
-    let core_files: Vec<PathBuf> = [
-        "alignment.cpp",
-        "bitvector.cpp",
-        "cmd.cpp",
-        "index.cpp",
-        "indexdb.cpp",
-        "izlib.cpp",
-        "kseq_load.cpp",
-        "kvdb.cpp",
-        "options.cpp",
-        "otumap.cpp",
-        "output.cpp",
-        "paralleltraversal.cpp",
-        "processor.cpp",
-        "read.cpp",
-        "readfeed.cpp",
-        "readstats.cpp",
-        "references.cpp",
-        "refstats.cpp",
-        "report.cpp",
-        "report_biom.cpp",
-        "report_blast.cpp",
-        "report_denovo.cpp",
-        "report_fastx.cpp",
-        "report_fx_base.cpp",
-        "report_fx_other.cpp",
-        "report_sam.cpp",
-        "smr_log.cpp",
-        "summary.cpp",
-        "traverse_bursttrie.cpp",
-        "util.cpp",
-    ]
-    .iter()
-    .map(|f| smr_src.join(f))
-    .collect();
-
-    let mut cpp_build = cc::Build::new();
-    cpp_build.cpp(true);
-    cpp_build.std("c++17");
-    for f in &alp_files {
-        cpp_build.file(f);
-    }
-    for f in &core_files {
-        cpp_build.file(f);
-    }
-    cpp_build
-        .file(api_src.join("smr_api.cpp"))
-        .include(dir.join("include"))
-        .include(&cmph_dir)
-        .include(&alp_dir)
-        .include(&cq_dir)
-        .include(rocksdb_include);
-    cpp_build
-        .define("SMR_NO_MAIN", None)
-        .flag("-fvisibility=hidden")
-        .flag("-fvisibility-inlines-hidden")
-        .opt_level(3)
-        .warnings(false)
-        // alp uses deprecated `register` keyword; Clang 16+ treats this as
-        // a hard error in C++17 mode even with -w. Suppress it explicitly.
-        .flag_if_supported("-Wno-register")
-        .compile("smr_cpp");
-
-    // Provide build_version symbols expected by options.cpp.
-    // CMake generates these from git info; we provide stubs since
-    // opt_version() is only reachable from the standalone binary's main().
-    let build_ver_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("smr_build_version.cpp");
-    std::fs::write(
-        &build_ver_path,
-        r#"
-namespace sortmerna {
-    const char* sortmerna_build_compile_date = "embedded";
-    const char* sortmerna_build_git_sha = "embedded";
-    const char* sortmerna_build_git_date = "embedded";
-}
-"#,
-    )
-    .expect("Failed to write smr_build_version.cpp");
-
-    cc::Build::new()
-        .cpp(true)
-        .file(&build_ver_path)
-        .flag("-fvisibility=hidden")
-        .warnings(false)
-        .compile("smr_build_version");
-
-    link_sortmerna_deps();
-
-    // Rebuild triggers
-    println!("cargo:rerun-if-changed=ext/sortmerna/include/smr_api.h");
-    println!("cargo:rerun-if-changed=ext/sortmerna/src/smr_api/smr_api.cpp");
-}
-
-/// Link libraries required by SortMeRNA.
-///
-/// Order matters for static linking: the linker resolves symbols
-/// left-to-right, so each lib must come *after* anything that depends on it.
-/// SortMeRNA's `smr_cpp` archive is emitted by cc::Build above; this
-/// function appends rocksdb (referenced by smr_cpp), then zlib (referenced
-/// by both smr_cpp and rocksdb), then the C++ runtime.
-fn link_sortmerna_deps() {
-    // RocksDB static lib from build_rocksdb(). Must come AFTER smr_cpp
-    // (emitted by cc::Build above) and BEFORE zlib (which rocksdb uses).
-    println!("cargo:rustc-link-lib=static=rocksdb");
-
-    // zlib (used directly by sortmerna for gzip support and by rocksdb
-    // for SST compression). Stays dynamic — every supported platform ships
-    // a usable libz.
-    println!("cargo:rustc-link-lib=z");
-
-    // C++ standard library (cc crate handles this for compiled objects,
-    // but we also need it for the final link of the Rust binary)
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os == "macos" {
-        println!("cargo:rustc-link-lib=c++");
-    } else {
-        println!("cargo:rustc-link-lib=stdc++");
-    }
-
-    // Linux-specific: libdl for dynamic loading
-    if target_os == "linux" {
-        println!("cargo:rustc-link-lib=dl");
-    }
-}
-
 /// Compile bowtie2 C++11 sources into a static library.
 ///
 /// Bowtie2 is C++11 with extern "C" API wrappers (bt2_api.h). We compile the
@@ -571,8 +322,17 @@ fn build_bowtie2() {
         .warnings(false)
         .compile("bowtie2_cpp");
 
-    // Bowtie2 needs pthreads on Linux (sortmerna already links stdc++/c++ and zlib)
-    if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "linux" {
+    // After bowtie2_cpp, which references them: zlib (dynamic; every supported
+    // platform ships one), the C++ runtime for the final link of the Rust
+    // binary, and pthreads on Linux.
+    println!("cargo:rustc-link-lib=z");
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "macos" {
+        println!("cargo:rustc-link-lib=c++");
+    } else {
+        println!("cargo:rustc-link-lib=stdc++");
+    }
+    if target_os == "linux" {
         println!("cargo:rustc-link-lib=pthread");
     }
 

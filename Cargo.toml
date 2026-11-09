@@ -22,7 +22,6 @@ sha2 = "0.10"
 
 [build-dependencies]
 cc = "1"
-cmake = "0.1"
 
 [dev-dependencies]
 
