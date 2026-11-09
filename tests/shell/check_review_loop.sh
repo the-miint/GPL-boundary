@@ -278,6 +278,13 @@ ok=0
 report "a Reviewed at line reading 'rounds: TBD' is refused" \
     "a round count that is not a number records nothing" "$ok"
 
+body="$(block "$SHA_first")"
+invoke "${body/"stopped: nothing new"/stopped:}"
+ok=0
+[[ $EXIT -eq 1 && "$ERR" == *"does not give 'rounds:"* ]] && ok=1
+report "a Reviewed at line with an empty 'stopped:' is refused" \
+    "a stop-rule label with no rule after it records nothing" "$ok"
+
 EXIT=0 OUT="" ERR=""
 if tpl="$(cat "$TEMPLATE")"; then
     invoke "${tpl/<sha>/$SHA_second}"

@@ -11,9 +11,9 @@ or a tool fork's own CI lanes when a submodule pin moves. -->
 ## Downstream (miint)
 
 <!-- A change to the wire protocol, an Arrow schema, a --describe surface, a config
-knob, the CLI or the install path needs a matching change in duckdb-miint. Name it,
-and the version miint checks if one moves (the protocol version, a tool's schema
-version), or write "none". -->
+knob, the CLI or the install path needs a matching change in duckdb-miint. Name it
+and, if a version miint checks moves (the protocol version, a tool's schema version),
+that version; or write "none". -->
 
 ## Reviewer loop
 

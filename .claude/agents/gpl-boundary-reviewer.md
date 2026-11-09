@@ -253,7 +253,7 @@ When two similar code paths solve the same problem differently, factor out the s
 
 ### R9 — Fork mode: the C and C++ library contract [strong]
 
-Applies to a diff in a tool fork's checkout. A tool fork is the repository behind a submodule under `ext/` whose `.gitmodules` branch ends in `-miint`, checked out beside this one (for example `ext/prodigal` at `../Prodigal`); this is the definition the skill and `CLAUDE.md` point to. `GUIDANCE_API_LIBRARY.md` is the contract; point at its sections.
+Applies to a diff in a tool fork's checkout. A tool fork is the repository behind a submodule under `ext/` whose `.gitmodules` branch ends in `-miint`, checked out beside this one (for example `ext/prodigal` at `../Prodigal`). `GUIDANCE_API_LIBRARY.md` is the contract; point at its sections.
 
 - **The API surface** ("Required C API surface", "Config struct design"). `config_init`, create, run, destroy, output free, `strerror` and `last_error`; the config struct carries `struct_size` first; booleans are `int`; `config_init` alone yields a valid run, with no field the caller must set.
 - **No process-wide side effects.** No global mutable state (bowtie2's documented alignment mutex is the exception this repository works around with subprocess workers), no `exit` or `abort`, no stdout or stderr outside the log callback, deterministic for a given seed.

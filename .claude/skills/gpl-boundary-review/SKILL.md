@@ -224,11 +224,12 @@ between a clean stop and a forgotten one.
 ## Then write the PR-body block
 
 A PR records that this loop ran and what it left open. `review-loop-check` in CI fails
-a PR whose description lacks the block or leaves it unfilled (the `no-agent-review` label opts out; see
-`CLAUDE.md`, "Reviewing a branch"). After the prose list, print the block filled in from
-the ledger (or, while a deferred finding has no issue number, what the last rule below
-says instead). It replaces the template's whole `## Reviewer loop` section, heading
-included. A fork's PR carries the same block, though no check reads it there:
+a PR whose description lacks the block or leaves it unfilled (the `no-agent-review`
+label opts out; see `CLAUDE.md`, "Reviewing a branch"). After the prose list, print
+the block filled in from the ledger (or, while a deferred finding has no issue number,
+what the last rule below says instead). It replaces the template's whole
+`## Reviewer loop` section, heading included. A fork's PR carries the same block,
+though no check reads it there:
 
 ```markdown
 ## Reviewer loop
