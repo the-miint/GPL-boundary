@@ -211,6 +211,20 @@ ok=0
 report "a line found only under another heading does not count" \
     "each of the four lines is read from the Reviewer loop section, not from anywhere in the description" "$ok"
 
+body="$(block "$SHA_first")"
+invoke "${body/"rounds: 2"/rounds: <N>}"
+ok=0
+[[ $EXIT -eq 1 && "$ERR" == *"template placeholder"* ]] && ok=1
+report "a placeholder left on the Reviewed at line is refused" \
+    "a sha pasted into an otherwise untouched template line records no rounds and no stop rule" "$ok"
+
+body="$(block "$SHA_first")"
+invoke "${body/"- Fixed: 3"/- Fixed: <count>}"
+ok=0
+[[ $EXIT -eq 1 && "$ERR" == *"template placeholder"* ]] && ok=1
+report "a placeholder left on the Fixed line is refused" \
+    "an unfilled count records nothing about what the loop changed" "$ok"
+
 invoke "$(block "$SHA_base")" "" no-such-ref
 ok=0
 [[ $EXIT -eq 2 && "$ERR" == *"cannot resolve 'no-such-ref'"* ]] && ok=1
@@ -226,12 +240,13 @@ report "an unset BASE_SHA is an error, not a default" \
 # --- the published block shape ---
 
 EXIT=0 OUT="" ERR=""
-if filled="$(sed "s/^- Reviewed at:.*/- Reviewed at: $SHA_second · rounds: 1 · stopped: nothing new/" "$TEMPLATE")"; then
+if filled="$(sed -e "s/^- Reviewed at:.*/- Reviewed at: $SHA_second · rounds: 1 · stopped: nothing new/" \
+    -e 's/^- Fixed:.*/- Fixed: 0/' "$TEMPLATE")"; then
     invoke "$filled"
 fi
 ok=0
 [[ -n "${filled:-}" && $EXIT -eq 0 ]] && ok=1
-report "the PR template passes once its sha is filled in" \
+report "the PR template passes once its sha and count are filled in" \
     "the template carries a copy of the block, and it has to be the shape the script accepts" "$ok"
 
 # The fenced example under the skill's PR-body heading.
@@ -240,11 +255,12 @@ example="$(awk '/^## Then write the PR-body block/ {s = 1} s && /^```markdown$/ 
     "$SKILL" 2> /dev/null)" || true
 if [ -n "$example" ]; then
     # shellcheck disable=SC2001 # a line-anchored edit, which ${var//} cannot express
-    invoke "$(sed "s/^- Reviewed at:.*/- Reviewed at: $SHA_second · rounds: 1 · stopped: nothing new/" <<< "$example")"
+    invoke "$(sed -e "s/^- Reviewed at:.*/- Reviewed at: $SHA_second · rounds: 1 · stopped: nothing new/" \
+        -e 's/^- Fixed:.*/- Fixed: 0/' <<< "$example")"
 fi
 ok=0
 [[ -n "$example" && $EXIT -eq 0 ]] && ok=1
-report "the skill's example block passes once its sha is filled in" \
+report "the skill's example block passes once its sha and count are filled in" \
     "the skill prints the block authors paste, and it has to be the shape the script accepts" "$ok"
 
 echo ""

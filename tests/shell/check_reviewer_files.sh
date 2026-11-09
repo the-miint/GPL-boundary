@@ -128,29 +128,50 @@ report "CLAUDE.md's 'Reviewing a branch' section names the skill, the agent and 
 
 # --- planning handles ---
 
-# The handle pattern of the agent's PR-level checks. The agent's own statement of
-# that check quotes the pattern, so its lines are blanked (line numbers kept).
-HANDLES='(^|[^A-Za-z0-9_])M[0-9]+([^A-Za-z0-9_]|$)|[Pp]hase [0-9]|[Cc]ycle [0-9]|localdocs|[Mm]ilestone'
+# The handle pattern is the one the agent's "Planning marks" check sweeps with: the
+# -e arguments of its rg command, with rg's \b written as an explicit word boundary
+# so BSD grep reads it too. That check quotes the pattern, so its own lines, up to
+# the next numbered check or heading, are blanked before the agent is scanned (line
+# numbers kept).
+planning_block() {
+    awk '/^[0-9]+\. \*\*Planning marks/ {on = 1; print; next} on && (/^[0-9]+\. / || /^#/) {exit} on' \
+        "$AGENT" 2> /dev/null
+}
+to_ere() {
+    local p="$1" w='[^A-Za-z0-9_]'
+    case "$p" in '\b'*) p="(^|$w)${p#'\b'}" ;; esac
+    case "$p" in *'\b') p="${p%'\b'}($w|\$)" ;; esac
+    printf '%s' "$p"
+}
+HANDLES=""
+while IFS= read -r arg; do
+    [ -n "$arg" ] && HANDLES+="${HANDLES:+|}$(to_ere "$arg")"
+done < <(planning_block | grep -oE "\-e '[^']*'" | sed "s/^-e '//; s/'\$//")
+
 hits=""
 scan() {  # scan LABEL: stdin is the text
     local found
     found="$(grep -nE "$HANDLES" | sed "s|^|$1:|")" || true
     [ -n "$found" ] && hits+="$found"$'\n'
 }
-if [[ -f "$AGENT" && -f "$SKILL" ]]; then
-    scan "$AGENT_REL" < <(awk '/^5\. \*\*Planning marks/ {skip = 1} /^6\. / {skip = 0} {print (skip ? "" : $0)}' "$AGENT")
+if [[ -f "$AGENT" && -f "$SKILL" && -n "$HANDLES" ]]; then
+    scan "$AGENT_REL" < <(awk '/^[0-9]+\. \*\*Planning marks/ {skip = 1; print ""; next}
+        skip && (/^[0-9]+\. / || /^#/) {skip = 0} {print (skip ? "" : $0)}' "$AGENT")
+    scan "$SKILL_REL" < "$SKILL"
+    # Other committed Markdown under .claude/; untracked local files (a worktree, a
+    # personal command) are not the repository's.
     while IFS= read -r f; do
-        [ "$f" = "$AGENT" ] && continue
-        scan "${f#"$ROOT"/}" < "$f"
-    done < <(find "$ROOT/.claude" -name '*.md' | sort)
+        [[ "$f" == "$AGENT_REL" || "$f" == "$SKILL_REL" ]] && continue
+        scan "$f" < "$ROOT/$f"
+    done < <(git -C "$ROOT" ls-files -- '.claude/*.md')
     scan ".github/pull_request_template.md" < "$TEMPLATE"
     scan "CLAUDE.md (Reviewing a branch, line numbers relative)" < <(section "$CLAUDE_MD" '## Reviewing a branch')
 fi
 ok=0
-[[ -f "$AGENT" && -f "$SKILL" && -z "$hits" ]] && ok=1
+[[ -f "$AGENT" && -f "$SKILL" && -n "$HANDLES" && -z "$hits" ]] && ok=1
 report "the review tooling carries no planning handles" \
     "these files are committed and read by every future reviewer; a handle points into notes they do not have" "$ok" \
-    "${hits:-agent or skill missing}"
+    "${hits:-agent or skill missing, or the agent Planning marks check names no rg sweep}"
 
 echo ""
 if [ $FAILED -eq 0 ]; then

@@ -10,7 +10,8 @@
 #
 # Passes when the 'no-agent-review' label is present, or when the description has a
 # "## Reviewer loop" section whose "Reviewed at:" line names one of the PR's own
-# commits and whose Fixed, Declined, Deferred and Not probed lines are present. It
+# commits, whose Fixed, Declined, Deferred and Not probed lines are present, and
+# whose Reviewed at and Fixed lines hold no template placeholder. It
 # checks that the block is there and points at this branch; it cannot check that the
 # loop was run.
 set -euo pipefail
@@ -67,5 +68,11 @@ for heading in "Fixed:" "Declined:" "Deferred:" "Not probed:"; do
     grep -q "^- ${heading}" <<<"$section" \
         || fail "the Reviewer loop section has no '- ${heading}' line."
 done
+# The template's placeholders are angle-bracketed. The Reviewed at and Fixed lines
+# carry no code, so a '<...>' left on either means the block was not filled in; the
+# entry lines are not checked, since they can name a type such as Vec<u8>.
+if grep -qE '^- (Reviewed at|Fixed):.*<[^>]*>' <<<"$section"; then
+    fail "the Reviewed at or Fixed line still holds a template placeholder ('<...>')."
+fi
 
 echo "Reviewer loop block present; reviewed at ${sha}."
