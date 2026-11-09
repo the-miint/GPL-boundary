@@ -6,7 +6,7 @@
 //!
 //! - `InProcessSlot` — wraps an optional `StreamingContext` (for tools that
 //!   support it) or falls through to `tools::dispatch` (for tools that don't).
-//!   Used by FastTree, Prodigal, SortMeRNA, and the bowtie2-build helper.
+//!   Used by every tool the registry does not route to a subprocess.
 //!   Each slot owns a dedicated worker thread that drains a per-slot mpsc
 //!   queue, so same-fingerprint batches are naturally serialized while
 //!   distinct fingerprints run in parallel.

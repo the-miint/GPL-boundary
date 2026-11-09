@@ -180,19 +180,19 @@ fn test_init_reply_carries_tool_registry() {
         .as_array()
         .expect("init reply must carry a tools array");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    for expected in [
-        "bowtie2-align",
-        "bowtie2-build",
-        "fasttree",
-        "prodigal",
-        "prodigal-train",
-        "sortmerna",
-    ] {
-        assert!(
-            names.contains(&expected),
-            "expected {expected} in tools registry: {names:?}"
-        );
-    }
+    let mut advertised = names.clone();
+    advertised.sort();
+    assert_eq!(
+        advertised,
+        [
+            "bowtie2-align",
+            "bowtie2-build",
+            "fasttree",
+            "prodigal",
+            "prodigal-train"
+        ],
+        "the init reply must advertise exactly the supported tools"
+    );
 
     // Entries are sorted by name; verify the property explicitly so
     // miint's deterministic ordering assumption holds.
@@ -210,7 +210,7 @@ fn test_init_reply_carries_tool_registry() {
         );
     }
 
-    // Sanity-check bowtie2-align lands at the post-Phase-A landmark of 2.
+    // bowtie2-align's schema_version, as CLAUDE.md documents it.
     let bt2 = tools.iter().find(|t| t["name"] == "bowtie2-align").unwrap();
     assert_eq!(bt2["schema_version"].as_u64().unwrap(), 2);
 }
