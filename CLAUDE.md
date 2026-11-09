@@ -154,10 +154,11 @@ make test-scripts    # shell tests for the review tooling (no Rust toolchain nee
 ```
 
 The `build.rs` compiles C/C++ sources from submodules using the `cc` crate;
-no CMake is involved, and CI fails the build if anything runs `cmake`. The
-system dependencies are zlib (`sudo apt-get install libz-dev` on
-Debian/Ubuntu; on macOS it ships in the SDK) and, on macOS, Homebrew's libomp
-for FastTree's OpenMP (`brew install libomp`; see "FastTree threads").
+no CMake is involved, and CI fails the build if `Cargo.lock` has the cmake
+crate or anything runs `cmake`. The system dependencies are zlib
+(`sudo apt-get install libz-dev` on Debian/Ubuntu; on macOS it ships in the
+SDK) and, on macOS, Homebrew's libomp for FastTree's OpenMP
+(`brew install libomp`; see "FastTree threads").
 
 ## Code organization
 

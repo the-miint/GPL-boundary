@@ -33,10 +33,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # The build needs no CMake. The runner images ship one, so a cmake that
-      # fails is put first on PATH: any use of it fails the build.
-      - name: Build (fails if anything runs cmake)
+      # The build needs no CMake. No crate may depend on the cmake crate, which
+      # the lock file shows whatever the cache restores. And since the runner
+      # images ship a cmake, a cmake that fails is put first on PATH, so a
+      # build script that runs one fails the build.
+      - name: Build (fails if anything needs cmake)
         run: |
+          if grep -qx 'name = "cmake"' Cargo.lock; then
+            echo "Cargo.lock has the cmake crate; the build must not need CMake" >&2
+            exit 1
+          fi
           mkdir -p "$RUNNER_TEMP/no-cmake"
           printf '#!/bin/sh\necho "cmake was run; the build must not need it" >&2\nexit 1\n' \
             > "$RUNNER_TEMP/no-cmake/cmake"

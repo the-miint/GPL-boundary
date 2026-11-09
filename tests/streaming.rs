@@ -180,10 +180,9 @@ fn test_init_reply_carries_tool_registry() {
         .as_array()
         .expect("init reply must carry a tools array");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    let mut advertised = names.clone();
-    advertised.sort();
+    // Exactly the supported tools, in name order (miint relies on the order).
     assert_eq!(
-        advertised,
+        names,
         [
             "bowtie2-align",
             "bowtie2-build",
@@ -191,14 +190,8 @@ fn test_init_reply_carries_tool_registry() {
             "prodigal",
             "prodigal-train"
         ],
-        "the init reply must advertise exactly the supported tools"
+        "the init reply must advertise exactly the supported tools, sorted by name"
     );
-
-    // Entries are sorted by name; verify the property explicitly so
-    // miint's deterministic ordering assumption holds.
-    let mut sorted = names.clone();
-    sorted.sort();
-    assert_eq!(names, sorted, "tools entries must be sorted by name");
 
     // schema_version must be present and >= 1 on every entry.
     for entry in tools {

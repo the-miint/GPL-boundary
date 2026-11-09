@@ -125,7 +125,7 @@ Only rules whose trigger appears in the diff can fire.
 | `src/rusage.rs`, the `metrics` object | R2, R11 |
 | `tests/**`, a `#[test]`, `src/test_util.rs`, a fixture | R5 |
 | A numeric literal or tolerance in an assertion; a parity or golden test | R5 |
-| `build.rs`, `Cargo.toml` / `Cargo.lock`, `.gitmodules`, an `ext/*` pointer bump | R6 |
+| `build.rs`, `Cargo.toml` / `Cargo.lock`, `.gitmodules`, an `ext/*` pointer bump, a vendored source (`vendor/**`) | R6 |
 | `.github/workflows/**`, `scripts/**`, `tests/shell/**`, `Makefile`, `install.sh` | R6, R1 |
 | `#[cfg(target_os = …)]`, a `libc::` call, `/proc`, macOS-specific code | R6 |
 | A guard, a `Response::error`, a non-test `unwrap` / `expect` / `panic!`, a substituted default | R1 |
