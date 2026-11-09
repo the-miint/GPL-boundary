@@ -89,7 +89,7 @@ for contributors already set up:
 ```bash
 cargo build          # debug build
 cargo test           # unit + integration tests (uses real POSIX shared memory)
-make check           # fmt + clippy + test
+make check           # fmt + clippy + test + test-scripts
 ```
 
 RocksDB is built from a vendored submodule (`ext/rocksdb`, pinned to

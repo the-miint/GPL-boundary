@@ -830,7 +830,7 @@ crashing, and that the output schema and metadata match expectations.
 ```bash
 cargo test                    # all tests (uses real POSIX shared memory)
 cargo test --lib tools::      # just tool module tests
-make check                    # fmt + clippy + test
+make check                    # fmt + clippy + test + test-scripts
 ```
 
 Tests require POSIX shared memory support (`/dev/shm` on Linux, `shm_open`

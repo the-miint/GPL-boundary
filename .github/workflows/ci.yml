@@ -61,3 +61,13 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt -- --check
+
+  # Linux and macOS: on macOS the shell tests run under bash 3.2 and the BSD tools.
+  scripts:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - run: make test-scripts

@@ -1,4 +1,4 @@
-.PHONY: build test clean fmt clippy check install-hooks
+.PHONY: build test test-scripts clean fmt clippy check install-hooks
 
 build:
 	cargo build
@@ -6,7 +6,13 @@ build:
 test:
 	cargo test
 
-check: fmt clippy test
+check: fmt clippy test test-scripts
+
+# Shell tests. They need git, bash and the POSIX text tools, not the Rust
+# toolchain or the submodules.
+test-scripts:
+	bash tests/shell/check_review_loop.sh
+	bash tests/shell/check_reviewer_files.sh
 
 fmt:
 	cargo fmt -- --check
