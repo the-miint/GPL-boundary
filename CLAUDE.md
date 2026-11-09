@@ -177,9 +177,9 @@ src/
     fasttree.rs      # FastTree FFI bindings + GplTool impl + tests
     prodigal.rs      # Prodigal FFI bindings + GplTool impl + tests
     prodigal_train.rs # prodigal-train: writes a single-genome model (uses prodigal.rs's FFI)
-    bowtie2_ffi.rs   # extern "C" declarations shared by the two bowtie2 tools
-    bowtie2_align.rs # Bowtie2 aligner #[repr(C)] structs + GplTool impl + tests
-    bowtie2_build.rs # Bowtie2 index builder #[repr(C)] structs + GplTool impl + tests
+    bowtie2_ffi.rs   # FFI declarations both bowtie2 tools share
+    bowtie2_align.rs # Bowtie2 aligner FFI bindings + GplTool impl + tests
+    bowtie2_build.rs # Bowtie2 index builder FFI bindings + GplTool impl + tests
 ext/
   fasttree/          # git submodule (GPL-2.0+, C99)
   prodigal/          # git submodule (GPL-3.0, C99)
@@ -756,5 +756,4 @@ GUIDANCE_API_LIBRARY.md for details.
 ## Related projects
 
 - **miint**: `../duckdb-miint` -- C++ DuckDB extension that spawns this binary
-- **fasttree**: `ext/fasttree` -- GPL phylogenetic tree library
-- **prodigal**: `ext/prodigal` -- GPL prokaryotic gene prediction library
+- **The tools**: the submodules under `ext/` (see "Submodules")

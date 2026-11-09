@@ -323,16 +323,10 @@ fn build_bowtie2() {
         .compile("bowtie2_cpp");
 
     // After bowtie2_cpp, which references them: zlib (dynamic; every supported
-    // platform ships one), the C++ runtime for the final link of the Rust
-    // binary, and pthreads on Linux.
+    // platform ships one) and pthreads on Linux. cc's compile() already emits
+    // the C++ runtime link for a cpp(true) build.
     println!("cargo:rustc-link-lib=z");
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os == "macos" {
-        println!("cargo:rustc-link-lib=c++");
-    } else {
-        println!("cargo:rustc-link-lib=stdc++");
-    }
-    if target_os == "linux" {
+    if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "linux" {
         println!("cargo:rustc-link-lib=pthread");
     }
 

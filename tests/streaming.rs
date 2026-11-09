@@ -180,7 +180,7 @@ fn test_init_reply_carries_tool_registry() {
         .as_array()
         .expect("init reply must carry a tools array");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    // Exactly the supported tools, in name order (miint relies on the order).
+    // Exactly the supported tools, in name order (so the reply is deterministic).
     assert_eq!(
         names,
         [
