@@ -4,7 +4,6 @@ pub mod bowtie2_ffi;
 pub mod fasttree;
 pub mod prodigal;
 pub mod prodigal_train;
-pub mod sortmerna;
 
 use crate::protocol::{BatchRequest, Response};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -388,48 +387,22 @@ pub fn version_info() -> serde_json::Value {
 mod tests {
     use super::*;
 
+    /// The registry is a contract: the init reply advertises it and miint
+    /// detects capabilities from it, so a tool added or dropped by accident
+    /// fails here.
     #[test]
-    fn test_bowtie2_align_in_registry() {
-        let names = list_tools();
-        assert!(
-            names.contains(&"bowtie2-align".to_string()),
-            "bowtie2-align not found in registry: {names:?}"
-        );
-    }
-
-    #[test]
-    fn test_bowtie2_build_in_registry() {
-        let names = list_tools();
-        assert!(
-            names.contains(&"bowtie2-build".to_string()),
-            "bowtie2-build not found in registry: {names:?}"
-        );
-    }
-
-    #[test]
-    fn test_fasttree_in_registry() {
-        let names = list_tools();
-        assert!(
-            names.contains(&"fasttree".to_string()),
-            "fasttree not found in registry: {names:?}"
-        );
-    }
-
-    #[test]
-    fn test_prodigal_in_registry() {
-        let names = list_tools();
-        assert!(
-            names.contains(&"prodigal".to_string()),
-            "prodigal not found in registry: {names:?}"
-        );
-    }
-
-    #[test]
-    fn test_sortmerna_in_registry() {
-        let names = list_tools();
-        assert!(
-            names.contains(&"sortmerna".to_string()),
-            "sortmerna not found in registry: {names:?}"
+    fn test_registry_is_exactly_the_supported_tools() {
+        let mut names = list_tools();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "bowtie2-align",
+                "bowtie2-build",
+                "fasttree",
+                "prodigal",
+                "prodigal-train"
+            ]
         );
     }
 
@@ -496,7 +469,6 @@ mod tests {
             ("fasttree", 4),
             ("prodigal", 5),
             ("prodigal-train", 2),
-            ("sortmerna", 2),
             ("bowtie2-align", 6),
             ("bowtie2-build", 2),
         ];

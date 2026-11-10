@@ -43,14 +43,15 @@ Homebrew install is needed at runtime.
 
 For platforms outside the prebuilt matrix — **Intel Macs**, **Linux
 arm64**, older glibc, and any other configuration — build from source.
-The build is self-contained: no system RocksDB, no `pkg-config` magic.
+The build needs a C/C++ compiler, zlib and, on macOS, libomp; no CMake or
+`pkg-config`.
 
 ```bash
 # 1. Install build prerequisites
 #    Debian/Ubuntu:
-sudo apt-get install -y build-essential cmake libz-dev curl
+sudo apt-get install -y build-essential libz-dev curl
 #    macOS (any arch):
-brew install cmake libomp     # Xcode command-line tools provide the rest
+brew install libomp           # Xcode command-line tools provide the rest
 
 # 2. Install the Rust toolchain (skip if you already have it)
 curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y
@@ -65,10 +66,7 @@ cargo build --release
 install -m 755 target/release/gpl-boundary ~/.local/bin/
 ```
 
-The first build takes ~5 minutes (RocksDB compile is the bottleneck;
-subsequent builds are cached by the `cmake` crate). The submodule clone
-is heavy — RocksDB alone is several hundred MB. If you want to verify
-the build, run `cargo test` or `make check`.
+If you want to verify the build, run `cargo test` or `make check`.
 
 ## Supported tools
 
@@ -77,7 +75,6 @@ the build, run `cargo test` or `make check`.
 | [FastTree](https://github.com/the-miint/fasttree) | GPL-2.0+ | Approximately-maximum-likelihood phylogenetic trees | no |
 | [Prodigal](https://github.com/the-miint/prodigal) | GPL-3.0 | Prokaryotic gene prediction: genes with their proteins, and per-contig model data; metagenomic or single-genome mode | yes |
 | [Prodigal (train)](https://github.com/the-miint/prodigal) | GPL-3.0 | Train a single-genome model on a whole genome and write it (the CLI's `-t` format) for `prodigal` | no |
-| [SortMeRNA](https://github.com/the-miint/sortmerna) | LGPL-3.0 | rRNA filtering and sequence alignment | yes |
 | [Bowtie2 (align)](https://github.com/the-miint/bowtie2) | GPL-3.0 | Short read aligner; requires `.bt2` index (built in process or via `bowtie2-build`) | yes |
 | [Bowtie2 (build)](https://github.com/the-miint/bowtie2) | GPL-3.0 | Build a `.bt2` index from in-memory FASTA-style sequences | no |
 
@@ -91,11 +88,6 @@ cargo build          # debug build
 cargo test           # unit + integration tests (uses real POSIX shared memory)
 make check           # fmt + clippy + test + test-scripts
 ```
-
-RocksDB is built from a vendored submodule (`ext/rocksdb`, pinned to
-v8.11.5) and linked statically into the binary. The first build adds
-~3–5 minutes for the RocksDB compile; subsequent builds are cached by
-the `cmake` crate.
 
 ## Introspection
 
@@ -112,7 +104,6 @@ gpl-boundary --list-tools
 gpl-boundary --describe fasttree
 gpl-boundary --describe prodigal
 gpl-boundary --describe prodigal-train
-gpl-boundary --describe sortmerna
 gpl-boundary --describe bowtie2-align
 gpl-boundary --describe bowtie2-build
 ```
@@ -156,8 +147,8 @@ schema changes. Both let consumers detect drift without parsing the data.
 
 The dispatcher routes batches by `(tool, canonical_config)` fingerprint:
 distinct fingerprints get distinct workers and run in parallel. Tools
-with expensive setup (bowtie2 index loading, sortmerna reference
-indexing, prodigal's metagenomic bins or single-genome model) reuse a
+with expensive setup (bowtie2 index loading, prodigal's metagenomic bins
+or single-genome model) reuse a
 long-lived context across batches in the session.
 
 ### Worker routing and eviction

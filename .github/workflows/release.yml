@@ -42,11 +42,11 @@ jobs:
 
       - name: Install build dependencies (Ubuntu)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake libz-dev
+        run: sudo apt-get update && sudo apt-get install -y libz-dev
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install cmake libomp
+        run: brew install libomp
 
       - uses: dtolnay/rust-toolchain@stable
         with:

@@ -22,8 +22,8 @@ spawns it as a long-lived daemon (one per DuckDB instance).
 - **WASM is a future goal**, not currently targeted
 
 **Batched streaming**: Tools with expensive context creation (bowtie2: index
-loading, sortmerna: reference indexing, prodigal: metagenomic bins or a
-single-genome model) support batched streaming. The `StreamingContext`
+loading, prodigal: metagenomic bins or a single-genome model) support batched
+streaming. The `StreamingContext`
 trait provides `run_batch()` for per-batch work against a pre-loaded
 context. Single-genome prodigal needs a model route (`training_path` or
 `train_on_batch`: see "Prodigal config knobs").
@@ -105,20 +105,6 @@ GPL-licensed tools live as git submodules under `ext/`. Currently:
   branch `v2.3.0-miint`)
 - `ext/prodigal` -- Prodigal prokaryotic gene prediction (GPL-3.0, C99,
   branch `v2.6.4-miint`)
-- `ext/sortmerna` -- SortMeRNA rRNA filtering and sequence alignment
-  (LGPL-3.0, C++17, branch `v4.4.0-miint`). Requires system zlib only;
-  RocksDB comes from the vendored `ext/rocksdb` submodule (built static
-  via CMake, linked into the binary). Build uses two `cc::Build`
-  instances (C and C++17) for SortMeRNA itself.
-- `ext/rocksdb` -- RocksDB key-value store (Apache-2.0/GPL-2.0 dual,
-  pinned to v8.11.5). Vendored to make `cargo build` self-contained and
-  enable single-binary release distribution. We deviate from SortMeRNA's
-  own pin (v7.10.2) because that release predates GCC 13's stricter
-  transitive-include rules; SortMeRNA only consumes the most stable
-  RocksDB headers (`db.h`, `options.h`, `slice.h`, `version.h`) so the
-  bump is API-safe. Built via the `cmake` crate with the same flags as
-  SortMeRNA's `cmake/presets/CMakePresets_rocksdb.json`, plus
-  `PORTABLE=1` to avoid `-march=native`.
 - `ext/bowtie2` -- Bowtie2 short read aligner (GPL-3.0, C++11, branch
   `v2.5.5-miint`). Requires zlib. Uses global mutable state behind a mutex
   (only one alignment per process at a time; acceptable for single-invocation
@@ -167,13 +153,12 @@ make check           # fmt + clippy + test + test-scripts
 make test-scripts    # shell tests for the review tooling (no Rust toolchain needed)
 ```
 
-The `build.rs` compiles C/C++ sources from submodules using the `cc` crate
-and drives a CMake build of vendored RocksDB via the `cmake` crate. The
-only system C/C++ dependencies are CMake itself (build-time tool) and
-zlib: `sudo apt-get install cmake libz-dev` on Debian/Ubuntu,
-`brew install cmake libomp` on macOS (zlib ships in the SDK). The first
-build adds a few minutes for the RocksDB compile; subsequent builds are
-cached by the `cmake` crate.
+The `build.rs` compiles C/C++ sources from submodules using the `cc` crate;
+no CMake is involved, and CI fails the build if `Cargo.lock` has the cmake
+crate or anything runs `cmake`. The system dependencies are zlib
+(`sudo apt-get install libz-dev` on Debian/Ubuntu; on macOS it ships in the
+SDK) and, on macOS, Homebrew's libomp for FastTree's OpenMP
+(`brew install libomp`; see "FastTree threads").
 
 ## Code organization
 
@@ -182,6 +167,9 @@ src/
   main.rs            # Entry point: CLI flags, stdin JSON dispatch, shm deregister
   arrow_ipc.rs       # Shared Arrow IPC helpers (write_batch_to_output_shm, read_batches_from_shm)
   protocol.rs        # Request/Response/ShmOutput JSON types (serde)
+  registry.rs        # Per-fingerprint worker registry: routing, eviction, budget
+  workers.rs         # Worker implementations: in-process slots and subprocess workers
+  rusage.rs          # Per-batch worker telemetry (the opt-in metrics object)
   shm.rs             # POSIX shared memory, cleanup registry, signal handlers
   test_util.rs       # Shared test helpers (cfg(test) only)
   tools/
@@ -189,18 +177,19 @@ src/
     fasttree.rs      # FastTree FFI bindings + GplTool impl + tests
     prodigal.rs      # Prodigal FFI bindings + GplTool impl + tests
     prodigal_train.rs # prodigal-train: writes a single-genome model (uses prodigal.rs's FFI)
-    sortmerna.rs     # SortMeRNA FFI bindings + GplTool impl + tests
+    bowtie2_ffi.rs   # FFI declarations both bowtie2 tools share
     bowtie2_align.rs # Bowtie2 aligner FFI bindings + GplTool impl + tests
     bowtie2_build.rs # Bowtie2 index builder FFI bindings + GplTool impl + tests
 ext/
   fasttree/          # git submodule (GPL-2.0+, C99)
   prodigal/          # git submodule (GPL-3.0, C99)
-  sortmerna/         # git submodule (LGPL-3.0, C++17)
   bowtie2/           # git submodule (GPL-3.0, C++11)
 tests/
   build_sanity.rs    # Integration tests: binary links and runs correctly
   bowtie2_build.rs   # Integration tests: bowtie2 index builder + round-trip with align
   streaming.rs       # Integration tests: NDJSON streaming protocol
+  subprocess.rs      # Integration tests: subprocess-worker dispatch (bowtie2-align)
+  metrics.rs         # Integration tests: the opt-in metrics object
   shell/             # Shell tests for the review tooling (make test-scripts)
 scripts/             # Developer and CI scripts
 .claude/
@@ -243,7 +232,7 @@ distinct bump policies and are NOT substitutes for each other:
   protocol checks this.
 
 Current landmark values (see `src/tools/mod.rs::tests::test_describe_version_landmarks`):
-fasttree=4, bowtie2-align=6, prodigal=5, sortmerna/bowtie2-build/prodigal-train=2.
+fasttree=4, bowtie2-align=6, prodigal=5, bowtie2-build/prodigal-train=2.
 fasttree's history is documented in a CHANGELOG block above its
 `describe()` method. When you intentionally edit a `--describe`
 surface, bump the version in that tool's `describe()` AND update
@@ -372,8 +361,7 @@ advertisement:
    {"name": "bowtie2-build",  "schema_version": 1},
    {"name": "fasttree",       "schema_version": 2},
    {"name": "prodigal",       "schema_version": 2},
-   {"name": "prodigal-train", "schema_version": 1},
-   {"name": "sortmerna",      "schema_version": 2}
+   {"name": "prodigal-train", "schema_version": 1}
  ]}
 ```
 - `protocol_version` is incremented on any breaking change to the wire
@@ -417,9 +405,9 @@ advertisement:
  "shm_outputs": [{"name": "/gb-1234-0-tree", "label": "tree", "size": 8192}],
  "result": {"n_nodes": 7, "n_leaves": 4, "root": 6}}
 ```
-- `schema_version` — per-tool (FastTree=2, Prodigal=2, SortMeRNA=2,
-  Bowtie2=2, Bowtie2-build=1, Prodigal-train=1 as of writing); bumped on
-  breaking output-schema changes.
+- `schema_version` — per-tool (FastTree=2, Prodigal=2, Bowtie2=2,
+  Bowtie2-build=1, Prodigal-train=1 as of writing); bumped on breaking
+  output-schema changes.
 - `shm_outputs` — omitted when empty. Labels match `[a-z0-9-]+`.
 - `result` — lightweight metadata; bulk data always travels in
   `shm_outputs`.
@@ -622,33 +610,6 @@ to `prodigal`), `model` (as Prodigal's result), `closed_ends` and
 `mask_regions` as trained (pass `prodigal` the same), `n_sequences`,
 `n_bases`, `elapsed_ms`.
 
-**SortMeRNA input** (written by miint to shm_input):
-- `read_id: Utf8` -- sequence identifier
-- `sequence: Utf8` -- forward read nucleotide sequence
-- `sequence2: Utf8` (nullable) -- reverse read for paired-end; absence = single-end
-
-**SortMeRNA output** (written by gpl-boundary to shm_outputs, label "alignments"; schema_version=2):
-- `read_id: Utf8` -- read identifier (from input)
-- `aligned: Int32` -- 1 if aligned, 0 otherwise
-- `strand: Int32` (nullable) -- 1=forward, 0=reverse-complement; NULL if unaligned
-- `ref_name: Utf8` (nullable) -- reference sequence ID; NULL if unaligned
-- `ref_start: Int32` (nullable) -- 1-based start on reference; NULL if unaligned
-- `ref_end: Int32` (nullable) -- 1-based end on reference; NULL if unaligned
-- `cigar: Utf8` (nullable) -- CIGAR string; NULL if unaligned
-- `score: Int32` (nullable) -- Smith-Waterman alignment score; NULL if unaligned
-- `e_value: Float64` -- E-value of best alignment (0.0 when unaligned)
-- `identity: Float64` -- percent identity (0-100; 0.0 when unaligned)
-- `coverage: Float64` -- query coverage (0-100; 0.0 when unaligned)
-- `edit_distance: Int32` (nullable) -- edit distance (mismatches + gaps); NULL if unaligned
-
-Schema v2 (Phase 5) replaced the prior `-1` / `0` sentinels in the
-alignment-only columns with NULL keyed off `aligned == 0`.
-
-SortMeRNA requires `ref_paths` (reference FASTA file paths) in the config
-JSON. Reference indexing is handled internally. Paired-end mode is inferred
-from the presence of the `sequence2` column — sequences are interleaved as
-`[fwd0, rev0, fwd1, rev1, ...]` for the C API.
-
 **Bowtie2-align input** (written by miint to shm_input):
 - `read_id: Utf8` -- read identifier
 - `sequence1: Utf8` -- mate 1 (or unpaired) DNA sequence
@@ -795,6 +756,4 @@ GUIDANCE_API_LIBRARY.md for details.
 ## Related projects
 
 - **miint**: `../duckdb-miint` -- C++ DuckDB extension that spawns this binary
-- **fasttree**: `ext/fasttree` -- GPL phylogenetic tree library
-- **prodigal**: `ext/prodigal` -- GPL prokaryotic gene prediction library
-- **sortmerna**: `ext/sortmerna` -- LGPL rRNA filtering and alignment library
+- **The tools**: the submodules under `ext/` (see "Submodules")

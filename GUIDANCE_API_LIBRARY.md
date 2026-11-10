@@ -453,13 +453,13 @@ extern "C" {
 #endif /* TOOL_H */
 ```
 
-This is required for tools whose own implementation is C++ (SortMeRNA,
-Bowtie2) and is good practice even for C-only tools, since the
+This is required for tools whose own implementation is C++ (Bowtie2,
+for example) and is good practice even for C-only tools, since the
 gpl-boundary build mixes C and C++ translation units.
 
 ### C++ namespaces (for C++ implementations)
 
-If your tool's implementation is C++ (SortMeRNA, Bowtie2), wrap the
+If your tool's implementation is C++ (as Bowtie2's is), wrap the
 internal code in a tool-specific namespace:
 
 ```cpp

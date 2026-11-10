@@ -10,7 +10,7 @@
 //! - `bowtie2-align` → `SubprocessWorker` (sidesteps bowtie2's process-wide
 //!   alignment mutex; distinct fingerprints align in parallel because they
 //!   live in distinct child processes).
-//! - everything else → `InProcessSlot` (FastTree/Prodigal/SortMeRNA).
+//! - everything else → `InProcessSlot`.
 //!
 //! ## Eviction (step 4)
 //!
@@ -204,7 +204,7 @@ impl Registry {
         }
 
         // Budget OK — build the worker. Construction happens *outside*
-        // the workers mutex so a slow init (SortMeRNA reference indexing,
+        // the workers mutex so a slow init (a streaming context's setup, a
         // bowtie2 child spawn) doesn't block other dispatches.
         let new_worker = match self.build_worker(&batch.tool, &batch.config) {
             Ok(w) => w,

@@ -23,18 +23,31 @@ jobs:
 
       - name: Install system dependencies (Ubuntu)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake libz-dev
+        run: sudo apt-get update && sudo apt-get install -y libz-dev
 
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install cmake libomp
+        run: brew install libomp
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build
-        run: cargo build --verbose
+      # The build needs no CMake. No crate may depend on the cmake crate, which
+      # the lock file shows whatever the cache restores. And since the runner
+      # images ship a cmake, a cmake that fails is put first on PATH, so a
+      # build script that runs one fails the build.
+      - name: Build (fails if anything needs cmake)
+        run: |
+          if grep -qx 'name = "cmake"' Cargo.lock; then
+            echo "Cargo.lock has the cmake crate; the build must not need CMake" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/no-cmake"
+          printf '#!/bin/sh\necho "cmake was run; the build must not need it" >&2\nexit 1\n' \
+            > "$RUNNER_TEMP/no-cmake/cmake"
+          chmod +x "$RUNNER_TEMP/no-cmake/cmake"
+          PATH="$RUNNER_TEMP/no-cmake:$PATH" cargo build --verbose
 
       - name: Run tests
         run: cargo test --verbose
@@ -46,7 +59,7 @@ jobs:
         with:
           submodules: recursive
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake libz-dev
+        run: sudo apt-get update && sudo apt-get install -y libz-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
