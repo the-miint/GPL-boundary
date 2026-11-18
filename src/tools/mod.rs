@@ -259,12 +259,14 @@ pub trait ShmTool {
 
 /// What a tool returns for one batch.
 ///
-/// `outputs` are the batch's output tables, each under its label, in the
-/// order the response lists them: the labels and order of the tool's
-/// `ToolDescription::outputs`. `result` is the response's `result` JSON.
+/// `outputs` are the batch's output tables, each one record batch under
+/// its label, in the order the response lists them. They are the labels
+/// and order of the tool's `ToolDescription::outputs`, which the tool's
+/// tests check; at run time only a label's syntax is checked, when its
+/// segment is named. `result` is the response's `result` JSON.
 ///
-/// Each output batch owns its memory. A batch must not view memory the C
-/// library frees, since the front end writes it out after the call has
+/// Each output record batch owns its memory. One must not view memory the
+/// C library frees, since the front end writes it out after the call has
 /// returned and the tool has released its C state.
 #[cfg_attr(not(test), allow(dead_code))]
 pub struct ToolOutput {
@@ -277,10 +279,9 @@ pub struct ToolOutput {
 /// fingerprint's worker, which calls `run_batch` once per batch, one at a
 /// time. The `Drop` impl must call the C library's `destroy()`.
 ///
-/// `Send` because the worker that keeps it may be dropped on another
-/// thread (the sweeper evicts idle workers), so any C library a context
-/// holds must be safe to free from a thread other than the one that made
-/// it.
+/// `Send` because a context is made on one thread, then used and dropped
+/// on its worker's own thread, so the C state it holds must not be tied
+/// to the thread that made it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub trait StreamingContext: Send {
     /// Run one batch against the context. Input, output and errors are
@@ -292,6 +293,9 @@ pub trait StreamingContext: Send {
 /// A GPL tool, free of any transport: it takes decoded record batches and
 /// returns record batches. A front end moves them between the tool and
 /// the caller; natively that is `crate::frontend`, over shared memory.
+///
+/// `Send` so that a worker can make the tool on one thread and run it on
+/// its own.
 #[cfg_attr(not(test), allow(dead_code))]
 pub trait GplTool: Send {
     fn name(&self) -> &str;
@@ -304,11 +308,13 @@ pub trait GplTool: Send {
     /// Run the tool on one batch.
     ///
     /// `input` is every record batch of the request's Arrow stream, in
-    /// order; there may be none. Natively the batches are read-only views
-    /// of the caller's input mapping, so a tool must not keep them, or any
-    /// array sliced from them, past the call. It takes them by value so
-    /// that a tool which copies its input can drop them before the C
-    /// library runs.
+    /// order; there may be none. Natively the record batches are read-only
+    /// views of the caller's input segment. A tool must not keep them, or
+    /// any array sliced from them, past the call: one kept keeps the whole
+    /// input mapped, and a pointer the C library holds into them dangles
+    /// once they drop. The tool takes them by value so that one which
+    /// copies its input can drop them, and the mapping with them, before
+    /// the C library runs.
     ///
     /// An `Err` becomes the error response, its message the response's
     /// `error`, and no output is written. On `Ok` the front end writes
@@ -332,7 +338,7 @@ pub trait GplTool: Send {
 }
 
 /// A `GplTool` served through `ShmTool`, by way of the native front end,
-/// for the dispatch that still takes `ShmTool`s.
+/// for the dispatch, which takes `ShmTool`s.
 #[cfg_attr(not(test), allow(dead_code))]
 pub struct OnShm<T>(pub T);
 

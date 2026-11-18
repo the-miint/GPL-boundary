@@ -192,6 +192,13 @@ pub fn cleanup_all() {
     }
 }
 
+/// Test-only: held by every test that asserts its own name is registered,
+/// and by the test that fills the registry (which then drops names
+/// silently), so neither runs while the other does. The long-name test
+/// takes no slot and skips it.
+#[cfg(test)]
+pub(crate) static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Test-only: report whether `name` is currently in the registry.
 /// Walks the slot pool without locking.
 #[cfg(test)]
@@ -319,8 +326,8 @@ impl SharedMemory {
     ///
     /// The production read path uses `ReadOnlyShm::open(name, size)`
     /// — it takes the data length out-of-band (the protocol is the
-    /// authoritative size source) and integrates with
-    /// `arrow_ipc::read_batches_from_shm`'s zero-copy `Buffer`. This
+    /// authoritative size source) and `arrow_ipc::map_shm` wraps it as a
+    /// zero-copy `Buffer`. This
     /// entry point uses `fstat` to size its mapping, which is
     /// unreliable on Darwin POSIX shm; it remains only for the
     /// existence-probe pattern in tests (`open_readonly(name).is_ok()`
@@ -512,9 +519,8 @@ fn to_cstring(name: &str) -> io::Result<CString> {
 /// An immutable mmap of a POSIX shm segment, opened with `O_RDONLY` and
 /// mapped `PROT_READ`. Write attempts would be SIGBUS at the OS level, so
 /// the mapping is genuinely shareable across threads — `Send + Sync` is
-/// sound by construction. Used by `arrow_ipc::read_batches_from_shm` and
-/// `read_batches_from_shm` to wrap a segment as a zero-copy
-/// `arrow_buffer::Buffer`.
+/// sound by construction. Used by `arrow_ipc::map_shm` to wrap a segment
+/// as a zero-copy `arrow_buffer::Buffer`.
 ///
 /// The struct does NOT unlink on drop; it only munmaps. The shm name is
 /// owned by the caller (typically miint).
@@ -711,13 +717,6 @@ mod tests {
         assert!(output_shm_name("tree alignments").is_err());
         assert!(output_shm_name("").is_err());
     }
-
-    /// Serializes tests that compete for slots in the global pool: any test
-    /// that asserts on its own slot landing must run while no other slot-
-    /// pressure test is filling the pool. The basic and overflow tests
-    /// share this lock; the long-name test doesn't consume slots and skips
-    /// it.
-    static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn test_cleanup_registry() {

@@ -140,17 +140,8 @@ pub fn prediction_of(response: Response) -> Result<Prediction, String> {
     if !response.success {
         return Err(response.error.unwrap());
     }
-    let read = |out: &crate::protocol::ShmOutput| {
-        let mut batches = read_arrow_from_shm(&out.name, out.size);
-        let _ = SharedMemory::unlink(&out.name);
-        batches.remove(0)
-    };
-    let outputs: Vec<RecordBatch> = response.shm_outputs.iter().map(read).collect();
-    let labels: Vec<&str> = response
-        .shm_outputs
-        .iter()
-        .map(|o| o.label.as_str())
-        .collect();
+    let (labels, outputs): (Vec<String>, Vec<RecordBatch>) =
+        take_outputs(&response).into_iter().unzip();
     assert_eq!(labels, ["genes", "contigs"]);
     let [genes, contigs] = <[RecordBatch; 2]>::try_from(outputs).unwrap();
     let result = response.result.unwrap();
@@ -159,6 +150,21 @@ pub fn prediction_of(response: Response) -> Result<Prediction, String> {
         genes,
         contigs,
     })
+}
+
+/// Every output of a response, in order, as (label, its one record
+/// batch); each segment is read, then unlinked.
+pub fn take_outputs(response: &Response) -> Vec<(String, RecordBatch)> {
+    response
+        .shm_outputs
+        .iter()
+        .map(|out| {
+            let mut batches = read_arrow_from_shm(&out.name, out.size);
+            let _ = SharedMemory::unlink(&out.name);
+            assert_eq!(batches.len(), 1, "{}", out.name);
+            (out.label.clone(), batches.remove(0))
+        })
+        .collect()
 }
 
 /// A column of an output batch, by name.

@@ -59,7 +59,7 @@ mod tests {
     use crate::arrow_ipc::map_shm;
     use crate::shm::{self, SharedMemory};
     use crate::test_util::{
-        read_arrow_from_shm, unique_shm_name, write_arrow_to_shm, write_batches_to_shm,
+        column, take_outputs, unique_shm_name, write_arrow_to_shm, write_batches_to_shm,
     };
     use crate::tools::{GplTool, OnShm, ShmTool, StreamingContext, ToolDescription, ToolOutput};
     use arrow::array::{Array, ArrayData, Int64Array, ListArray, StringArray};
@@ -73,27 +73,8 @@ mod tests {
     }
 
     fn names_of(batch: &RecordBatch) -> Vec<Option<String>> {
-        let col = batch
-            .column_by_name("name")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let col: &StringArray = column(batch, "name");
         col.iter().map(|v| v.map(str::to_string)).collect()
-    }
-
-    /// Every output of a response, read, then unlinked: (label, batch).
-    fn take_outputs(response: &Response) -> Vec<(String, RecordBatch)> {
-        response
-            .shm_outputs
-            .iter()
-            .map(|out| {
-                let mut batches = read_arrow_from_shm(&out.name, out.size);
-                let _ = SharedMemory::unlink(&out.name);
-                assert_eq!(batches.len(), 1, "{}", out.name);
-                (out.label.clone(), batches.remove(0))
-            })
-            .collect()
     }
 
     /// The number the next output segment name takes, less one: the
@@ -107,6 +88,7 @@ mod tests {
 
     #[test]
     fn test_outputs_are_written_in_order_under_their_labels() {
+        let _registry = shm::REGISTRY_TEST_LOCK.lock().unwrap();
         let name = unique_shm_name("fe-order");
         let holder = write_arrow_to_shm(&name, &names_batch(&[Some("a")]));
         let first = names_batch(&[Some("x"), Some("y")]);
@@ -150,7 +132,9 @@ mod tests {
         assert!(!response.success);
         assert!(response.error.as_deref().unwrap().contains("label"));
         assert!(response.shm_outputs.is_empty());
-        assert!(after > before + 1, "no output was written");
+        // The window holds the number the kept write drew, and any that
+        // other test threads drew meanwhile, whose labels differ.
+        assert!(after > before + 1, "no name was drawn");
         let pid = std::process::id();
         let left: Vec<String> = (before + 1..after)
             .map(|n| format!("/gb-{pid}-{n}-fe-kept"))
@@ -198,6 +182,81 @@ mod tests {
         assert!(!response.success);
         let error = response.error.unwrap();
         assert!(error.contains("Arrow IPC"), "{error}");
+    }
+
+    #[test]
+    fn test_an_empty_input_reaches_the_tool_as_no_batches() {
+        // A zero-byte segment (SharedMemory::create cannot map none)
+        let name = unique_shm_name("fe-empty");
+        let c_name = std::ffi::CString::new(name.as_str()).unwrap();
+        // SAFETY: plain libc calls on a name this test owns.
+        let fd = unsafe {
+            libc::shm_open(
+                c_name.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
+                0o600,
+            )
+        };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        unsafe { libc::close(fd) };
+        let mut seen = None;
+        let response = run_on_shm(&name, 0, |input| {
+            seen = Some(input.len());
+            Ok(ToolOutput {
+                outputs: vec![],
+                result: json!({}),
+            })
+        });
+        let _ = SharedMemory::unlink(&name);
+        assert!(response.success, "{:?}", response.error);
+        assert_eq!(seen, Some(0));
+
+        // A stream with a schema and no batches
+        let schema = names_batch(&[]).schema();
+        let mut stream = Vec::new();
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut stream, &schema).unwrap();
+        writer.finish().unwrap();
+        drop(writer);
+        let name = unique_shm_name("fe-schema-only");
+        let mut holder = SharedMemory::create(&name, stream.len()).unwrap();
+        holder.as_mut_slice().copy_from_slice(&stream);
+        let mut seen = None;
+        let response = run_on_shm(&name, holder.len(), |input| {
+            seen = Some(input.len());
+            Ok(ToolOutput {
+                outputs: vec![],
+                result: json!({}),
+            })
+        });
+        assert!(response.success, "{:?}", response.error);
+        assert_eq!(seen, Some(0));
+    }
+
+    /// The tool reads the segment itself: a write to the segment, made
+    /// through the writer's own mapping during the call, shows in the
+    /// tool's input. A copy anywhere between the segment and the tool
+    /// would not see it.
+    #[test]
+    fn test_the_tool_reads_the_input_segment_in_place() {
+        let name = unique_shm_name("fe-in-place");
+        let mut holder = write_arrow_to_shm(&name, &names_batch(&[Some("mark-a")]));
+        let size = holder.len();
+        let at = holder
+            .as_slice()
+            .windows(6)
+            .position(|w| w == b"mark-a")
+            .unwrap();
+        let mut seen = Vec::new();
+        let response = run_on_shm(&name, size, |input| {
+            holder.as_mut_slice()[at..at + 6].copy_from_slice(b"mark-b");
+            seen = names_of(&input[0]);
+            Ok(ToolOutput {
+                outputs: vec![],
+                result: json!({}),
+            })
+        });
+        assert!(response.success, "{:?}", response.error);
+        assert_eq!(seen, [Some("mark-b".to_string())]);
     }
 
     /// The (address, length) of every non-empty buffer an array holds:
@@ -303,8 +362,7 @@ mod tests {
     }
 
     fn count_of(batch: &RecordBatch) -> i64 {
-        let col = batch.column(0).as_any().downcast_ref::<Int64Array>();
-        col.unwrap().value(0)
+        column::<Int64Array>(batch, "rows").value(0)
     }
 
     impl GplTool for RowCounter {
@@ -390,6 +448,10 @@ mod tests {
         let first = take_outputs(&first);
         assert_eq!(first[0].0, "fe-rows");
         assert_eq!(count_of(&first[0].1), 3);
+
+        // A batch that fails leaves the context as it was
+        let failed = ctx.run_batch("/gb-fe-no-such-input", 0);
+        assert!(!failed.success);
 
         let second = ctx.run_batch(&one, one_holder.len());
         assert!(second.success, "{:?}", second.error);

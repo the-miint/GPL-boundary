@@ -31,14 +31,15 @@
 //! over-allocated to a sparse-mmap reservation, so neither input nor
 //! output segments can rely on `fstat` for cross-platform correctness.
 //!
-//! The function opens a `ReadOnlyShm` (a Sync-by-construction wrapper
-//! around an `O_RDONLY` + `PROT_READ` mmap) and wraps it as an
+//! `map_shm` opens a `ReadOnlyShm` (a Sync-by-construction wrapper around
+//! an `O_RDONLY` + `PROT_READ` mmap) and wraps it as an
 //! `arrow::buffer::Buffer` whose Arc-counted owner is the mmap itself.
-//! `StreamDecoder::with_require_alignment(true)` enforces that buffer
-//! bodies are aligned in place — forcing the decoder to error out
-//! rather than silently fall back to allocate + memcpy on misalignment.
-//! The mmap stays alive until the last batch (and any column it carries)
-//! is dropped, even after `shm_unlink`.
+//! `decode_stream` decodes with `StreamDecoder::with_require_alignment(true)`,
+//! which enforces that buffer bodies are aligned in place — forcing the
+//! decoder to error out rather than silently fall back to allocate +
+//! memcpy on misalignment — and it refuses a stream without its EOS
+//! marker. The mmap stays alive until the last batch (and any column it
+//! carries) is dropped, even after `shm_unlink`.
 
 use std::ffi::CString;
 use std::io::{self, Write};
@@ -355,7 +356,8 @@ pub fn read_batches_from_shm(shm_name: &str, size: usize) -> Result<Vec<RecordBa
 /// Map the first `size` bytes of a segment read-only, as a `Buffer` that
 /// owns the mapping: the mapping lasts as long as the buffer or anything
 /// sliced from it. See `read_batches_from_shm` for why `size` comes from
-/// the caller.
+/// the caller. A `size` of 0 maps nothing and gives an empty buffer; it is
+/// an error against a segment that is not empty (`ReadOnlyShm::open`).
 pub fn map_shm(shm_name: &str, size: usize) -> Result<Buffer, String> {
     let shm = ReadOnlyShm::open(shm_name, size)
         .map_err(|e| format!("Failed to open shm '{shm_name}': {e}"))?;
@@ -379,8 +381,9 @@ pub fn map_shm(shm_name: &str, size: usize) -> Result<Buffer, String> {
 
 /// Decode an Arrow IPC stream into its batches, in order, without copying:
 /// every array buffer is a slice of `stream`. An empty `stream` holds no
-/// batches. A body that is not aligned for its type is an error rather
-/// than a copy (see `read_batches_from_shm`).
+/// batches; any other must end with the EOS marker. A body that is not
+/// aligned for its type is an error rather than a copy (see
+/// `read_batches_from_shm`).
 pub fn decode_stream(mut stream: Buffer) -> Result<Vec<RecordBatch>, String> {
     if stream.is_empty() {
         return Ok(Vec::new());
@@ -396,9 +399,14 @@ pub fn decode_stream(mut stream: Buffer) -> Result<Vec<RecordBatch>, String> {
             None => break,
         }
     }
-    decoder
-        .finish()
-        .map_err(|e| format!("Arrow IPC stream ended without EOS marker: {e}"))?;
+    const NO_EOS: &str = "Arrow IPC stream ended without EOS marker";
+    decoder.finish().map_err(|e| format!("{NO_EOS}: {e}"))?;
+    // `finish` also passes a stream that stops between two messages, so a
+    // stream cut short at a batch boundary would lose its later batches.
+    // Only a decoder past the EOS marker refuses a further byte.
+    if decoder.decode(&mut Buffer::from_vec(vec![0u8])).is_ok() {
+        return Err(NO_EOS.to_string());
+    }
     Ok(out)
 }
 
@@ -455,6 +463,7 @@ mod tests {
     /// A failed write unlinks the outputs written before it.
     #[test]
     fn test_shm_outputs_are_all_or_none() {
+        let _registry = crate::shm::REGISTRY_TEST_LOCK.lock().unwrap();
         let batch = make_large_batch(3, 4);
         let mut outputs = ShmOutputs::default();
         outputs.write(&batch, "first").unwrap();
@@ -473,6 +482,49 @@ mod tests {
         let kept = outputs.into_vec();
         assert!(SharedMemory::open_readonly(&kept[0].name).is_ok());
         let _ = SharedMemory::unlink(&kept[0].name);
+    }
+
+    /// The bytes of an Arrow stream of `batches`, and how many of them
+    /// precede the last batch.
+    fn stream_bytes(batches: &[RecordBatch]) -> (Vec<u8>, usize) {
+        let mut writer = StreamWriter::try_new(Vec::new(), &batches[0].schema()).unwrap();
+        let mut before_last = 0;
+        for batch in batches {
+            before_last = writer.get_ref().len();
+            writer.write(batch).unwrap();
+        }
+        writer.finish().unwrap();
+        (writer.into_inner().unwrap(), before_last)
+    }
+
+    /// A stream cut short at a batch boundary is refused: it decodes to
+    /// whole batches, and would lose the later ones without a word.
+    #[test]
+    fn test_decode_stream_refuses_a_stream_without_its_end() {
+        let one = make_large_batch(3, 4);
+        let two = make_large_batch(2, 5);
+        let (stream, before_last) = stream_bytes(&[one, two]);
+
+        let whole = decode_stream(Buffer::from_vec(stream.clone())).unwrap();
+        assert_eq!(whole.len(), 2);
+
+        let cut = Buffer::from_vec(stream[..before_last].to_vec());
+        let err = decode_stream(cut).unwrap_err();
+        assert!(err.contains("EOS"), "{err}");
+    }
+
+    /// A stream whose bodies are not aligned for their types is refused,
+    /// not copied into aligned memory.
+    #[test]
+    fn test_decode_stream_refuses_a_misaligned_stream() {
+        let (stream, _) = stream_bytes(&[make_large_batch(3, 4)]);
+        let mut shifted = vec![0u8];
+        shifted.extend_from_slice(&stream);
+        let shifted = Buffer::from_vec(shifted).slice(1);
+        assert_eq!(shifted.as_ptr() as usize % 2, 1);
+
+        let err = decode_stream(shifted).unwrap_err();
+        assert!(err.to_lowercase().contains("align"), "{err}");
     }
 
     #[test]
@@ -700,16 +752,17 @@ mod tests {
 
     #[test]
     fn test_input_values_buffer_points_into_mmap() {
-        // True zero-copy proof: the column's underlying buffer pointer
-        // must lie inside the mmap range we used to read the batch.
-        // `read_batches_from_shm` is `map_shm` then `decode_stream`; calling
-        // them apart gives the mapping's address range.
+        // True zero-copy proof, in two parts. The values buffer lies inside
+        // the buffer `map_shm` returns, so `decode_stream` sliced it; and a
+        // write to the segment through the writer's own mapping shows in
+        // the column, so that buffer is the segment, not a copy of it.
         let n_rows = 1024;
         let str_len = 1024;
         let batch = make_large_batch(n_rows, str_len);
-        let shm_out = write_batch_to_output_shm(&batch, "zcin").unwrap();
+        let name = unique_shm_name("aipc-zc");
+        let mut holder = write_arrow_to_shm(&name, &batch);
 
-        let mapping = map_shm(&shm_out.name, shm_out.size).unwrap();
+        let mapping = map_shm(&name, holder.len()).unwrap();
         let mmap_start = mapping.as_ptr() as usize;
         let mmap_end = mmap_start + mapping.len();
         let batches = decode_stream(mapping).unwrap();
@@ -728,9 +781,13 @@ mod tests {
              mmap range [{mmap_start:#x}, {mmap_end:#x}) — read path is \
              copying instead of zero-slicing into the mmap"
         );
-
-        drop(batches);
-        let _ = SharedMemory::unlink(&shm_out.name);
+        assert_eq!(&val_col.value(0)[..1], "x");
+        holder.as_mut_slice()[values_ptr - mmap_start] = b'y';
+        assert_eq!(
+            &val_col.value(0)[..1],
+            "y",
+            "a write to the segment does not show: map_shm copied it"
+        );
     }
 
     #[test]
