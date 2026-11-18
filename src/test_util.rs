@@ -29,10 +29,18 @@ pub fn unique_shm_name(prefix: &str) -> String {
 /// The returned `SharedMemory` holds the mapping open. The shm segment is
 /// unlinked on drop, so keep the return value alive as long as readers need it.
 pub fn write_arrow_to_shm(name: &str, batch: &RecordBatch) -> SharedMemory {
+    write_batches_to_shm(name, std::slice::from_ref(batch))
+}
+
+/// Write record batches, which share a schema, as one Arrow IPC stream
+/// into a new shared memory region (see `write_arrow_to_shm`).
+pub fn write_batches_to_shm(name: &str, batches: &[RecordBatch]) -> SharedMemory {
     let mut ipc_buf = Vec::new();
     {
-        let mut writer = StreamWriter::try_new(&mut ipc_buf, &batch.schema()).unwrap();
-        writer.write(batch).unwrap();
+        let mut writer = StreamWriter::try_new(&mut ipc_buf, &batches[0].schema()).unwrap();
+        for batch in batches {
+            writer.write(batch).unwrap();
+        }
         writer.finish().unwrap();
     }
 

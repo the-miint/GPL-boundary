@@ -7,6 +7,7 @@ pub mod prodigal_train;
 
 use crate::protocol::{BatchRequest, Response};
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use std::os::raw::c_int;
 
 /// Description of an Arrow schema field for introspection.
@@ -253,6 +254,134 @@ pub trait ShmTool {
     ) -> Result<Option<Box<dyn ShmContext>>, String> {
         let _ = config;
         Ok(None)
+    }
+}
+
+/// What a tool returns for one batch.
+///
+/// `outputs` are the batch's output tables, each under its label, in the
+/// order the response lists them: the labels and order of the tool's
+/// `ToolDescription::outputs`. `result` is the response's `result` JSON.
+///
+/// Each output batch owns its memory. A batch must not view memory the C
+/// library frees, since the front end writes it out after the call has
+/// returned and the tool has released its C state.
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct ToolOutput {
+    pub outputs: Vec<(&'static str, RecordBatch)>,
+    pub result: serde_json::Value,
+}
+
+/// A tool's loaded state for a run of batches under one config: an index,
+/// a model. Created by `GplTool::create_streaming_context` and kept by the
+/// fingerprint's worker, which calls `run_batch` once per batch, one at a
+/// time. The `Drop` impl must call the C library's `destroy()`.
+///
+/// `Send` because the worker that keeps it may be dropped on another
+/// thread (the sweeper evicts idle workers), so any C library a context
+/// holds must be safe to free from a thread other than the one that made
+/// it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub trait StreamingContext: Send {
+    /// Run one batch against the context. Input, output and errors are
+    /// those of `GplTool::execute`. An error fails only this batch: the
+    /// context must stay usable for the next.
+    fn run_batch(&mut self, input: Vec<RecordBatch>) -> Result<ToolOutput, String>;
+}
+
+/// A GPL tool, free of any transport: it takes decoded record batches and
+/// returns record batches. A front end moves them between the tool and
+/// the caller; natively that is `crate::frontend`, over shared memory.
+#[cfg_attr(not(test), allow(dead_code))]
+pub trait GplTool: Send {
+    fn name(&self) -> &str;
+    fn version(&self) -> String;
+    /// Output Arrow schema version. Bump on any breaking schema change
+    /// (new/removed/renamed columns, type changes) so consumers can fail fast.
+    fn schema_version(&self) -> u32;
+    fn describe(&self) -> ToolDescription;
+
+    /// Run the tool on one batch.
+    ///
+    /// `input` is every record batch of the request's Arrow stream, in
+    /// order; there may be none. Natively the batches are read-only views
+    /// of the caller's input mapping, so a tool must not keep them, or any
+    /// array sliced from them, past the call. It takes them by value so
+    /// that a tool which copies its input can drop them before the C
+    /// library runs.
+    ///
+    /// An `Err` becomes the error response, its message the response's
+    /// `error`, and no output is written. On `Ok` the front end writes
+    /// every output or, if one write fails, none.
+    fn execute(
+        &self,
+        config: &serde_json::Value,
+        input: Vec<RecordBatch>,
+    ) -> Result<ToolOutput, String>;
+
+    /// The tool's streaming context for `config`: `Ok(Some(ctx))` if the
+    /// tool streams, `Ok(None)` if it does not (the default), and `Err`
+    /// if the context cannot be made (a missing index, a bad config).
+    fn create_streaming_context(
+        &self,
+        config: &serde_json::Value,
+    ) -> Result<Option<Box<dyn StreamingContext>>, String> {
+        let _ = config;
+        Ok(None)
+    }
+}
+
+/// A `GplTool` served through `ShmTool`, by way of the native front end,
+/// for the dispatch that still takes `ShmTool`s.
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct OnShm<T>(pub T);
+
+impl<T: GplTool> ShmTool for OnShm<T> {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn version(&self) -> String {
+        self.0.version()
+    }
+
+    fn schema_version(&self) -> u32 {
+        self.0.schema_version()
+    }
+
+    fn describe(&self) -> ToolDescription {
+        self.0.describe()
+    }
+
+    fn execute(
+        &self,
+        config: &serde_json::Value,
+        shm_input: &str,
+        shm_input_size: usize,
+    ) -> Response {
+        crate::frontend::run_on_shm(shm_input, shm_input_size, |input| {
+            self.0.execute(config, input)
+        })
+    }
+
+    fn create_streaming_context(
+        &self,
+        config: &serde_json::Value,
+    ) -> Result<Option<Box<dyn ShmContext>>, String> {
+        Ok(self
+            .0
+            .create_streaming_context(config)?
+            .map(|ctx| Box::new(ContextOnShm(ctx)) as Box<dyn ShmContext>))
+    }
+}
+
+/// A `StreamingContext` served through `ShmContext` (see `OnShm`).
+#[cfg_attr(not(test), allow(dead_code))]
+struct ContextOnShm(Box<dyn StreamingContext>);
+
+impl ShmContext for ContextOnShm {
+    fn run_batch(&mut self, shm_input: &str, shm_input_size: usize) -> Response {
+        crate::frontend::run_on_shm(shm_input, shm_input_size, |input| self.0.run_batch(input))
     }
 }
 

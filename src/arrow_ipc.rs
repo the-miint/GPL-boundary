@@ -352,6 +352,21 @@ pub fn read_batches_from_shm(shm_name: &str, size: usize) -> Result<Vec<RecordBa
     decode_readonly_shm(shm_name, shm)
 }
 
+/// Map `size` bytes of a segment read-only, as a `Buffer` that owns the
+/// mapping.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn map_shm(shm_name: &str, size: usize) -> Result<Buffer, String> {
+    let _ = (shm_name, size);
+    unimplemented!()
+}
+
+/// Decode an Arrow IPC stream into its batches, which slice `stream`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn decode_stream(stream: Buffer) -> Result<Vec<RecordBatch>, String> {
+    let _ = stream;
+    unimplemented!()
+}
+
 fn decode_readonly_shm(shm_name: &str, shm: ReadOnlyShm) -> Result<Vec<RecordBatch>, String> {
     let len = shm.len();
     if len == 0 {

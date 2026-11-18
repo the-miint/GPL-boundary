@@ -1,4 +1,5 @@
 mod arrow_ipc;
+mod frontend;
 mod protocol;
 mod registry;
 mod rusage;
