@@ -21,8 +21,10 @@
 //!
 //! ## Reading: zero-copy reader via `Buffer::from_custom_allocation`
 //!
-//! `read_batches_from_shm` is the single read API. It takes an explicit
-//! `size`: callers must supply the data length out-of-band (from
+//! `read_batches_from_shm` reads a segment in two steps, each public:
+//! `map_shm` maps the segment as a `Buffer`, and `decode_stream` decodes
+//! the batches from any `Buffer`, shared memory or not. `map_shm` takes an
+//! explicit `size`: callers must supply the data length out-of-band (from
 //! `BatchRequest::shm_input_size` for inputs, or `ShmOutput::size` for
 //! outputs). `fstat` is **not** consulted — Darwin POSIX shm has
 //! unreliable `fstat` semantics, and gpl-boundary's own outputs are
@@ -347,30 +349,19 @@ impl Drop for ShmOutputs {
 /// returned batch (or any column it carries) is alive — including across
 /// `shm_unlink`, since unlink only removes the name.
 pub fn read_batches_from_shm(shm_name: &str, size: usize) -> Result<Vec<RecordBatch>, String> {
+    decode_stream(map_shm(shm_name, size)?)
+}
+
+/// Map the first `size` bytes of a segment read-only, as a `Buffer` that
+/// owns the mapping: the mapping lasts as long as the buffer or anything
+/// sliced from it. See `read_batches_from_shm` for why `size` comes from
+/// the caller.
+pub fn map_shm(shm_name: &str, size: usize) -> Result<Buffer, String> {
     let shm = ReadOnlyShm::open(shm_name, size)
         .map_err(|e| format!("Failed to open shm '{shm_name}': {e}"))?;
-    decode_readonly_shm(shm_name, shm)
-}
-
-/// Map `size` bytes of a segment read-only, as a `Buffer` that owns the
-/// mapping.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn map_shm(shm_name: &str, size: usize) -> Result<Buffer, String> {
-    let _ = (shm_name, size);
-    unimplemented!()
-}
-
-/// Decode an Arrow IPC stream into its batches, which slice `stream`.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn decode_stream(stream: Buffer) -> Result<Vec<RecordBatch>, String> {
-    let _ = stream;
-    unimplemented!()
-}
-
-fn decode_readonly_shm(shm_name: &str, shm: ReadOnlyShm) -> Result<Vec<RecordBatch>, String> {
     let len = shm.len();
     if len == 0 {
-        return Ok(Vec::new());
+        return Ok(Buffer::from_vec(Vec::<u8>::new()));
     }
 
     let ptr = NonNull::new(shm.as_ptr() as *mut u8)
@@ -383,13 +374,22 @@ fn decode_readonly_shm(shm_name: &str, shm: ReadOnlyShm) -> Result<Vec<RecordBat
     // `from_custom_allocation` retains `allocation` via Arc; the mmap is not
     // unmapped until the Arc count drops to zero (i.e., all derived buffers
     // are dropped).
-    let mut buf = unsafe { Buffer::from_custom_allocation(ptr, len, allocation) };
+    Ok(unsafe { Buffer::from_custom_allocation(ptr, len, allocation) })
+}
 
+/// Decode an Arrow IPC stream into its batches, in order, without copying:
+/// every array buffer is a slice of `stream`. An empty `stream` holds no
+/// batches. A body that is not aligned for its type is an error rather
+/// than a copy (see `read_batches_from_shm`).
+pub fn decode_stream(mut stream: Buffer) -> Result<Vec<RecordBatch>, String> {
+    if stream.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut decoder = StreamDecoder::new().with_require_alignment(true);
     let mut out = Vec::new();
-    while !buf.is_empty() {
+    while !stream.is_empty() {
         match decoder
-            .decode(&mut buf)
+            .decode(&mut stream)
             .map_err(|e| format!("Failed to decode Arrow IPC: {e}"))?
         {
             Some(batch) => out.push(batch),
@@ -701,32 +701,18 @@ mod tests {
     #[test]
     fn test_input_values_buffer_points_into_mmap() {
         // True zero-copy proof: the column's underlying buffer pointer
-        // must lie inside the mmap range we used to read the batch. We
-        // replicate the read path manually here so we own the mmap and
-        // can compare addresses; the public `read_batches_from_shm` hides
-        // the mmap base for encapsulation.
+        // must lie inside the mmap range we used to read the batch.
+        // `read_batches_from_shm` is `map_shm` then `decode_stream`; calling
+        // them apart gives the mapping's address range.
         let n_rows = 1024;
         let str_len = 1024;
         let batch = make_large_batch(n_rows, str_len);
         let shm_out = write_batch_to_output_shm(&batch, "zcin").unwrap();
 
-        let shm = crate::shm::ReadOnlyShm::open(&shm_out.name, shm_out.size).unwrap();
-        let mmap_start = shm.as_ptr() as usize;
-        let mmap_end = mmap_start + shm.len();
-        let ptr = NonNull::new(shm.as_ptr() as *mut u8).unwrap();
-        let allocation: Arc<dyn Allocation> = Arc::new(shm);
-        let mut buf =
-            unsafe { Buffer::from_custom_allocation(ptr, mmap_end - mmap_start, allocation) };
-        let mut decoder = StreamDecoder::new().with_require_alignment(true);
-        let mut batches = Vec::new();
-        while !buf.is_empty() {
-            if let Some(b) = decoder.decode(&mut buf).unwrap() {
-                batches.push(b);
-            } else {
-                break;
-            }
-        }
-        decoder.finish().unwrap();
+        let mapping = map_shm(&shm_out.name, shm_out.size).unwrap();
+        let mmap_start = mapping.as_ptr() as usize;
+        let mmap_end = mmap_start + mapping.len();
+        let batches = decode_stream(mapping).unwrap();
 
         let val_col = batches[0]
             .column_by_name("val")

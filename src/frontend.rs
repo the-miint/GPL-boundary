@@ -11,6 +11,7 @@
 use arrow::buffer::Buffer;
 use arrow::record_batch::RecordBatch;
 
+use crate::arrow_ipc::{self, ShmOutputs};
 use crate::protocol::Response;
 use crate::tools::ToolOutput;
 
@@ -23,8 +24,10 @@ pub(crate) fn run_on_shm(
     shm_input_size: usize,
     call: impl FnOnce(Vec<RecordBatch>) -> Result<ToolOutput, String>,
 ) -> Response {
-    let _ = (shm_input, shm_input_size, call);
-    unimplemented!()
+    match arrow_ipc::map_shm(shm_input, shm_input_size) {
+        Ok(input) => run_on_buffer(input, call),
+        Err(e) => Response::error(e),
+    }
 }
 
 /// `run_on_shm` from the mapped input on.
@@ -33,8 +36,21 @@ fn run_on_buffer(
     input: Buffer,
     call: impl FnOnce(Vec<RecordBatch>) -> Result<ToolOutput, String>,
 ) -> Response {
-    let _ = (input, call);
-    unimplemented!()
+    let input = match arrow_ipc::decode_stream(input) {
+        Ok(batches) => batches,
+        Err(e) => return Response::error(e),
+    };
+    let output = match call(input) {
+        Ok(output) => output,
+        Err(e) => return Response::error(e),
+    };
+    let mut written = ShmOutputs::default();
+    for (label, batch) in output.outputs {
+        if let Err(e) = written.write(&batch, label) {
+            return Response::error(e);
+        }
+    }
+    Response::ok(output.result, written.into_vec())
 }
 
 #[cfg(test)]
