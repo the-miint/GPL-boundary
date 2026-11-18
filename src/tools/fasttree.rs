@@ -3,7 +3,7 @@
 
 use crate::protocol::{Response, ShmOutput};
 use crate::tools::{
-    checked_cint, ConfigParam, FieldDescription, GplTool, OutputDescription, ToolDescription,
+    checked_cint, ConfigParam, FieldDescription, OutputDescription, ShmTool, ToolDescription,
 };
 use arrow::array::{
     BooleanArray, Float64Builder, Int32Array, Int64Array, Int64Builder, StringArray,
@@ -646,7 +646,7 @@ impl FastTreeTool {
     }
 }
 
-impl GplTool for FastTreeTool {
+impl ShmTool for FastTreeTool {
     fn name(&self) -> &str {
         "fasttree"
     }

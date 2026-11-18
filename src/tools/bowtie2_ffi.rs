@@ -10,7 +10,7 @@
 
 use std::os::raw::{c_char, c_int};
 
-/// bowtie2 **software** version reported by `GplTool::version()` for both
+/// bowtie2 **software** version reported by `ShmTool::version()` for both
 /// bowtie2-align and bowtie2-build. Tracks the `ext/bowtie2` submodule pin
 /// (`v2.5.5-miint`) and must stay in sync with the `BOWTIE2_VERSION` string
 /// compiled into the C library by `build.rs` — bump both together when the

@@ -5,7 +5,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use arrow::array::StringArray;
 
 use crate::protocol::Response;
-use crate::tools::{ConfigParam, FieldDescription, GplTool, ToolDescription, ToolRegistration};
+use crate::tools::{ConfigParam, FieldDescription, ShmTool, ToolDescription, ToolRegistration};
 
 // ---------------------------------------------------------------------------
 // FFI bindings — mirror ext/bowtie2/bt2_api.h (build API)
@@ -195,10 +195,10 @@ fn collect_index_files(index_path: &str) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// GplTool implementation
+// ShmTool implementation
 // ---------------------------------------------------------------------------
 
-impl GplTool for Bowtie2BuildTool {
+impl ShmTool for Bowtie2BuildTool {
     fn name(&self) -> &str {
         "bowtie2-build"
     }

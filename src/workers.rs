@@ -4,7 +4,7 @@
 //! and serves batches submitted to that fingerprint. Phase 4 ships two
 //! implementations:
 //!
-//! - `InProcessSlot` — wraps an optional `StreamingContext` (for tools that
+//! - `InProcessSlot` — wraps an optional `ShmContext` (for tools that
 //!   support it) or falls through to `tools::dispatch` (for tools that don't).
 //!   Used by every tool the registry does not route to a subprocess.
 //!   Each slot owns a dedicated worker thread that drains a per-slot mpsc
@@ -35,7 +35,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::protocol::{BatchRequest, Response};
-use crate::tools::{self, StreamingContext};
+use crate::tools::{self, ShmContext};
 
 /// Channel the coordinator listens on for completed batch responses. Every
 /// `Worker` impl is constructed with a clone of this sender. The coordinator
@@ -205,7 +205,7 @@ impl InProcessSlot {
 /// observes idle while a response is still in transit.
 fn worker_thread_main(
     rx: mpsc::Receiver<BatchRequest>,
-    mut ctx_opt: Option<Box<dyn StreamingContext>>,
+    mut ctx_opt: Option<Box<dyn ShmContext>>,
     streaming_supported: bool,
     schema_version: Option<u32>,
     tool_name: String,

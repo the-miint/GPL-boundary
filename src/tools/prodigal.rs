@@ -6,7 +6,7 @@ use crate::arrow_ipc::ShmOutputs;
 use crate::protocol::Response;
 use crate::tools::{
     arrow_schema, config_bool, config_cint, config_f64, config_knobs_known, config_str,
-    ConfigParam, FieldDescription, GplTool, OutputDescription, StreamingContext, ToolDescription,
+    ConfigParam, FieldDescription, OutputDescription, ShmContext, ShmTool, ToolDescription,
 };
 use arrow::array::{
     Array, ArrayRef, BooleanBuilder, Float64Builder, Int32Builder, StringArray, StringBuilder,
@@ -1104,7 +1104,7 @@ impl Session {
     }
 }
 
-impl StreamingContext for Session {
+impl ShmContext for Session {
     fn run_batch(&mut self, shm_input: &str, shm_input_size: usize) -> Response {
         Contigs::read(shm_input, shm_input_size)
             .and_then(|contigs| self.run(&contigs))
@@ -1112,7 +1112,7 @@ impl StreamingContext for Session {
     }
 }
 
-impl GplTool for ProdigalTool {
+impl ShmTool for ProdigalTool {
     fn name(&self) -> &str {
         "prodigal"
     }
@@ -1276,7 +1276,7 @@ impl GplTool for ProdigalTool {
     fn create_streaming_context(
         &self,
         config: &serde_json::Value,
-    ) -> Result<Option<Box<dyn StreamingContext>>, String> {
+    ) -> Result<Option<Box<dyn ShmContext>>, String> {
         let session = Session::new(Settings::parse(config)?)?;
         Ok(Some(Box::new(session)))
     }
@@ -1325,7 +1325,7 @@ mod tests {
     /// A batch run through a streaming session: the result JSON and the
     /// outputs, or the error.
     fn predict_in(
-        session: &mut Box<dyn StreamingContext>,
+        session: &mut Box<dyn ShmContext>,
         batch: &RecordBatch,
     ) -> Result<Prediction, String> {
         let input_name = unique_shm_name("pd-sess");

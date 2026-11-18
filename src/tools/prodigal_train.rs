@@ -7,7 +7,7 @@ use crate::tools::prodigal::{
     library_version, model_config, model_fields, model_json, sha256_hex, training_info, validate,
     Context, Contigs, INPUT_FIELDS, TRANS_TABLES,
 };
-use crate::tools::{config_str, ConfigParam, FieldDescription, GplTool, ToolDescription};
+use crate::tools::{config_str, ConfigParam, FieldDescription, ShmTool, ToolDescription};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -21,7 +21,7 @@ inventory::submit! {
     }
 }
 
-impl GplTool for ProdigalTrainTool {
+impl ShmTool for ProdigalTrainTool {
     fn name(&self) -> &str {
         "prodigal-train"
     }
@@ -236,7 +236,7 @@ mod tests {
         PRODIGAL_REF_TRAIN_SHA256 as REF_TRAIN_SHA256,
     };
     use crate::tools::prodigal::{sha256_hex, ProdigalTool};
-    use crate::tools::GplTool;
+    use crate::tools::ShmTool;
     use arrow::record_batch::RecordBatch;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;

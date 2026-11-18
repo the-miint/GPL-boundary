@@ -12,7 +12,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::protocol::Response;
 use crate::tools::{
-    ConfigParam, FieldDescription, GplTool, OutputDescription, StreamingContext, ToolDescription,
+    ConfigParam, FieldDescription, OutputDescription, ShmContext, ShmTool, ToolDescription,
     ToolRegistration,
 };
 
@@ -767,7 +767,7 @@ impl Drop for Bowtie2StreamingContext {
     }
 }
 
-impl StreamingContext for Bowtie2StreamingContext {
+impl ShmContext for Bowtie2StreamingContext {
     fn run_batch(&mut self, shm_input: &str, shm_input_size: usize) -> Response {
         let input_data = match Bowtie2AlignTool::read_input(shm_input, shm_input_size) {
             Ok(data) => data,
@@ -1227,10 +1227,10 @@ unsafe fn build_nullable_string_tag(ptr: *const *const c_char, n: usize) -> Stri
 }
 
 // ---------------------------------------------------------------------------
-// GplTool implementation
+// ShmTool implementation
 // ---------------------------------------------------------------------------
 
-impl GplTool for Bowtie2AlignTool {
+impl ShmTool for Bowtie2AlignTool {
     fn name(&self) -> &str {
         "bowtie2-align"
     }
@@ -2011,7 +2011,7 @@ impl GplTool for Bowtie2AlignTool {
     fn create_streaming_context(
         &self,
         config: &serde_json::Value,
-    ) -> Result<Option<Box<dyn StreamingContext>>, String> {
+    ) -> Result<Option<Box<dyn ShmContext>>, String> {
         let verbose = config
             .get("verbose")
             .and_then(|v| v.as_bool())

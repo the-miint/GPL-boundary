@@ -199,20 +199,20 @@ pub struct ToolDescription {
 }
 
 /// A reusable tool context for batched streaming. Created once per session
-/// via `GplTool::create_streaming_context`, then used for multiple batches.
+/// via `ShmTool::create_streaming_context`, then used for multiple batches.
 /// Holds expensive state (loaded index, reference DB) that is reused across
 /// `run_batch` calls. The `Drop` impl must call the C library's `destroy()`.
 ///
 /// `Send` is required because the Phase 4 worker registry stores contexts
-/// inside an `Arc<dyn Worker>` whose `Mutex<Option<Box<dyn StreamingContext>>>`
+/// inside an `Arc<dyn Worker>` whose `Mutex<Option<Box<dyn ShmContext>>>`
 /// must be `Send + Sync`. The contexts themselves are not accessed concurrently
 /// — the Mutex guarantees single-threaded use of the underlying C state — but
 /// they may be created on one thread and dropped on another (e.g. during
 /// step-4 idle-deadline eviction from a sweeper thread). Any C library held
 /// inside a context must therefore be safe to free from a thread other than
 /// the one that constructed it. All current submodules satisfy this.
-pub trait StreamingContext: Send {
-    /// Process one batch of input. Same contract as `GplTool::execute()` but
+pub trait ShmContext: Send {
+    /// Process one batch of input. Same contract as `ShmTool::execute()` but
     /// against a pre-loaded context: reads input from shm, creates output shm,
     /// returns Response.
     ///
@@ -225,7 +225,7 @@ pub trait StreamingContext: Send {
 }
 
 /// Trait for GPL-licensed tools that can be dispatched.
-pub trait GplTool {
+pub trait ShmTool {
     fn name(&self) -> &str;
     fn version(&self) -> String;
     /// Output Arrow schema version. Bump on any breaking schema change
@@ -250,7 +250,7 @@ pub trait GplTool {
     fn create_streaming_context(
         &self,
         config: &serde_json::Value,
-    ) -> Result<Option<Box<dyn StreamingContext>>, String> {
+    ) -> Result<Option<Box<dyn ShmContext>>, String> {
         let _ = config;
         Ok(None)
     }
@@ -259,13 +259,13 @@ pub trait GplTool {
 /// Registration entry for the tool registry. Each tool module calls
 /// `inventory::submit!` with one of these to register itself.
 pub struct ToolRegistration {
-    pub(crate) create: fn() -> Box<dyn GplTool>,
+    pub(crate) create: fn() -> Box<dyn ShmTool>,
 }
 
 inventory::collect!(ToolRegistration);
 
 /// Return all registered tools.
-fn all_tools() -> Vec<Box<dyn GplTool>> {
+fn all_tools() -> Vec<Box<dyn ShmTool>> {
     inventory::iter::<ToolRegistration>
         .into_iter()
         .map(|reg| (reg.create)())
@@ -293,7 +293,7 @@ pub fn dispatch(request: &BatchRequest) -> Response {
 
 /// `(streaming context, tool schema_version)` returned by a successful
 /// `streaming_setup` call.
-pub type StreamingSession = (Box<dyn StreamingContext>, u32);
+pub type StreamingSession = (Box<dyn ShmContext>, u32);
 
 /// Try to set up a streaming context for the named tool.
 ///
@@ -496,17 +496,17 @@ mod tests {
         );
     }
 
-    // -- StreamingContext and streaming_setup tests --
+    // -- ShmContext and streaming_setup tests --
 
     #[test]
     fn test_streaming_context_trait_is_object_safe() {
         struct DummyCtx;
-        impl StreamingContext for DummyCtx {
+        impl ShmContext for DummyCtx {
             fn run_batch(&mut self, _shm_input: &str, _shm_input_size: usize) -> Response {
                 Response::error("stub")
             }
         }
-        let mut ctx: Box<dyn StreamingContext> = Box::new(DummyCtx);
+        let mut ctx: Box<dyn ShmContext> = Box::new(DummyCtx);
         let resp = ctx.run_batch("/dummy", 0);
         assert!(!resp.success);
     }
