@@ -543,15 +543,21 @@ impl ReadOnlyShm {
     /// must travel out-of-band via the protocol (`BatchRequest::shm_input_size`
     /// for inputs, `ShmOutput::size` for outputs).
     ///
-    /// `size == 0` is allowed only when the segment is genuinely empty —
-    /// a freshly-created shm whose `ftruncate` has not yet enlarged it,
-    /// or a tool whose input batch is intentionally zero-length. Passing
-    /// `size == 0` for a non-empty segment is treated as a caller bug
-    /// (forgot to plumb `shm_input_size`) and surfaced as an error
-    /// rather than silently returning an empty handle. The check uses
-    /// `fstat` solely as a sanity gate — `st_size > 0` is a reliable
-    /// signal of "non-empty" on both Linux and macOS even when its exact
-    /// value isn't trustworthy on Darwin.
+    /// `fstat` serves only as a sanity gate on `size`: its `st_size` is
+    /// not the data length on Darwin (it is rounded up to a page), but it
+    /// is never less than the data, and `st_size > 0` reliably means
+    /// "non-empty", on both Linux and macOS. Two sizes are caller bugs and
+    /// refused:
+    ///
+    /// - past the end of the segment: mapping it would succeed, and a read
+    ///   past the object's last page would be SIGBUS, which kills the
+    ///   process without running the cleanup handler;
+    /// - `size == 0` against a non-empty segment (forgot to plumb
+    ///   `shm_input_size`), rather than silently returning an empty
+    ///   handle. `size == 0` is allowed when the segment is genuinely
+    ///   empty — a freshly-created shm whose `ftruncate` has not yet
+    ///   enlarged it, or a tool whose input batch is intentionally
+    ///   zero-length.
     #[cfg(unix)]
     pub fn open(name: &str, size: usize) -> io::Result<Self> {
         let c_name = to_cstring(name)?;
@@ -560,24 +566,33 @@ impl ReadOnlyShm {
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
-            // Special-case the empty mapping: mmap with len=0 is undefined.
-            // Reject `size == 0` against a non-empty segment as a caller
-            // bug (likely forgot to plumb shm_input_size).
-            if size == 0 {
-                let mut stat: libc::stat = std::mem::zeroed();
-                let rc = libc::fstat(fd, &mut stat);
+            let mut stat: libc::stat = std::mem::zeroed();
+            if libc::fstat(fd, &mut stat) < 0 {
+                let err = io::Error::last_os_error();
                 libc::close(fd);
-                if rc < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if stat.st_size > 0 {
+                return Err(err);
+            }
+            let segment_len = u64::try_from(stat.st_size).unwrap_or(0);
+            if size as u64 > segment_len {
+                libc::close(fd);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "size {size} is past the end of segment '{name}' \
+                         (fstat reports {segment_len} bytes)"
+                    ),
+                ));
+            }
+            // Special-case the empty mapping: mmap with len=0 is undefined.
+            if size == 0 {
+                libc::close(fd);
+                if segment_len > 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
                             "ReadOnlyShm::open called with size=0 against non-empty \
-                             segment '{name}' (fstat reports {} bytes); caller likely \
-                             forgot to plumb shm_input_size",
-                            stat.st_size
+                             segment '{name}' (fstat reports {segment_len} bytes); caller \
+                             likely forgot to plumb shm_input_size"
                         ),
                     ));
                 }
@@ -800,5 +815,19 @@ mod tests {
         let long = format!("/gb-{}", "x".repeat(NAME_BUF_LEN));
         register_for_cleanup(&long);
         assert!(!is_registered(&long), "Over-long name must not register");
+    }
+
+    /// A size past the segment's end is refused at open: a read past the
+    /// object's last page would be SIGBUS, which kills the daemon.
+    #[test]
+    fn test_read_only_open_refuses_a_size_past_the_segment() {
+        let name = format!("/gb-test-past-{}", std::process::id());
+        let _segment = SharedMemory::create(&name, 16).unwrap();
+        // Past any page rounding of the 16 bytes
+        match ReadOnlyShm::open(&name, 1 << 20) {
+            Ok(_) => panic!("a size past the segment was mapped"),
+            Err(e) => assert!(e.to_string().contains("past the end"), "{e}"),
+        }
+        assert!(ReadOnlyShm::open(&name, 16).is_ok());
     }
 }
