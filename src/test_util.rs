@@ -126,7 +126,7 @@ pub fn assert_anthus_model(model: &serde_json::Value) {
     assert_eq!(model["start_weight"], 4.35, "{model}");
 }
 
-/// A prodigal response: its result JSON and its two outputs.
+/// A prodigal prediction: its result JSON and its two outputs.
 #[derive(Debug)]
 pub struct Prediction {
     pub result: serde_json::Value,
@@ -134,18 +134,13 @@ pub struct Prediction {
     pub contigs: RecordBatch,
 }
 
-/// A prodigal response's result and outputs, genes then contigs (every
-/// output segment read and unlinked, then their labels checked), or its
-/// error.
-pub fn prediction_of(response: Response) -> Result<Prediction, String> {
-    if !response.success {
-        return Err(response.error.unwrap());
-    }
-    let (labels, outputs): (Vec<String>, Vec<RecordBatch>) =
-        take_outputs(&response).into_iter().unzip();
+/// A prodigal call's result and outputs, genes then contigs (their labels
+/// checked), or its error.
+pub fn prediction_of(output: Result<ToolOutput, String>) -> Result<Prediction, String> {
+    let ToolOutput { outputs, result } = output?;
+    let (labels, outputs): (Vec<&str>, Vec<RecordBatch>) = outputs.into_iter().unzip();
     assert_eq!(labels, ["genes", "contigs"]);
     let [genes, contigs] = <[RecordBatch; 2]>::try_from(outputs).unwrap();
-    let result = response.result.unwrap();
     Ok(Prediction {
         result,
         genes,

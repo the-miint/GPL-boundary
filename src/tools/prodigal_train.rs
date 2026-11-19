@@ -228,15 +228,13 @@ fn write_atomically(target: &str, blob: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::ProdigalTrainTool;
-    use crate::protocol::{BatchRequest, Response};
     use crate::test_util::{
         anthus, anthus_batch, assert_anthus_model, contigs_batch, gene_coordinates,
-        gff_coordinates, prediction_of, prodigal_truth, scratch_dir, unique_shm_name,
-        write_arrow_to_shm, PRODIGAL_REF_TRAIN as REF_TRAIN,
-        PRODIGAL_REF_TRAIN_SHA256 as REF_TRAIN_SHA256,
+        gff_coordinates, prediction_of, prodigal_truth, scratch_dir, Prediction,
+        PRODIGAL_REF_TRAIN as REF_TRAIN, PRODIGAL_REF_TRAIN_SHA256 as REF_TRAIN_SHA256,
     };
     use crate::tools::prodigal::{sha256_hex, ProdigalTool};
-    use crate::tools::ShmTool;
+    use crate::tools::GplTool;
     use arrow::record_batch::RecordBatch;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
@@ -246,18 +244,17 @@ mod tests {
     /// (ext/prodigal/docs/testing.md).
     const TRAIN_BYTES_MATCH: bool = !cfg!(target_os = "macos");
 
-    fn run(tool: &str, config: serde_json::Value, batch: &RecordBatch) -> Response {
-        let input_name = unique_shm_name("pd-train");
-        let input = write_arrow_to_shm(&input_name, batch);
-        crate::tools::dispatch(&BatchRequest {
-            tool: tool.to_string(),
-            config,
-            shm_input: input_name,
-            shm_input_size: input.len(),
-            batch_id: None,
-            metrics: false,
-            received_at: None,
-        })
+    /// prodigal-train on a batch: its result JSON (it has no outputs), or
+    /// the error.
+    fn train(config: serde_json::Value, batch: &RecordBatch) -> Result<serde_json::Value, String> {
+        let output = ProdigalTrainTool.execute(&config, vec![batch.clone()])?;
+        assert!(output.outputs.is_empty());
+        Ok(output.result)
+    }
+
+    /// prodigal on a batch: its prediction, or the error.
+    fn predict(config: serde_json::Value, batch: &RecordBatch) -> Result<Prediction, String> {
+        prediction_of(ProdigalTool.execute(&config, vec![batch.clone()]))
     }
 
     /// Files in `dir`, sorted.
@@ -278,10 +275,7 @@ mod tests {
         let dir = scratch_dir();
         let path = dir.path().join("anthus.bin");
         let config = serde_json::json!({"training_path": path});
-        let response = run("prodigal-train", config, &anthus_batch());
-        assert!(response.success, "{:?}", response.error);
-        assert!(response.shm_outputs.is_empty());
-        let result = response.result.unwrap();
+        let result = train(config, &anthus_batch()).unwrap();
 
         let written = std::fs::read(&path).unwrap();
         let reference = std::fs::read(REF_TRAIN).unwrap();
@@ -310,13 +304,9 @@ mod tests {
     fn test_retrain_replaces_the_model() {
         let dir = scratch_dir();
         let path = dir.path().join("model.bin");
-        let train = |config: serde_json::Value| {
-            let response = run("prodigal-train", config, &anthus_batch());
-            assert!(response.success, "{:?}", response.error);
-            response.result.unwrap()
-        };
-        let first = train(serde_json::json!({"training_path": path}));
-        let second = train(serde_json::json!({"training_path": path, "closed_ends": true}));
+        let retrain = |config: serde_json::Value| train(config, &anthus_batch()).unwrap();
+        let first = retrain(serde_json::json!({"training_path": path}));
+        let second = retrain(serde_json::json!({"training_path": path, "closed_ends": true}));
         assert_eq!(second["closed_ends"], true);
         assert_ne!(first["training_sha256"], second["training_sha256"]);
         let file = std::fs::read(&path).unwrap();
@@ -334,9 +324,7 @@ mod tests {
         let link = dir.path().join("current.bin");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let config = serde_json::json!({"training_path": link});
-        let result = run("prodigal-train", config, &anthus_batch())
-            .result
-            .unwrap();
+        let result = train(config, &anthus_batch()).unwrap();
         let link_type = std::fs::symlink_metadata(&link).unwrap().file_type();
         assert!(link_type.is_symlink());
         let target = std::fs::canonicalize(&target).unwrap();
@@ -348,9 +336,7 @@ mod tests {
         let dangling = dir.path().join("dangling.bin");
         std::os::unix::fs::symlink(dir.path().join("none.bin"), &dangling).unwrap();
         let config = serde_json::json!({"training_path": dangling});
-        let err = run("prodigal-train", config, &anthus_batch())
-            .error
-            .unwrap();
+        let err = train(config, &anthus_batch()).unwrap_err();
         assert!(err.contains("symlink"), "{err}");
         assert!(dangling.is_symlink());
     }
@@ -363,12 +349,7 @@ mod tests {
         let plain = dir.path().join("plain");
         std::fs::write(&plain, b"").unwrap();
         let path = dir.path().join("model.bin");
-        let response = run(
-            "prodigal-train",
-            serde_json::json!({"training_path": path}),
-            &anthus_batch(),
-        );
-        assert!(response.success, "{:?}", response.error);
+        train(serde_json::json!({"training_path": path}), &anthus_batch()).unwrap();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), mode(&plain));
     }
@@ -399,12 +380,7 @@ mod tests {
         std::fs::write(&path, b"old").unwrap();
         // One contig of 960 bp: training needs 20,000
         let short = anthus_batch().slice(0, 1);
-        let response = run(
-            "prodigal-train",
-            serde_json::json!({"training_path": path}),
-            &short,
-        );
-        let err = response.error.expect("refused");
+        let err = train(serde_json::json!({"training_path": path}), &short).unwrap_err();
         assert!(err.contains("training"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), b"old");
         assert_eq!(files(dir.path()), ["model.bin"]);
@@ -418,12 +394,8 @@ mod tests {
         let path = dir.path().join("model.bin");
         let mut contigs = anthus();
         contigs.push(("empty".into(), String::new()));
-        let response = run(
-            "prodigal-train",
-            serde_json::json!({"training_path": path}),
-            &contigs_batch(&contigs),
-        );
-        let err = response.error.expect("refused");
+        let config = serde_json::json!({"training_path": path});
+        let err = train(config, &contigs_batch(&contigs)).unwrap_err();
         assert!(
             err.contains("'empty' (input row 23): empty sequence"),
             "{err}"
@@ -462,8 +434,7 @@ mod tests {
                 "Invalid prodigal config",
             ),
         ] {
-            let response = run("prodigal-train", config.clone(), &anthus_batch());
-            let err = response.error.expect("refused");
+            let err = train(config.clone(), &anthus_batch()).unwrap_err();
             assert!(err.contains(named), "{config}: {err}");
         }
         assert!(files(dir.path()).is_empty());
@@ -474,12 +445,7 @@ mod tests {
     fn test_train_needs_an_existing_directory() {
         let dir = scratch_dir();
         let path = dir.path().join("missing").join("model.bin");
-        let response = run(
-            "prodigal-train",
-            serde_json::json!({"training_path": path}),
-            &anthus_batch(),
-        );
-        let err = response.error.expect("refused");
+        let err = train(serde_json::json!({"training_path": path}), &anthus_batch()).unwrap_err();
         assert!(err.contains(path.to_str().unwrap()), "{err}");
     }
 
@@ -489,18 +455,14 @@ mod tests {
     fn test_trained_model_predicts_the_clis_genes() {
         let dir = scratch_dir();
         let path = dir.path().join("model.bin");
-        let response = run(
-            "prodigal-train",
-            serde_json::json!({"training_path": path}),
-            &anthus_batch(),
-        );
-        let result = response.result.expect("trained");
+        let result = train(serde_json::json!({"training_path": path}), &anthus_batch());
+        let result = result.expect("trained");
         let config = serde_json::json!({
             "meta_mode": false,
             "training_path": result["training_path"],
             "training_sha256": result["training_sha256"],
         });
-        let outputs = prediction_of(run("prodigal", config, &anthus_batch())).unwrap();
+        let outputs = predict(config, &anthus_batch()).unwrap();
         let expected = gff_coordinates(&prodigal_truth("ref_trained.gff"));
         assert_eq!(gene_coordinates(&outputs.genes), expected);
         assert_eq!(outputs.result["model"], result["model"]);

@@ -1286,10 +1286,10 @@ impl ShmTool for ProdigalTool {
 mod tests {
     use super::*;
     use crate::test_util::{
-        anthus, anthus_batch, assert_anthus_model, column, contigs_batch, fasta_records,
-        gene_coordinates, gff_coordinates, gff_genes, gff_sequences, prediction_of, prodigal_batch,
-        prodigal_truth, scratch_dir, unique_shm_name, write_arrow_to_shm, Prediction,
-        PRODIGAL_REF_TRAIN as REF_TRAIN, PRODIGAL_REF_TRAIN_SHA256 as REF_TRAIN_SHA256,
+        anthus, anthus_batch, assert_anthus_model, assert_outputs_described, column, contigs_batch,
+        fasta_records, gene_coordinates, gff_coordinates, gff_genes, gff_sequences, prediction_of,
+        prodigal_batch, prodigal_truth, scratch_dir, Prediction, PRODIGAL_REF_TRAIN as REF_TRAIN,
+        PRODIGAL_REF_TRAIN_SHA256 as REF_TRAIN_SHA256,
     };
     use arrow::array::{BooleanArray, Float64Array, Int32Array};
     use arrow::compute::{filter_record_batch, kernels::cmp::eq};
@@ -1317,20 +1317,16 @@ mod tests {
 
     /// execute() on a batch: the result JSON and the outputs, or the error.
     fn predict_batch(config: serde_json::Value, batch: &RecordBatch) -> Result<Prediction, String> {
-        let input_name = unique_shm_name("pd-run");
-        let input = write_arrow_to_shm(&input_name, batch);
-        prediction_of(ProdigalTool.execute(&config, &input_name, input.len()))
+        prediction_of(ProdigalTool.execute(&config, vec![batch.clone()]))
     }
 
     /// A batch run through a streaming session: the result JSON and the
     /// outputs, or the error.
     fn predict_in(
-        session: &mut Box<dyn ShmContext>,
+        session: &mut Box<dyn StreamingContext>,
         batch: &RecordBatch,
     ) -> Result<Prediction, String> {
-        let input_name = unique_shm_name("pd-sess");
-        let input = write_arrow_to_shm(&input_name, batch);
-        prediction_of(session.run_batch(&input_name, input.len()))
+        prediction_of(session.run_batch(vec![batch.clone()]))
     }
 
     /// Single-genome mode from REF_TRAIN, with `knobs` added or replaced.
@@ -1371,27 +1367,15 @@ mod tests {
         ]
     }
 
-    /// A batch's outputs (prediction_of checks their labels and order) are
-    /// the ones --describe lists, with its columns: name, type as
-    /// described, nullability.
+    /// A batch's outputs are the ones --describe lists, in its order, with
+    /// its columns: name, type as described, nullability.
     #[test]
     fn test_outputs_are_described() {
         let batch = prodigal_batch(&["contig_1", "contig_2"], &[TEST_SEQ_1, TEST_SEQ_2]);
-        let outputs = predict_batch(serde_json::json!({}), &batch).unwrap();
-        let desc = ProdigalTool.describe();
-        let described: Vec<&str> = desc.outputs.iter().map(|o| o.label).collect();
-        assert_eq!(described, ["genes", "contigs"]);
-        let column = |f: &Field| (f.name().clone(), f.data_type().to_string(), f.is_nullable());
-        for (batch, output) in [&outputs.genes, &outputs.contigs]
-            .into_iter()
-            .zip(&desc.outputs)
-        {
-            let columns: Vec<_> = batch.schema().fields().iter().map(|f| column(f)).collect();
-            let listed: Vec<_> = (output.schema.iter())
-                .map(|f| (f.name.to_string(), f.arrow_type.to_string(), f.nullable))
-                .collect();
-            assert_eq!(columns, listed, "{}", output.label);
-        }
+        let output = ProdigalTool.execute(&serde_json::json!({}), vec![batch]);
+        let output = output.unwrap();
+        assert_outputs_described(&ProdigalTool.describe(), &output);
+        let outputs = prediction_of(Ok(output)).unwrap();
         assert!(outputs.genes.num_rows() > 0);
         assert_eq!(outputs.contigs.num_rows(), 2);
     }
@@ -1686,46 +1670,19 @@ mod tests {
 
     #[test]
     fn test_prodigal_single_genome_too_short() {
-        let input_name = unique_shm_name("pd-sg-in");
-
         // 960 bp sequences are far below the 20000 bp minimum for training
         let batch = prodigal_batch(&["contig_1"], &[TEST_SEQ_1]);
-        let input_shm = write_arrow_to_shm(&input_name, &batch);
-        let input_shm_size = input_shm.len();
-
-        let tool = ProdigalTool;
         let config = serde_json::json!({
             "meta_mode": false,
             "train_on_batch": true,
             "trans_table": 11,
         });
 
-        let response = tool.execute(&config, &input_name, input_shm_size);
+        let err = ProdigalTool.execute(&config, vec![batch]).unwrap_err();
         assert!(
-            !response.success,
-            "Expected failure for too-short training input"
+            err.contains("too short") || err.contains("Too short"),
+            "Expected sequence-too-short error, got: {err}"
         );
-        assert!(
-            response.error.as_ref().unwrap().contains("too short")
-                || response.error.as_ref().unwrap().contains("Too short")
-                || response
-                    .error
-                    .as_ref()
-                    .unwrap()
-                    .contains("Sequence too short"),
-            "Expected sequence-too-short error, got: {:?}",
-            response.error
-        );
-    }
-
-    #[test]
-    fn test_prodigal_bad_input_shm() {
-        let tool = ProdigalTool;
-        let config = serde_json::json!({"meta_mode": true});
-
-        let response = tool.execute(&config, "/nonexistent-shm-name", 0);
-        assert!(!response.success);
-        assert!(response.error.unwrap().contains("Failed to open shm"));
     }
 
     // -- Streaming context tests --
@@ -1882,17 +1839,14 @@ mod tests {
             c_buf_to_string(&msg)
         };
         let tool = ProdigalTool;
-        let input_name = unique_shm_name("pd-refused");
-        let input_shm = write_arrow_to_shm(&input_name, &prodigal_batch(&["c1"], &[TEST_SEQ_1]));
+        let batch = prodigal_batch(&["c1"], &[TEST_SEQ_1]);
         for config in [
             serde_json::json!({"meta_mode": true, "trans_table": 4}),
             serde_json::json!({"meta_mode": true, "force_nonsd": true}),
             serde_json::json!({"meta_mode": true, "start_weight": 5.0}),
             serde_json::json!({"meta_mode": false, "train_on_batch": true, "trans_table": 1}),
         ] {
-            let response = tool.execute(&config, &input_name, input_shm.len());
-            assert!(!response.success, "{config}: expected a refusal");
-            let err = response.error.unwrap();
+            let err = tool.execute(&config, vec![batch.clone()]).unwrap_err();
             assert!(err.contains(&reason(&config)), "{config}: {err}");
         }
 
@@ -1931,8 +1885,7 @@ mod tests {
             (serde_json::json!({"metamode": false}), "metamode"),
             (serde_json::json!(["meta_mode"]), "object"),
         ] {
-            let response = tool.execute(&config, "/gb-no-such-input", 1);
-            let err = response.error.expect("refused");
+            let err = tool.execute(&config, vec![]).unwrap_err();
             assert!(err.contains(named), "{config}: {err}");
             let err = tool.create_streaming_context(&config).err();
             assert!(err.expect("refused").contains(named), "{config}");
@@ -2025,13 +1978,8 @@ mod tests {
             ('*', 960),
         ] {
             let bad = with(TEST_SEQ_2, at, c);
-            let input_name = unique_shm_name("pd-drop");
             let batch = prodigal_batch(&["c1", "c2"], &[TEST_SEQ_1, &bad]);
-            let input = write_arrow_to_shm(&input_name, &batch);
-            let err = meta
-                .run_batch(&input_name, input.len())
-                .error
-                .expect("refused");
+            let err = meta.run_batch(vec![batch]).unwrap_err();
             let wanted = format!("{c:?} at position {} is outside 'A'..'z'", at + 1);
             assert!(err.contains("'c2'") && err.contains(&wanted), "{err}");
         }
