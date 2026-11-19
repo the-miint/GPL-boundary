@@ -422,6 +422,39 @@ mod tests {
         }
     }
 
+    /// fasttree through the front end, on real shared memory, gives what
+    /// a direct `execute` gives.
+    #[test]
+    fn test_fasttree_on_shm() {
+        use crate::tools::fasttree::{input_schema, FastTreeTool};
+        let batch = RecordBatch::try_new(
+            Arc::new(input_schema()),
+            vec![
+                Arc::new(StringArray::from(vec!["SeqA", "SeqB", "SeqC", "SeqD"])),
+                Arc::new(StringArray::from(vec![
+                    "ACGTACGTACGTACGTACGT",
+                    "ACGTACGTACGTACGTACGA",
+                    "TGCATGCATGCATGCATGCA",
+                    "TGCATGCATGCATGCATGCG",
+                ])),
+            ],
+        )
+        .unwrap();
+        let config = json!({"seq_type": "nucleotide", "seed": 12345});
+        let direct = FastTreeTool.execute(&config, vec![batch.clone()]).unwrap();
+
+        let name = unique_shm_name("fe-fasttree");
+        let holder = write_arrow_to_shm(&name, &batch);
+        let response = OnShm(FastTreeTool).execute(&config, &name, holder.len());
+
+        assert!(response.success, "{:?}", response.error);
+        assert_eq!(response.result.as_ref(), Some(&direct.result));
+        let written = take_outputs(&response);
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].0, "tree");
+        assert_eq!(written[0].1, direct.outputs[0].1);
+    }
+
     #[test]
     fn test_on_shm_serves_a_context_across_batches() {
         let tool = OnShm(RowCounter);

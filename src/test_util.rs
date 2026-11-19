@@ -5,6 +5,7 @@
 
 use crate::protocol::Response;
 use crate::shm::SharedMemory;
+use crate::tools::{ToolDescription, ToolOutput};
 use arrow::array::{Array, Int32Array, StringArray};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -165,6 +166,23 @@ pub fn take_outputs(response: &Response) -> Vec<(String, RecordBatch)> {
             (out.label.clone(), batches.remove(0))
         })
         .collect()
+}
+
+/// Check a tool's output against its description: the output labels, in
+/// order, and each output's columns (name, Arrow type, nullability).
+pub fn assert_outputs_described(desc: &ToolDescription, output: &ToolOutput) {
+    let labels: Vec<&str> = output.outputs.iter().map(|(label, _)| *label).collect();
+    let described: Vec<&str> = desc.outputs.iter().map(|o| o.label).collect();
+    assert_eq!(labels, described, "{}: output labels", desc.name);
+    for ((label, batch), described) in output.outputs.iter().zip(&desc.outputs) {
+        let columns: Vec<_> = (batch.schema().fields().iter())
+            .map(|f| (f.name().clone(), f.data_type().to_string(), f.is_nullable()))
+            .collect();
+        let listed: Vec<_> = (described.schema.iter())
+            .map(|f| (f.name.to_string(), f.arrow_type.to_string(), f.nullable))
+            .collect();
+        assert_eq!(columns, listed, "{}: output {label}", desc.name);
+    }
 }
 
 /// A column of an output batch, by name.

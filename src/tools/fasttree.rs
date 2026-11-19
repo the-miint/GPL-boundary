@@ -1199,10 +1199,8 @@ unsafe fn soa_to_record_batch(tree: &FastTreeSoa) -> Result<RecordBatch, String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shm::SharedMemory;
     use crate::test_util::{
-        extracted_16s_phylip, parse_interleaved_phylip, read_arrow_from_shm, subset_alignment,
-        unique_shm_name, write_arrow_to_shm,
+        assert_outputs_described, extracted_16s_phylip, parse_interleaved_phylip, subset_alignment,
     };
     use arrow::array::{Array, Float64Array};
 
@@ -1248,6 +1246,18 @@ mod tests {
         .unwrap()
     }
 
+    /// The result and the tree of a successful build.
+    fn tree_of(output: ToolOutput) -> (serde_json::Value, RecordBatch) {
+        let ToolOutput {
+            mut outputs,
+            result,
+        } = output;
+        assert_eq!(outputs.len(), 1);
+        let (label, tree) = outputs.remove(0);
+        assert_eq!(label, "tree");
+        (result, tree)
+    }
+
     fn make_input_batch_owned(alignment: &[(String, String)]) -> RecordBatch {
         let schema = Arc::new(input_schema());
         let names: Vec<&str> = alignment.iter().map(|(n, _)| n.as_str()).collect();
@@ -1264,8 +1274,6 @@ mod tests {
 
     #[test]
     fn test_fasttree_nucleotide_roundtrip() {
-        let input_name = unique_shm_name("ft-nt-in");
-
         let batch = make_input_batch(
             &["SeqA", "SeqB", "SeqC", "SeqD"],
             &[
@@ -1276,37 +1284,21 @@ mod tests {
             ],
         );
 
-        // Write input to shm (simulating what miint does)
-        let input_shm = write_arrow_to_shm(&input_name, &batch);
-        let input_shm_size = input_shm.len();
-
-        let tool = FastTreeTool;
         let config = serde_json::json!({
             "seq_type": "nucleotide",
             "seed": 12345
         });
 
-        let response = tool.execute(&config, &input_name, input_shm_size);
-        assert!(response.success, "FastTree failed: {:?}", response.error);
-
-        // Response should contain output shm info
-        assert_eq!(response.shm_outputs.len(), 1);
-        let output_name = &response.shm_outputs[0].name;
-        let output_size = response.shm_outputs[0].size;
-        assert!(output_size > 0);
-        assert!(output_name.starts_with("/gb-"));
-        assert_eq!(response.shm_outputs[0].label, "tree");
+        let output = FastTreeTool
+            .execute(&config, vec![batch])
+            .expect("FastTree failed");
+        assert_outputs_described(&FastTreeTool.describe(), &output);
+        let (result, out) = tree_of(output);
 
         // Verify JSON metadata
-        let result = response.result.unwrap();
         assert_eq!(result["n_leaves"], 4);
         assert!(result["n_nodes"].as_i64().unwrap() >= 4);
         assert!(result["stats"]["log_likelihood"].as_f64().unwrap() < 0.0);
-
-        // Verify Arrow IPC output in shared memory
-        let out_batches = read_arrow_from_shm(output_name, output_size);
-        assert_eq!(out_batches.len(), 1);
-        let out = &out_batches[0];
 
         let n_nodes = result["n_nodes"].as_i64().unwrap() as usize;
         assert_eq!(out.num_rows(), n_nodes);
@@ -1406,60 +1398,45 @@ mod tests {
                 "edge_id convention: == node_index for non-root nodes"
             );
         }
+    }
 
-        // Caller cleans up output shm (simulating what miint does)
-        let _ = SharedMemory::unlink(output_name);
+    /// A NUL byte cannot pass to the C library in a name or a sequence:
+    /// it is refused, not a panic.
+    #[test]
+    fn test_a_nul_byte_is_refused() {
+        let seqs = ["ACGTACGT", "ACGTACGA", "TGCATGCA", "TGCATGCG"];
+        let config = serde_json::json!({"seq_type": "nucleotide"});
+        let names = make_input_batch(&["A", "B\0", "C", "D"], &seqs);
+        let err = FastTreeTool.execute(&config, vec![names]).unwrap_err();
+        assert!(err.contains("NUL"), "{err}");
+        let sequences = make_input_batch(
+            &["A", "B", "C", "D"],
+            &["ACGTACG\0", seqs[1], seqs[2], seqs[3]],
+        );
+        let err = FastTreeTool.execute(&config, vec![sequences]).unwrap_err();
+        assert!(err.contains("NUL"), "{err}");
     }
 
     #[test]
     fn test_fasttree_protein_roundtrip() {
-        let input_name = unique_shm_name("ft-aa-in");
-
         let batch = make_input_batch(
             &["ProtA", "ProtB", "ProtC", "ProtD"],
             &["ARNDCQEGHI", "ARNDCQEGHL", "LKMFPSTWYV", "LKMFPSTWYA"],
         );
-
-        let input_shm = write_arrow_to_shm(&input_name, &batch);
-        let input_shm_size = input_shm.len();
-
-        let tool = FastTreeTool;
         let config = serde_json::json!({
             "seq_type": "protein",
             "seed": 12345
         });
 
-        let response = tool.execute(&config, &input_name, input_shm_size);
-        assert!(
-            response.success,
-            "FastTree protein failed: {:?}",
-            response.error
-        );
-
-        assert_eq!(response.shm_outputs.len(), 1);
-        let output_name = &response.shm_outputs[0].name;
-        let output_size = response.shm_outputs[0].size;
-        let result = response.result.unwrap();
+        let output = FastTreeTool
+            .execute(&config, vec![batch])
+            .expect("FastTree protein failed");
+        let (result, tree) = tree_of(output);
         assert_eq!(result["n_leaves"], 4);
-
-        let out_batches = read_arrow_from_shm(output_name, output_size);
-        assert_eq!(out_batches.len(), 1);
         assert_eq!(
-            out_batches[0].num_rows(),
+            tree.num_rows(),
             result["n_nodes"].as_i64().unwrap() as usize
         );
-
-        let _ = SharedMemory::unlink(output_name);
-    }
-
-    #[test]
-    fn test_fasttree_bad_input_shm() {
-        let tool = FastTreeTool;
-        let config = serde_json::json!({"seq_type": "nucleotide"});
-
-        let response = tool.execute(&config, "/nonexistent-shm-name", 0);
-        assert!(!response.success);
-        assert!(response.error.unwrap().contains("Failed to open shm"));
     }
 
     /// Unit test for the schema-v2 sentinel→NULL emission path. Builds a
@@ -1598,25 +1575,16 @@ mod tests {
         let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
         assert_eq!(alignment.len(), 50);
 
-        let input_name = unique_shm_name("ft-16s-50");
         let batch = make_input_batch_owned(&alignment);
-        let input_shm = write_arrow_to_shm(&input_name, &batch);
-        let input_shm_size = input_shm.len();
-
-        let tool = FastTreeTool;
         let config = serde_json::json!({
             "seq_type": "nucleotide",
             "seed": 12345,
         });
 
-        let response = tool.execute(&config, &input_name, input_shm_size);
-        assert!(
-            response.success,
-            "16S smoke: FastTree failed: {:?}",
-            response.error
-        );
-
-        let result = response.result.expect("result metadata");
+        let output = FastTreeTool
+            .execute(&config, vec![batch])
+            .expect("16S smoke: FastTree failed");
+        let (result, out) = tree_of(output);
         let n_leaves = result["n_leaves"].as_i64().expect("n_leaves") as usize;
         let n_nodes = result["n_nodes"].as_i64().expect("n_nodes") as usize;
         // FastTree dedups identical sequences; in practice the 16S.1.p
@@ -1629,10 +1597,6 @@ mod tests {
 
         // Tree-shape invariant: sum of n_children == n_nodes - 1
         // (every non-root node is someone's child exactly once).
-        let output_name = &response.shm_outputs[0].name;
-        let output_size = response.shm_outputs[0].size;
-        let out_batches = read_arrow_from_shm(output_name, output_size);
-        let out = &out_batches[0];
         let n_children = out
             .column_by_name("n_children")
             .unwrap()
@@ -1641,8 +1605,6 @@ mod tests {
             .unwrap();
         let total: i64 = (0..n_nodes).map(|i| n_children.value(i) as i64).sum();
         assert_eq!(total, (n_nodes - 1) as i64);
-
-        let _ = SharedMemory::unlink(output_name);
     }
 
     /// Phase 0 sanity: `fasttree_tree_soa_to_newick` round-trips the
@@ -2352,24 +2314,17 @@ mod tests {
     fn test_threads_4_sanity() {
         let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
 
-        let input_name = unique_shm_name("ft-threads-4");
         let batch = make_input_batch_owned(&alignment);
-        let shm_holder = write_arrow_to_shm(&input_name, &batch);
-        let shm_holder_size = shm_holder.len();
-        let resp = FastTreeTool.execute(
-            &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "threads": 4}),
-            &input_name,
-            shm_holder_size,
-        );
-        assert!(resp.success, "threads=4 failed: {:?}", resp.error);
-
-        let result = resp.result.as_ref().unwrap();
+        let output = FastTreeTool
+            .execute(
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "threads": 4}),
+                vec![batch],
+            )
+            .expect("threads=4 failed");
+        let (result, out) = tree_of(output);
         let n_nodes = result["n_nodes"].as_i64().unwrap() as usize;
         let n_leaves = result["n_leaves"].as_i64().unwrap() as usize;
         assert_eq!(n_leaves, alignment.len(), "no leaves lost at threads=4");
-
-        let out_batches = read_arrow_from_shm(&resp.shm_outputs[0].name, resp.shm_outputs[0].size);
-        let out = &out_batches[0];
 
         // Every input name appears as a tip exactly once.
         let names_col = out
@@ -2411,8 +2366,6 @@ mod tests {
             lk.is_finite() && lk < 0.0,
             "log_likelihood not finite-negative: {lk}"
         );
-
-        let _ = SharedMemory::unlink(&resp.shm_outputs[0].name);
     }
 
     /// `threads=0` is rejected — the C library treats 0 as "consult
@@ -3014,45 +2967,33 @@ mod tests {
     fn test_gamma_response_stats() {
         let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 50);
 
-        let input_with = unique_shm_name("ft-gamma-with");
-        let shm_with = write_arrow_to_shm(&input_with, &make_input_batch_owned(&alignment));
-        let shm_with_size = shm_with.len();
-        let resp_with = FastTreeTool.execute(
-            &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "gamma": true}),
-            &input_with,
-            shm_with_size,
-        );
-        assert!(
-            resp_with.success,
-            "gamma=true failed: {:?}",
-            resp_with.error
-        );
-        let glk = resp_with.result.as_ref().unwrap()["stats"]["gamma_log_lk"]
+        let with = FastTreeTool
+            .execute(
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345, "gamma": true}),
+                vec![make_input_batch_owned(&alignment)],
+            )
+            .expect("gamma=true failed");
+        let glk = with.result["stats"]["gamma_log_lk"]
             .as_f64()
             .expect("gamma_log_lk");
         assert!(
             glk.is_finite() && glk < 0.0,
             "gamma_log_lk should be finite-negative when gamma=true, got {glk}"
         );
-        let _ = SharedMemory::unlink(&resp_with.shm_outputs[0].name);
 
-        let input_without = unique_shm_name("ft-gamma-without");
-        let shm_without = write_arrow_to_shm(&input_without, &make_input_batch_owned(&alignment));
-        let shm_without_size = shm_without.len();
-        let resp_without = FastTreeTool.execute(
-            &serde_json::json!({"seq_type": "nucleotide", "seed": 12345}),
-            &input_without,
-            shm_without_size,
-        );
-        assert!(resp_without.success);
-        let glk_off = resp_without.result.as_ref().unwrap()["stats"]["gamma_log_lk"]
+        let without = FastTreeTool
+            .execute(
+                &serde_json::json!({"seq_type": "nucleotide", "seed": 12345}),
+                vec![make_input_batch_owned(&alignment)],
+            )
+            .expect("gamma absent failed");
+        let glk_off = without.result["stats"]["gamma_log_lk"]
             .as_f64()
             .expect("gamma_log_lk");
         assert_eq!(
             glk_off, -1.0,
             "gamma absent should leave gamma_log_lk at the -1.0 sentinel, got {glk_off}"
         );
-        let _ = SharedMemory::unlink(&resp_without.shm_outputs[0].name);
     }
 
     /// `gamma=true` rescales branch lengths by the fitted gamma
