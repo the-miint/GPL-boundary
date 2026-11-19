@@ -6,7 +6,7 @@ use crate::tools::{
     ToolDescription, ToolOutput,
 };
 use arrow::array::{
-    BooleanArray, Float64Builder, Int32Array, Int64Array, Int64Builder, StringArray,
+    Array, BooleanArray, Float64Builder, Int32Array, Int64Array, Int64Builder, StringArray,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -660,7 +660,8 @@ inventory::submit! {
 }
 
 impl FastTreeTool {
-    /// The names and sequences of the input batches, copied out.
+    /// The names and sequences of the input batches, copied out. A null
+    /// is refused, naming its input row.
     fn read_input(batches: &[RecordBatch]) -> Result<(Vec<String>, Vec<String>), String> {
         let mut all_names = Vec::new();
         let mut all_seqs = Vec::new();
@@ -681,6 +682,14 @@ impl FastTreeTool {
                 .ok_or("'sequence' column is not Utf8")?;
 
             for i in 0..batch.num_rows() {
+                // 1-based, across the batches
+                let row = all_names.len() + 1;
+                if name_col.is_null(i) {
+                    return Err(format!("input row {row}: null name"));
+                }
+                if seq_col.is_null(i) {
+                    return Err(format!("input row {row}: null sequence"));
+                }
                 all_names.push(name_col.value(i).to_string());
                 all_seqs.push(seq_col.value(i).to_string());
             }
@@ -1396,6 +1405,41 @@ mod tests {
         );
         let err = FastTreeTool.execute(&config, vec![sequences]).unwrap_err();
         assert!(err.contains("NUL"), "{err}");
+    }
+
+    /// A null name or sequence is refused, naming its input row (counted
+    /// across batches), rather than read as an empty string.
+    #[test]
+    fn test_a_null_is_refused() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("sequence", DataType::Utf8, true),
+        ]));
+        let batch = |names: Vec<Option<&str>>, seqs: Vec<Option<&str>>| {
+            let columns: Vec<arrow::array::ArrayRef> = vec![
+                Arc::new(StringArray::from(names)),
+                Arc::new(StringArray::from(seqs)),
+            ];
+            RecordBatch::try_new(schema.clone(), columns).unwrap()
+        };
+        let config = serde_json::json!({"seq_type": "nucleotide"});
+        let first = batch(
+            vec![Some("A"), Some("B")],
+            vec![Some("ACGTACGT"), Some("ACGTACGA")],
+        );
+
+        let null_name = batch(
+            vec![Some("C"), None],
+            vec![Some("TGCATGCA"), Some("TGCATGCG")],
+        );
+        let input = vec![first.clone(), null_name];
+        let err = FastTreeTool.execute(&config, input).unwrap_err();
+        assert!(err.contains("input row 4: null name"), "{err}");
+
+        let null_sequence = batch(vec![Some("C"), Some("D")], vec![None, Some("TGCATGCG")]);
+        let input = vec![first, null_sequence];
+        let err = FastTreeTool.execute(&config, input).unwrap_err();
+        assert!(err.contains("input row 3: null sequence"), "{err}");
     }
 
     #[test]
