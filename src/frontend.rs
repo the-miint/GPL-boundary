@@ -18,7 +18,6 @@ use crate::tools::ToolOutput;
 /// Run `call` on the Arrow stream in the `shm_input` segment, whose first
 /// `shm_input_size` bytes hold it, and write its outputs to new segments.
 /// An input that cannot be mapped or decoded fails before `call` runs.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn run_on_shm(
     shm_input: &str,
     shm_input_size: usize,
@@ -31,7 +30,6 @@ pub(crate) fn run_on_shm(
 }
 
 /// `run_on_shm` from the mapped input on.
-#[cfg_attr(not(test), allow(dead_code))]
 fn run_on_buffer(
     input: Buffer,
     call: impl FnOnce(Vec<RecordBatch>) -> Result<ToolOutput, String>,

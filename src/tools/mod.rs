@@ -268,7 +268,7 @@ pub trait ShmTool {
 /// Each output record batch owns its memory. One must not view memory the
 /// C library frees, since the front end writes it out after the call has
 /// returned and the tool has released its C state.
-#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
 pub struct ToolOutput {
     pub outputs: Vec<(&'static str, RecordBatch)>,
     pub result: serde_json::Value,
@@ -282,7 +282,6 @@ pub struct ToolOutput {
 /// `Send` because a context is made on one thread, then used and dropped
 /// on its worker's own thread, so the C state it holds must not be tied
 /// to the thread that made it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub trait StreamingContext: Send {
     /// Run one batch against the context. Input, output and errors are
     /// those of `GplTool::execute`. An error fails only this batch: the
@@ -296,7 +295,6 @@ pub trait StreamingContext: Send {
 ///
 /// `Send` so that a worker can make the tool on one thread and run it on
 /// its own.
-#[cfg_attr(not(test), allow(dead_code))]
 pub trait GplTool: Send {
     fn name(&self) -> &str;
     fn version(&self) -> String;
@@ -339,7 +337,6 @@ pub trait GplTool: Send {
 
 /// A `GplTool` served through `ShmTool`, by way of the native front end,
 /// for the dispatch, which takes `ShmTool`s.
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct OnShm<T>(pub T);
 
 impl<T: GplTool> ShmTool for OnShm<T> {
@@ -382,7 +379,6 @@ impl<T: GplTool> ShmTool for OnShm<T> {
 }
 
 /// A `StreamingContext` served through `ShmContext` (see `OnShm`).
-#[cfg_attr(not(test), allow(dead_code))]
 struct ContextOnShm(Box<dyn StreamingContext>);
 
 impl ShmContext for ContextOnShm {

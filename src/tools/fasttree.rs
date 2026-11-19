@@ -1,9 +1,9 @@
-//! FastTree adapter: reads Arrow IPC from shared memory, runs fasttree,
-//! writes SOA tree as Arrow IPC back to shared memory.
+//! FastTree adapter: takes the alignment as record batches, runs fasttree,
+//! and returns the SOA tree as a record batch.
 
-use crate::protocol::{Response, ShmOutput};
 use crate::tools::{
-    checked_cint, ConfigParam, FieldDescription, OutputDescription, ShmTool, ToolDescription,
+    checked_cint, ConfigParam, FieldDescription, GplTool, OnShm, OutputDescription,
+    ToolDescription, ToolOutput,
 };
 use arrow::array::{
     BooleanArray, Float64Builder, Int32Array, Int64Array, Int64Builder, StringArray,
@@ -597,24 +597,75 @@ fn apply_json_to_config(
 
 pub struct FastTreeTool;
 
+/// The tree output: one row per node, in the SOA's node order. Its
+/// columns, as --describe lists them, are `soa_to_record_batch`'s.
+const TREE: OutputDescription = OutputDescription {
+    label: "tree",
+    schema: &[
+        FieldDescription {
+            name: "node_index",
+            arrow_type: "Int64",
+            nullable: false,
+            description: "Node index [0, n_nodes)",
+        },
+        FieldDescription {
+            name: "parent_index",
+            arrow_type: "Int64",
+            nullable: true,
+            description: "Parent node's node_index; NULL for the root",
+        },
+        FieldDescription {
+            name: "edge_id",
+            arrow_type: "Int64",
+            nullable: true,
+            description: "Inbound-edge join key (= node_index for non-root); NULL for the root",
+        },
+        FieldDescription {
+            name: "branch_length",
+            arrow_type: "Float64",
+            nullable: true,
+            description: "Branch length to parent; NULL when the C library emits NaN",
+        },
+        FieldDescription {
+            name: "support",
+            arrow_type: "Float64",
+            nullable: true,
+            description: "SH-like local support [0, 1]; NULL when not computed",
+        },
+        FieldDescription {
+            name: "n_children",
+            arrow_type: "Int32",
+            nullable: false,
+            description: "Number of children (0 for tips)",
+        },
+        FieldDescription {
+            name: "is_tip",
+            arrow_type: "Boolean",
+            nullable: false,
+            description: "Whether node is a tip (formerly is_leaf)",
+        },
+        FieldDescription {
+            name: "name",
+            arrow_type: "Utf8",
+            nullable: true,
+            description: "Tip name (NULL for internal nodes)",
+        },
+    ],
+};
+
 inventory::submit! {
     crate::tools::ToolRegistration {
-        create: || Box::new(FastTreeTool),
+        create: || Box::new(OnShm(FastTreeTool)),
     }
 }
 
 impl FastTreeTool {
-    /// Read Arrow IPC stream from shared memory, extract name and sequence columns.
-    fn read_input(
-        shm_input: &str,
-        shm_input_size: usize,
-    ) -> Result<(Vec<String>, Vec<String>), String> {
-        let batches = crate::arrow_ipc::read_batches_from_shm(shm_input, shm_input_size)?;
-
+    /// The names and sequences of the input batches, copied out.
+    fn read_input(batches: &[RecordBatch]) -> Result<(Vec<String>, Vec<String>), String> {
         let mut all_names = Vec::new();
         let mut all_seqs = Vec::new();
 
-        for batch in &batches {
+        for batch in batches {
             let name_col = batch
                 .column_by_name("name")
                 .ok_or("Input missing 'name' column")?
@@ -637,16 +688,9 @@ impl FastTreeTool {
 
         Ok((all_names, all_seqs))
     }
-
-    /// Convert SOA tree to Arrow RecordBatch and write as IPC to a new shared
-    /// memory region. Returns ShmOutput with name, label, and byte count.
-    fn write_output(tree: &FastTreeSoa) -> Result<ShmOutput, String> {
-        let batch = unsafe { soa_to_record_batch(tree)? };
-        crate::arrow_ipc::write_batch_to_output_shm(&batch, "tree")
-    }
 }
 
-impl ShmTool for FastTreeTool {
+impl GplTool for FastTreeTool {
     fn name(&self) -> &str {
         "fasttree"
     }
@@ -882,60 +926,7 @@ impl ShmTool for FastTreeTool {
                     description: "Aligned sequence (all must be equal length)",
                 },
             ],
-            outputs: vec![OutputDescription {
-                label: "tree",
-                schema: &[
-                FieldDescription {
-                    name: "node_index",
-                    arrow_type: "Int64",
-                    nullable: false,
-                    description: "Node index [0, n_nodes)",
-                },
-                FieldDescription {
-                    name: "parent_index",
-                    arrow_type: "Int64",
-                    nullable: true,
-                    description: "Parent node's node_index; NULL for the root",
-                },
-                FieldDescription {
-                    name: "edge_id",
-                    arrow_type: "Int64",
-                    nullable: true,
-                    description:
-                        "Inbound-edge join key (= node_index for non-root); NULL for the root",
-                },
-                FieldDescription {
-                    name: "branch_length",
-                    arrow_type: "Float64",
-                    nullable: true,
-                    description: "Branch length to parent; NULL when the C library emits NaN",
-                },
-                FieldDescription {
-                    name: "support",
-                    arrow_type: "Float64",
-                    nullable: true,
-                    description: "SH-like local support [0, 1]; NULL when not computed",
-                },
-                FieldDescription {
-                    name: "n_children",
-                    arrow_type: "Int32",
-                    nullable: false,
-                    description: "Number of children (0 for tips)",
-                },
-                FieldDescription {
-                    name: "is_tip",
-                    arrow_type: "Boolean",
-                    nullable: false,
-                    description: "Whether node is a tip (formerly is_leaf)",
-                },
-                FieldDescription {
-                    name: "name",
-                    arrow_type: "Utf8",
-                    nullable: true,
-                    description: "Tip name (NULL for internal nodes)",
-                },
-            ],
-            }],
+            outputs: vec![TREE],
             response_metadata: vec![
                 FieldDescription {
                     name: "n_nodes",
@@ -998,48 +989,43 @@ impl ShmTool for FastTreeTool {
     fn execute(
         &self,
         config: &serde_json::Value,
-        shm_input: &str,
-        shm_input_size: usize,
-    ) -> Response {
-        // Read input alignment from Arrow IPC in shared memory
-        let (names, sequences) = match Self::read_input(shm_input, shm_input_size) {
-            Ok(data) => data,
-            Err(e) => return Response::error(e),
-        };
+        input: Vec<RecordBatch>,
+    ) -> Result<ToolOutput, String> {
+        let (names, sequences) = Self::read_input(&input)?;
+        // Copied out: release the input before the build
+        drop(input);
 
         if names.len() < 3 {
-            return Response::error("At least 3 sequences required");
+            return Err("At least 3 sequences required".to_string());
         }
 
         let n_seq = names.len() as c_int;
         let n_pos = sequences[0].len() as c_int;
 
         if sequences.iter().any(|s| s.len() as c_int != n_pos) {
-            return Response::error("All sequences must have the same length (aligned)");
+            return Err("All sequences must have the same length (aligned)".to_string());
         }
 
         // Convert to C strings for fasttree
-        let c_names: Vec<CString> = names
-            .iter()
-            .map(|n| CString::new(n.as_str()).unwrap())
-            .collect();
-        let c_seqs: Vec<CString> = sequences
-            .iter()
-            .map(|s| CString::new(s.as_str()).unwrap())
-            .collect();
+        let c_strings = |strings: &[String], what: &str| {
+            (strings.iter())
+                .map(|s| CString::new(s.as_str()))
+                .collect::<Result<Vec<CString>, _>>()
+                .map_err(|e| format!("A {what} holds a NUL byte at {}", e.nul_position()))
+        };
+        let c_names = c_strings(&names, "name")?;
+        let c_seqs = c_strings(&sequences, "sequence")?;
         let c_name_ptrs: Vec<*const c_char> = c_names.iter().map(|n| n.as_ptr()).collect();
         let c_seq_ptrs: Vec<*const c_char> = c_seqs.iter().map(|s| s.as_ptr()).collect();
 
         unsafe {
             let mut ft_config: FastTreeConfig = std::mem::zeroed();
             fasttree_config_init(&mut ft_config);
-            if let Err(e) = apply_json_to_config(config, &mut ft_config) {
-                return Response::error(e);
-            }
+            apply_json_to_config(config, &mut ft_config)?;
 
             let ctx = fasttree_create(&ft_config);
             if ctx.is_null() {
-                return Response::error("Failed to create fasttree context (out of memory)");
+                return Err("Failed to create fasttree context (out of memory)".to_string());
             }
 
             let mut tree: *mut FastTreeSoa = ptr::null_mut();
@@ -1063,20 +1049,12 @@ impl ShmTool for FastTreeTool {
                     .to_string_lossy()
                     .into_owned();
                 fasttree_destroy(ctx);
-                return Response::error(format!("{code_msg}: {err_msg}"));
+                return Err(format!("{code_msg}: {err_msg}"));
             }
 
-            // Write tree as Arrow IPC to a new output shared memory region
-            let shm_out = match Self::write_output(&*tree) {
-                Ok(v) => v,
-                Err(e) => {
-                    fasttree_tree_soa_free(tree);
-                    fasttree_destroy(ctx);
-                    return Response::error(e);
-                }
-            };
-
-            // Build lightweight stats for JSON response
+            // The batch copies the tree, so both are freed here, on
+            // either outcome of the conversion.
+            let batch = soa_to_record_batch(&*tree);
             let result = serde_json::json!({
                 "n_nodes": (*tree).n_nodes,
                 "n_leaves": (*tree).n_leaves,
@@ -1094,7 +1072,10 @@ impl ShmTool for FastTreeTool {
             fasttree_tree_soa_free(tree);
             fasttree_destroy(ctx);
 
-            Response::ok(result, vec![shm_out])
+            Ok(ToolOutput {
+                outputs: vec![(TREE.label, batch?)],
+                result,
+            })
         }
     }
 }
