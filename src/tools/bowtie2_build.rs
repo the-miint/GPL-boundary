@@ -465,7 +465,6 @@ impl ShmTool for Bowtie2BuildTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{unique_shm_name, write_arrow_to_shm};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
@@ -507,16 +506,12 @@ mod tests {
 
     #[test]
     fn test_missing_index_path() {
-        // Validates that index_path is rejected before we touch the shm at
-        // all — pass a name that doesn't exist, and rely on the validation
-        // failing first. If the field-order in execute() is ever reshuffled
-        // and shm is read before config validation, this test will start
-        // failing with an "open shm" error and that's a deliberate signal
-        // to put validation back in front.
+        // index_path is checked before the input: with no input at all, the
+        // error still names index_path. If execute() ever reads the input
+        // first, this fails with "At least 1 sequence required" instead.
         let tool = Bowtie2BuildTool;
-        let resp = tool.execute(&serde_json::json!({}), "/never-created-bt2-shm", 0);
-        assert!(!resp.success);
-        assert!(resp.error.unwrap().contains("index_path"));
+        let err = tool.execute(&serde_json::json!({}), vec![]).unwrap_err();
+        assert!(err.contains("index_path"), "{err}");
     }
 
     fn make_batch(names: &[&str], seqs: &[&str]) -> RecordBatch {
@@ -536,14 +531,11 @@ mod tests {
 
     #[test]
     fn test_rejects_name_with_newline() {
-        let shm = unique_shm_name("bt2b-bad-name-nl");
         let batch = make_batch(&["bad\nname"], &["ACGT"]);
-        let holder = write_arrow_to_shm(&shm, &batch);
-        let err = match read_input(&shm, holder.len()) {
+        let err = match read_input(&[batch]) {
             Err(e) => e,
             Ok(_) => panic!("Expected error for name containing newline"),
         };
-        let _ = crate::shm::SharedMemory::unlink(&shm);
         assert!(err.contains("whitespace"), "Unexpected error: {err}");
     }
 
@@ -552,28 +544,22 @@ mod tests {
         // bowtie2 silently truncates `chr1 dna:primary` to `chr1`. Detect
         // the bad input here so the user gets an explanation, not a quiet
         // mismatch between input names and aligned output names.
-        let shm = unique_shm_name("bt2b-bad-name-sp");
         let batch = make_batch(&["chr1 dna:primary"], &["ACGT"]);
-        let holder = write_arrow_to_shm(&shm, &batch);
-        let err = match read_input(&shm, holder.len()) {
+        let err = match read_input(&[batch]) {
             Err(e) => e,
             Ok(_) => panic!("Expected error for name containing space"),
         };
-        let _ = crate::shm::SharedMemory::unlink(&shm);
         assert!(err.contains("whitespace"), "Unexpected error: {err}");
         assert!(err.contains("truncate"), "Error should explain why: {err}");
     }
 
     #[test]
     fn test_rejects_empty_name() {
-        let shm = unique_shm_name("bt2b-empty-name");
         let batch = make_batch(&[""], &["ACGT"]);
-        let holder = write_arrow_to_shm(&shm, &batch);
-        let err = match read_input(&shm, holder.len()) {
+        let err = match read_input(&[batch]) {
             Err(e) => e,
             Ok(_) => panic!("Expected error for empty name"),
         };
-        let _ = crate::shm::SharedMemory::unlink(&shm);
         assert!(err.contains("empty"), "Unexpected error: {err}");
     }
 
