@@ -3,9 +3,11 @@ use std::io::Write;
 use std::os::raw::{c_char, c_int, c_void};
 
 use arrow::array::StringArray;
+use arrow::record_batch::RecordBatch;
 
-use crate::protocol::Response;
-use crate::tools::{ConfigParam, FieldDescription, ShmTool, ToolDescription, ToolRegistration};
+use crate::tools::{
+    ConfigParam, FieldDescription, GplTool, OnShm, ToolDescription, ToolOutput, ToolRegistration,
+};
 
 // ---------------------------------------------------------------------------
 // FFI bindings — mirror ext/bowtie2/bt2_api.h (build API)
@@ -87,7 +89,7 @@ pub struct Bowtie2BuildTool;
 
 inventory::submit! {
     ToolRegistration {
-        create: || Box::new(Bowtie2BuildTool),
+        create: || Box::new(OnShm(Bowtie2BuildTool)),
     }
 }
 
@@ -101,12 +103,11 @@ struct BuildInput {
     n_bases: i64,
 }
 
-fn read_input(shm_input: &str, shm_input_size: usize) -> Result<BuildInput, String> {
-    let batches = crate::arrow_ipc::read_batches_from_shm(shm_input, shm_input_size)?;
+fn read_input(batches: &[RecordBatch]) -> Result<BuildInput, String> {
     let mut names = Vec::new();
     let mut seqs = Vec::new();
     let mut n_bases: i64 = 0;
-    for batch in &batches {
+    for batch in batches {
         let name_col = batch
             .column_by_name("name")
             .ok_or("Input missing 'name' column")?
@@ -195,10 +196,10 @@ fn collect_index_files(index_path: &str) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// ShmTool implementation
+// GplTool implementation
 // ---------------------------------------------------------------------------
 
-impl ShmTool for Bowtie2BuildTool {
+impl GplTool for Bowtie2BuildTool {
     fn name(&self) -> &str {
         "bowtie2-build"
     }
@@ -311,28 +312,21 @@ impl ShmTool for Bowtie2BuildTool {
     fn execute(
         &self,
         config: &serde_json::Value,
-        shm_input: &str,
-        shm_input_size: usize,
-    ) -> Response {
-        let index_path = match config.get("index_path").and_then(|v| v.as_str()) {
-            Some(s) => s.to_string(),
-            None => {
-                return Response::error("index_path is required (output basename for .bt2 files)");
-            }
-        };
+        input: Vec<RecordBatch>,
+    ) -> Result<ToolOutput, String> {
+        let index_path = (config.get("index_path").and_then(|v| v.as_str()))
+            .ok_or("index_path is required (output basename for .bt2 files)")?
+            .to_string();
 
         let verbose = config
             .get("verbose")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let input = match read_input(shm_input, shm_input_size) {
-            Ok(v) => v,
-            Err(e) => return Response::error(e),
-        };
+        let input = read_input(&input)?;
 
         if input.names.is_empty() {
-            return Response::error("At least 1 sequence required");
+            return Err("At least 1 sequence required".to_string());
         }
         let n_seqs = input.names.len() as i64;
         let n_bases = input.n_bases;
@@ -340,26 +334,17 @@ impl ShmTool for Bowtie2BuildTool {
         // Materialize a tempfile FASTA. Suboptimal: bowtie2's C builder API
         // only accepts disk paths today (`ref_paths`). Phase 6 adds an
         // in-memory path — see GUIDANCE_BT2_BUILD_API.md.
-        let tmpfile = match tempfile::Builder::new()
+        let tmpfile = (tempfile::Builder::new()
             .prefix("gb-bt2-build-")
-            .suffix(".fa")
-            .tempfile()
-        {
-            Ok(f) => f,
-            Err(e) => return Response::error(format!("Failed to create FASTA tempfile: {e}")),
-        };
-        if let Err(e) = write_fasta(tmpfile.path(), &input) {
-            return Response::error(e);
-        }
+            .suffix(".fa"))
+        .tempfile()
+        .map_err(|e| format!("Failed to create FASTA tempfile: {e}"))?;
+        write_fasta(tmpfile.path(), &input)?;
 
-        let ref_path_c = match CString::new(tmpfile.path().to_string_lossy().as_ref()) {
-            Ok(c) => c,
-            Err(_) => return Response::error("FASTA tempfile path contains a null byte"),
-        };
-        let output_base_c = match CString::new(index_path.as_str()) {
-            Ok(c) => c,
-            Err(_) => return Response::error("index_path contains a null byte"),
-        };
+        let ref_path_c = CString::new(tmpfile.path().to_string_lossy().as_ref())
+            .map_err(|_| "FASTA tempfile path contains a null byte")?;
+        let output_base_c =
+            CString::new(index_path.as_str()).map_err(|_| "index_path contains a null byte")?;
         let ref_ptrs: [*const c_char; 1] = [ref_path_c.as_ptr()];
 
         // SAFETY: `bt2.ref_paths`, `bt2.output_base`, and the `ref_ptrs`
@@ -402,7 +387,7 @@ impl ShmTool for Bowtie2BuildTool {
                 let cat = CStr::from_ptr(bt2_strerror(error_code))
                     .to_string_lossy()
                     .into_owned();
-                return Response::error(format!("Failed to create bowtie2 build context: {cat}"));
+                return Err(format!("Failed to create bowtie2 build context: {cat}"));
             }
 
             let mut stats: Bt2BuildStats = std::mem::zeroed();
@@ -415,7 +400,7 @@ impl ShmTool for Bowtie2BuildTool {
                     .to_string_lossy()
                     .into_owned();
                 bt2_build_destroy(ctx);
-                return Response::error(format!("{cat}: {detail}"));
+                return Err(format!("{cat}: {detail}"));
             }
 
             bt2_build_destroy(ctx);
@@ -438,7 +423,7 @@ impl ShmTool for Bowtie2BuildTool {
             .filter(|s| index_files.iter().any(|f| f.ends_with(*s)))
             .count();
         if small_count != INDEX_SUFFIXES_SMALL.len() && large_count != INDEX_SUFFIXES_LARGE.len() {
-            return Response::error(format!(
+            return Err(format!(
                 "bowtie2-build returned success but only {} of {} index files \
                  were found at {} (found: {:?}). The index is incomplete.",
                 index_files.len(),
@@ -454,7 +439,10 @@ impl ShmTool for Bowtie2BuildTool {
             "n_bases": n_bases,
             "index_files": index_files,
         });
-        Response::ok(result, vec![])
+        Ok(ToolOutput {
+            outputs: vec![],
+            result,
+        })
     }
 }
 

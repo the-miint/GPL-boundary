@@ -21,9 +21,10 @@
 //!
 //! ## Reading: zero-copy reader via `Buffer::from_custom_allocation`
 //!
-//! `read_batches_from_shm` reads a segment in two steps, each public:
+//! The front end (`crate::frontend`) reads a segment in two steps:
 //! `map_shm` maps the segment as a `Buffer`, and `decode_stream` decodes
-//! the batches from any `Buffer`, shared memory or not. `map_shm` takes an
+//! the batches from any `Buffer`, shared memory or not (tests read output
+//! segments the same way, through `read_batches_from_shm`). `map_shm` takes an
 //! explicit `size`: callers must supply the data length out-of-band (from
 //! `BatchRequest::shm_input_size` for inputs, or `ShmOutput::size` for
 //! outputs). `fstat` is **not** consulted — Darwin POSIX shm has
@@ -325,10 +326,18 @@ impl Drop for ShmOutputs {
 }
 
 /// Read all RecordBatches from an Arrow IPC stream in a shared memory
-/// segment. `size` must be the exact data byte count — for input segments
-/// it comes from `BatchRequest::shm_input_size`, for output segments from
-/// `ShmOutput::size`. Only that many bytes are mapped, regardless of what
-/// `fstat` would report for the underlying shm fd.
+/// segment (`map_shm`, then `decode_stream`). Test-only: the daemon reads
+/// its input through the front end, and the caller reads the outputs.
+#[cfg(test)]
+pub fn read_batches_from_shm(shm_name: &str, size: usize) -> Result<Vec<RecordBatch>, String> {
+    decode_stream(map_shm(shm_name, size)?)
+}
+
+/// Map the first `size` bytes of a segment read-only, as a `Buffer` that
+/// owns the mapping. `size` must be the exact data byte count — for input
+/// segments it comes from `BatchRequest::shm_input_size`, for output
+/// segments from `ShmOutput::size`. Only that many bytes are mapped,
+/// regardless of what `fstat` would report for the underlying shm fd.
 ///
 /// `fstat` is **not** used to size the mapping. Darwin POSIX shm has
 /// inconsistent `fstat` semantics for our usage pattern (the segment is
@@ -340,24 +349,14 @@ impl Drop for ShmOutputs {
 /// Zero-copy: the read-only mmap (`ReadOnlyShm`, which is `Send + Sync` by
 /// construction — `O_RDONLY` + `PROT_READ` makes writes a SIGBUS) is
 /// wrapped as an `arrow::buffer::Buffer` via `from_custom_allocation`,
-/// with the mmap itself as the Arc-counted owner.
-/// `StreamDecoder::with_require_alignment(true)` is the load-bearing
-/// zero-copy gate: with the default (false), the decoder silently
-/// allocates and copies into an aligned buffer when an array body's offset
-/// doesn't meet the type's natural alignment. Forcing strict alignment
-/// turns any misalignment into a decode error so a regression to the slow
-/// path is loud, not silent. The mapping survives for as long as any
-/// returned batch (or any column it carries) is alive — including across
-/// `shm_unlink`, since unlink only removes the name.
-pub fn read_batches_from_shm(shm_name: &str, size: usize) -> Result<Vec<RecordBatch>, String> {
-    decode_stream(map_shm(shm_name, size)?)
-}
-
-/// Map the first `size` bytes of a segment read-only, as a `Buffer` that
-/// owns the mapping: the mapping lasts as long as the buffer or anything
-/// sliced from it. See `read_batches_from_shm` for why `size` comes from
-/// the caller. A `size` of 0 maps nothing and gives an empty buffer; it is
-/// an error against a segment that is not empty (`ReadOnlyShm::open`).
+/// with the mmap itself as the Arc-counted owner. The mapping survives for
+/// as long as the buffer, or any batch or column decoded from it, is
+/// alive — including across `shm_unlink`, since unlink only removes the
+/// name.
+///
+/// A `size` of 0 maps nothing and gives an empty buffer; it is an error
+/// against a segment that is not empty, as is a `size` past the segment's
+/// end (`ReadOnlyShm::open`).
 pub fn map_shm(shm_name: &str, size: usize) -> Result<Buffer, String> {
     let shm = ReadOnlyShm::open(shm_name, size)
         .map_err(|e| format!("Failed to open shm '{shm_name}': {e}"))?;
@@ -381,9 +380,14 @@ pub fn map_shm(shm_name: &str, size: usize) -> Result<Buffer, String> {
 
 /// Decode an Arrow IPC stream into its batches, in order, without copying:
 /// every array buffer is a slice of `stream`. An empty `stream` holds no
-/// batches; any other must end with the EOS marker. A body that is not
-/// aligned for its type is an error rather than a copy (see
-/// `read_batches_from_shm`).
+/// batches; any other must end with the EOS marker.
+///
+/// `StreamDecoder::with_require_alignment(true)` is the load-bearing
+/// zero-copy gate: with the default (false), the decoder silently
+/// allocates and copies into an aligned buffer when an array body's offset
+/// doesn't meet the type's natural alignment. Forcing strict alignment
+/// turns any misalignment into a decode error so a regression to the slow
+/// path is loud, not silent.
 pub fn decode_stream(mut stream: Buffer) -> Result<Vec<RecordBatch>, String> {
     if stream.is_empty() {
         return Ok(Vec::new());
