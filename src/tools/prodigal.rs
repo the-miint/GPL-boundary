@@ -1,12 +1,11 @@
-//! Prodigal adapter: reads contigs as Arrow IPC from shared memory, runs
-//! prodigal gene prediction, and writes the genes and a table of the contigs
-//! as Arrow IPC back to shared memory.
+//! Prodigal adapter: takes contigs as record batches, runs prodigal gene
+//! prediction, and returns the genes and a table of the contigs as record
+//! batches.
 
-use crate::arrow_ipc::ShmOutputs;
-use crate::protocol::Response;
 use crate::tools::{
     arrow_schema, config_bool, config_cint, config_f64, config_knobs_known, config_str,
-    ConfigParam, FieldDescription, OutputDescription, ShmContext, ShmTool, ToolDescription,
+    ConfigParam, FieldDescription, GplTool, OnShm, OutputDescription, StreamingContext,
+    ToolDescription, ToolOutput,
 };
 use arrow::array::{
     Array, ArrayRef, BooleanBuilder, Float64Builder, Int32Builder, StringArray, StringBuilder,
@@ -613,7 +612,7 @@ pub struct ProdigalTool;
 
 inventory::submit! {
     crate::tools::ToolRegistration {
-        create: || Box::new(ProdigalTool),
+        create: || Box::new(OnShm(ProdigalTool)),
     }
 }
 
@@ -813,17 +812,16 @@ pub(super) fn training_info(blob: &[u8]) -> Result<ProdigalTrainingInfo, String>
     Ok(info)
 }
 
-/// A batch's contigs, read in place from the input mapping: its (name,
-/// sequence) columns, which hold no nulls, no empty sequence and no
-/// character the library drops.
+/// A batch's contigs, views of the input batches (the library copies each
+/// contig as it loads it): their (name, sequence) columns, which hold no
+/// nulls, no empty sequence and no character the library drops.
 pub(super) struct Contigs(Vec<(StringArray, StringArray)>);
 
 impl Contigs {
-    pub(super) fn read(shm_input: &str, shm_input_size: usize) -> Result<Self, String> {
-        let batches = crate::arrow_ipc::read_batches_from_shm(shm_input, shm_input_size)?;
+    pub(super) fn from_batches(batches: &[RecordBatch]) -> Result<Self, String> {
         let mut columns = Vec::with_capacity(batches.len());
         let mut row = 0;
-        for batch in &batches {
+        for batch in batches {
             let column = |name: &str| {
                 let col = batch
                     .column_by_name(name)
@@ -1012,13 +1010,13 @@ impl Context {
         Ok(())
     }
 
-    /// Find the genes of every contig, and respond with them and the
-    /// contigs, and the model's settings in single-genome mode.
+    /// Find the genes of every contig, and return them and the contigs,
+    /// and the model's settings in single-genome mode.
     fn predict(
         &mut self,
         contigs: &Contigs,
         model: Option<&ProdigalTrainingInfo>,
-    ) -> Result<Response, String> {
+    ) -> Result<ToolOutput, String> {
         let (mut genes, mut table) = (GeneColumns::default(), ContigColumns::default());
         for (i, (name, seq)) in contigs.iter().enumerate() {
             let contig = |e: String| format!("contig '{name}': {e}");
@@ -1049,10 +1047,10 @@ impl Context {
         if let Some(model) = model {
             result["model"] = model_json(model);
         }
-        let mut outputs = ShmOutputs::default();
-        outputs.write(&genes, GENES.label)?;
-        outputs.write(&table, CONTIGS.label)?;
-        Ok(Response::ok(result, outputs.into_vec()))
+        Ok(ToolOutput {
+            outputs: vec![(GENES.label, genes), (CONTIGS.label, table)],
+            result,
+        })
     }
 }
 
@@ -1091,7 +1089,7 @@ impl Session {
         Ok(Self::Shared(ctx, info))
     }
 
-    fn run(&mut self, contigs: &Contigs) -> Result<Response, String> {
+    fn run(&mut self, contigs: &Contigs) -> Result<ToolOutput, String> {
         match self {
             Self::Shared(ctx, model) => ctx.predict(contigs, model.as_ref()),
             Self::TrainOnBatch(config) => {
@@ -1104,15 +1102,13 @@ impl Session {
     }
 }
 
-impl ShmContext for Session {
-    fn run_batch(&mut self, shm_input: &str, shm_input_size: usize) -> Response {
-        Contigs::read(shm_input, shm_input_size)
-            .and_then(|contigs| self.run(&contigs))
-            .unwrap_or_else(Response::error)
+impl StreamingContext for Session {
+    fn run_batch(&mut self, input: Vec<RecordBatch>) -> Result<ToolOutput, String> {
+        self.run(&Contigs::from_batches(&input)?)
     }
 }
 
-impl ShmTool for ProdigalTool {
+impl GplTool for ProdigalTool {
     fn name(&self) -> &str {
         "prodigal"
     }
@@ -1264,19 +1260,15 @@ impl ShmTool for ProdigalTool {
     fn execute(
         &self,
         config: &serde_json::Value,
-        shm_input: &str,
-        shm_input_size: usize,
-    ) -> Response {
-        match Settings::parse(config).and_then(Session::new) {
-            Ok(mut session) => session.run_batch(shm_input, shm_input_size),
-            Err(e) => Response::error(e),
-        }
+        input: Vec<RecordBatch>,
+    ) -> Result<ToolOutput, String> {
+        Session::new(Settings::parse(config)?)?.run_batch(input)
     }
 
     fn create_streaming_context(
         &self,
         config: &serde_json::Value,
-    ) -> Result<Option<Box<dyn ShmContext>>, String> {
+    ) -> Result<Option<Box<dyn StreamingContext>>, String> {
         let session = Session::new(Settings::parse(config)?)?;
         Ok(Some(Box::new(session)))
     }

@@ -2,12 +2,14 @@
 //! contigs (one genome) and writes it, as the CLI's -t does, for
 //! prodigal's training_path.
 
-use crate::protocol::Response;
 use crate::tools::prodigal::{
     library_version, model_config, model_fields, model_json, sha256_hex, training_info, validate,
     Context, Contigs, INPUT_FIELDS, TRANS_TABLES,
 };
-use crate::tools::{config_str, ConfigParam, FieldDescription, ShmTool, ToolDescription};
+use crate::tools::{
+    config_str, ConfigParam, FieldDescription, GplTool, OnShm, ToolDescription, ToolOutput,
+};
+use arrow::record_batch::RecordBatch;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -17,11 +19,11 @@ pub struct ProdigalTrainTool;
 
 inventory::submit! {
     crate::tools::ToolRegistration {
-        create: || Box::new(ProdigalTrainTool),
+        create: || Box::new(OnShm(ProdigalTrainTool)),
     }
 }
 
-impl ShmTool for ProdigalTrainTool {
+impl GplTool for ProdigalTrainTool {
     fn name(&self) -> &str {
         "prodigal-train"
     }
@@ -141,25 +143,22 @@ impl ShmTool for ProdigalTrainTool {
     fn execute(
         &self,
         config: &serde_json::Value,
-        shm_input: &str,
-        shm_input_size: usize,
-    ) -> Response {
-        train(config, shm_input, shm_input_size).unwrap_or_else(Response::error)
+        input: Vec<RecordBatch>,
+    ) -> Result<ToolOutput, String> {
+        train(config, &input)
     }
 }
 
-fn train(
-    json: &serde_json::Value,
-    shm_input: &str,
-    shm_input_size: usize,
-) -> Result<Response, String> {
+/// Train on the input's contigs and write the model, the config checked
+/// and training_path resolved first.
+fn train(json: &serde_json::Value, input: &[RecordBatch]) -> Result<ToolOutput, String> {
     let started = Instant::now();
     let config = model_config(json, &ProdigalTrainTool.describe().config_params)?;
     let path = config_str(json, "training_path")?
         .ok_or("training_path is required: the file to write the model to")?;
     validate(&config)?;
     let target = model_target(Path::new(path))?;
-    let contigs = Contigs::read(shm_input, shm_input_size)?;
+    let contigs = Contigs::from_batches(input)?;
     let mut ctx = Context::new(&config)?;
     ctx.train(&contigs)?;
     let blob = ctx.export()?;
@@ -177,7 +176,10 @@ fn train(
         "n_bases": n_bases,
         "elapsed_ms": started.elapsed().as_millis() as u64,
     });
-    Ok(Response::ok(result, vec![]))
+    Ok(ToolOutput {
+        outputs: vec![],
+        result,
+    })
 }
 
 /// Where training_path's model goes, found before any training: the file
