@@ -27,6 +27,7 @@
 //! parallelism.
 
 use std::io::{BufRead, BufReader, Write};
+use std::panic::{self, AssertUnwindSafe};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -203,6 +204,11 @@ impl InProcessSlot {
 /// The `in_flight` decrement happens *after* `response_tx.send` so the
 /// registry's eviction sweeper, which checks `in_flight() == 0`, never
 /// observes idle while a response is still in transit.
+///
+/// A panic in a tool call answers its batch with an error rather than
+/// ending the thread, which would leave that batch and the queued ones
+/// unanswered and `in_flight` raised. The streaming context, which the
+/// panic may have left mid-update, is dropped, so later batches fail fast.
 fn worker_thread_main(
     rx: mpsc::Receiver<BatchRequest>,
     mut ctx_opt: Option<Box<dyn ShmContext>>,
@@ -213,22 +219,32 @@ fn worker_thread_main(
     in_flight: Arc<AtomicU32>,
 ) {
     while let Ok(batch) = rx.recv() {
-        let mut response = if streaming_supported {
-            match ctx_opt.as_mut() {
-                Some(ctx) => {
-                    let mut r = ctx.run_batch(&batch.shm_input, batch.shm_input_size);
-                    if r.success {
-                        r.schema_version = schema_version;
+        let run = panic::catch_unwind(AssertUnwindSafe(|| {
+            if streaming_supported {
+                match ctx_opt.as_mut() {
+                    Some(ctx) => {
+                        let mut r = ctx.run_batch(&batch.shm_input, batch.shm_input_size);
+                        if r.success {
+                            r.schema_version = schema_version;
+                        }
+                        r
                     }
-                    r
+                    None => Response::error(format!(
+                        "Worker for tool '{tool_name}' has no streaming context: \
+                         a tool call panicked on an earlier batch"
+                    )),
                 }
-                None => Response::error(format!(
-                    "Worker for tool '{tool_name}' lost its streaming context unexpectedly"
-                )),
+            } else {
+                tools::dispatch(&batch)
             }
-        } else {
-            tools::dispatch(&batch)
-        };
+        }));
+        let mut response = run.unwrap_or_else(|payload| {
+            ctx_opt = None;
+            Response::error(format!(
+                "Tool '{tool_name}' panicked: {}",
+                panic_message(payload.as_ref())
+            ))
+        });
         response.batch_id = batch.batch_id;
         // If the coordinator is gone (channel closed) there's nothing useful
         // we can do with the response — drop it and exit. The cleanup
@@ -242,6 +258,15 @@ fn worker_thread_main(
     // Drop the streaming context here so its C `destroy` runs on this
     // worker thread, not on whoever happens to drop the slot.
     drop(ctx_opt);
+}
+
+/// A panic's message, when it has one.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("(no message)")
 }
 
 impl Worker for InProcessSlot {
@@ -828,6 +853,64 @@ mod tests {
 
     fn make_response_channel() -> (ResponseTx, mpsc::Receiver<Response>) {
         mpsc::channel()
+    }
+
+    /// A streaming context whose every batch panics.
+    struct PanickingContext;
+
+    impl ShmContext for PanickingContext {
+        fn run_batch(&mut self, _shm_input: &str, _shm_input_size: usize) -> Response {
+            panic!("the test context panics");
+        }
+    }
+
+    /// A panic in a tool call answers its batch with an error and drops the
+    /// context, so later batches fail fast; none is left unanswered, and
+    /// `in_flight` returns to zero so the worker can be evicted.
+    #[test]
+    fn test_a_panicking_tool_call_still_answers_its_batch() {
+        let (response_tx, response_rx) = make_response_channel();
+        let (tx, rx) = mpsc::channel::<BatchRequest>();
+        let in_flight = Arc::new(AtomicU32::new(2));
+        let thread = {
+            let in_flight = Arc::clone(&in_flight);
+            thread::spawn(move || {
+                worker_thread_main(
+                    rx,
+                    Some(Box::new(PanickingContext)),
+                    true,
+                    Some(1),
+                    "panicky".to_string(),
+                    response_tx,
+                    in_flight,
+                )
+            })
+        };
+        for batch_id in [1, 2] {
+            tx.send(BatchRequest {
+                tool: "panicky".to_string(),
+                config: serde_json::json!({}),
+                shm_input: "/gb-unused".to_string(),
+                shm_input_size: 0,
+                batch_id: Some(batch_id),
+                metrics: false,
+                received_at: None,
+            })
+            .unwrap();
+        }
+
+        for batch_id in [1, 2] {
+            let response = response_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap_or_else(|e| panic!("batch {batch_id} got no response: {e}"));
+            assert!(!response.success);
+            assert_eq!(response.batch_id, Some(batch_id));
+            let error = response.error.unwrap();
+            assert!(error.contains("panicked"), "{error}");
+        }
+        assert_eq!(in_flight.load(Ordering::Acquire), 0);
+        drop(tx);
+        thread.join().expect("the worker thread exits cleanly");
     }
 
     #[test]
