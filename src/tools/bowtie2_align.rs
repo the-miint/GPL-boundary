@@ -525,6 +525,14 @@ impl Bowtie2AlignTool {
                 .transpose()?;
 
             for i in 0..batch.num_rows() {
+                // 1-based, across the batches
+                let row = read_ids.len() + 1;
+                if id_col.is_null(i) {
+                    return Err(format!("input row {row}: null read_id"));
+                }
+                if seq1_col.is_null(i) {
+                    return Err(format!("input row {row}: null sequence1"));
+                }
                 read_ids.push(id_col.value(i).to_string());
                 seqs1.push(seq1_col.value(i).to_string());
 
@@ -2470,6 +2478,39 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             &[Some(qual), Some(qual)],
         );
         expect_read_input_err(&batch, "qual1 and qual2 must be uniformly");
+    }
+
+    /// A null read_id or sequence1 is refused, naming its input row
+    /// (counted across batches), rather than read as an empty string.
+    #[test]
+    fn test_read_input_refuses_a_null_read_id_or_sequence1() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("read_id", DataType::Utf8, true),
+            Field::new("sequence1", DataType::Utf8, true),
+        ]));
+        let batch = |ids: Vec<Option<&str>>, seqs: Vec<Option<&str>>| {
+            let columns: Vec<arrow::array::ArrayRef> = vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(seqs)),
+            ];
+            RecordBatch::try_new(schema.clone(), columns).unwrap()
+        };
+        let first = batch(vec![Some("r1")], vec![Some("ACGT")]);
+        for (second, wanted) in [
+            (
+                batch(vec![Some("r2"), None], vec![Some("ACGT"), Some("ACGT")]),
+                "input row 3: null read_id",
+            ),
+            (
+                batch(vec![Some("r2")], vec![None]),
+                "input row 2: null sequence1",
+            ),
+        ] {
+            match Bowtie2AlignTool::read_input(&[first.clone(), second]) {
+                Ok(_) => panic!("expected {wanted:?}, got Ok"),
+                Err(e) => assert!(e.contains(wanted), "expected {wanted:?}, got: {e}"),
+            }
+        }
     }
 
     #[test]

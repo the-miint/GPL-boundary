@@ -2,7 +2,7 @@ use std::ffi::{CStr, CString};
 use std::io::Write;
 use std::os::raw::{c_char, c_int, c_void};
 
-use arrow::array::StringArray;
+use arrow::array::{Array, StringArray};
 use arrow::record_batch::RecordBatch;
 
 use crate::tools::{
@@ -121,6 +121,12 @@ fn read_input(batches: &[RecordBatch]) -> Result<BuildInput, String> {
             .downcast_ref::<StringArray>()
             .ok_or("'sequence' column is not Utf8")?;
         for i in 0..batch.num_rows() {
+            if name_col.is_null(i) {
+                return Err(format!("Sequence name {i} is null"));
+            }
+            if seq_col.is_null(i) {
+                return Err(format!("Sequence body {i} is null"));
+            }
             let n = name_col.value(i);
             let s = seq_col.value(i);
             // FASTA convention is that bowtie2-build splits names on the
@@ -539,6 +545,32 @@ mod tests {
         };
         assert!(err.contains("whitespace"), "Unexpected error: {err}");
         assert!(err.contains("truncate"), "Error should explain why: {err}");
+    }
+
+    /// A null name or sequence is refused, not read as an empty string.
+    #[test]
+    fn test_rejects_null_name_or_sequence() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("sequence", DataType::Utf8, true),
+        ]));
+        for (name, seq, wanted) in [
+            (None, Some("ACGT"), "Sequence name 0 is null"),
+            (Some("chr1"), None, "Sequence body 0 is null"),
+        ] {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec![name])),
+                    Arc::new(StringArray::from(vec![seq])),
+                ],
+            )
+            .unwrap();
+            match read_input(&[batch]) {
+                Ok(_) => panic!("expected {wanted:?}, got Ok"),
+                Err(e) => assert!(e.contains(wanted), "expected {wanted:?}, got: {e}"),
+            }
+        }
     }
 
     #[test]
