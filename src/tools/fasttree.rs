@@ -2,8 +2,8 @@
 //! and returns the SOA tree as a record batch.
 
 use crate::tools::{
-    checked_cint, ConfigParam, FieldDescription, GplTool, OnShm, OutputDescription,
-    ToolDescription, ToolOutput,
+    checked_cint, ConfigParam, FieldDescription, GplTool, OutputDescription, ToolDescription,
+    ToolOutput,
 };
 use arrow::array::{
     Array, BooleanArray, Float64Builder, Int32Array, Int64Array, Int64Builder, StringArray,
@@ -655,7 +655,7 @@ const TREE: OutputDescription = OutputDescription {
 
 inventory::submit! {
     crate::tools::ToolRegistration {
-        create: || Box::new(OnShm(FastTreeTool)),
+        create: || Box::new(FastTreeTool),
     }
 }
 

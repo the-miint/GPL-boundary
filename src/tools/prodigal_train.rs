@@ -7,7 +7,7 @@ use crate::tools::prodigal::{
     Context, Contigs, INPUT_FIELDS, TRANS_TABLES,
 };
 use crate::tools::{
-    config_str, ConfigParam, FieldDescription, GplTool, OnShm, ToolDescription, ToolOutput,
+    config_str, ConfigParam, FieldDescription, GplTool, ToolDescription, ToolOutput,
 };
 use arrow::record_batch::RecordBatch;
 use std::io::Write;
@@ -19,7 +19,7 @@ pub struct ProdigalTrainTool;
 
 inventory::submit! {
     crate::tools::ToolRegistration {
-        create: || Box::new(OnShm(ProdigalTrainTool)),
+        create: || Box::new(ProdigalTrainTool),
     }
 }
 

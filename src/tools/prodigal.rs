@@ -4,8 +4,8 @@
 
 use crate::tools::{
     arrow_schema, config_bool, config_cint, config_f64, config_knobs_known, config_str,
-    ConfigParam, FieldDescription, GplTool, OnShm, OutputDescription, StreamingContext,
-    ToolDescription, ToolOutput,
+    ConfigParam, FieldDescription, GplTool, OutputDescription, StreamingContext, ToolDescription,
+    ToolOutput,
 };
 use arrow::array::{
     Array, ArrayRef, BooleanBuilder, Float64Builder, Int32Builder, StringArray, StringBuilder,
@@ -612,7 +612,7 @@ pub struct ProdigalTool;
 
 inventory::submit! {
     crate::tools::ToolRegistration {
-        create: || Box::new(OnShm(ProdigalTool)),
+        create: || Box::new(ProdigalTool),
     }
 }
 

@@ -12,13 +12,29 @@ use arrow::buffer::Buffer;
 use arrow::record_batch::RecordBatch;
 
 use crate::arrow_ipc::{self, ShmOutputs};
-use crate::protocol::Response;
+use crate::protocol::{BatchRequest, Response};
 use crate::tools::ToolOutput;
+
+/// The response to `batch`: `call` run on its input segment (`run_on_shm`),
+/// with the batch's `batch_id` and, on success, the tool's
+/// `schema_version`.
+pub(crate) fn respond(
+    batch: &BatchRequest,
+    schema_version: u32,
+    call: impl FnOnce(Vec<RecordBatch>) -> Result<ToolOutput, String>,
+) -> Response {
+    let mut response = run_on_shm(&batch.shm_input, batch.shm_input_size, call);
+    if response.success {
+        response.schema_version = Some(schema_version);
+    }
+    response.batch_id = batch.batch_id;
+    response
+}
 
 /// Run `call` on the Arrow stream in the `shm_input` segment, whose first
 /// `shm_input_size` bytes hold it, and write its outputs to new segments.
 /// An input that cannot be mapped or decoded fails before `call` runs.
-pub(crate) fn run_on_shm(
+fn run_on_shm(
     shm_input: &str,
     shm_input_size: usize,
     call: impl FnOnce(Vec<RecordBatch>) -> Result<ToolOutput, String>,

@@ -1,54 +1,16 @@
-//! Shared test utilities for Arrow IPC + shared memory roundtrips.
+//! Shared test utilities: input batches and fixtures for the tools' tests,
+//! checks on their outputs, and (`shm`) helpers for tests on shared memory.
 //!
-//! Intentionally duplicates IPC serialization logic from `arrow_ipc.rs` so that
-//! tests exercise production read/write paths against independently-written data.
+//! `shm` intentionally duplicates IPC serialization logic from `arrow_ipc.rs`
+//! so that tests exercise production read/write paths against
+//! independently-written data.
 
-use crate::protocol::Response;
-use crate::shm::SharedMemory;
 use crate::tools::{ToolDescription, ToolOutput};
 use arrow::array::{Array, Int32Array, StringArray};
-use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-
-/// Generate a unique shm name using prefix, PID, and an atomic counter.
-/// Uses a counter instead of a timestamp to keep names under the macOS
-/// POSIX shm 31-character limit. PID prevents collisions across concurrent
-/// test processes; the counter prevents collisions within a process.
-pub fn unique_shm_name(prefix: &str) -> String {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    format!("/{prefix}-{pid}-{n}")
-}
-
-/// Write an Arrow RecordBatch as IPC stream into a new shared memory region.
-///
-/// The returned `SharedMemory` holds the mapping open. The shm segment is
-/// unlinked on drop, so keep the return value alive as long as readers need it.
-pub fn write_arrow_to_shm(name: &str, batch: &RecordBatch) -> SharedMemory {
-    write_batches_to_shm(name, std::slice::from_ref(batch))
-}
-
-/// Write record batches, which share a schema, as one Arrow IPC stream
-/// into a new shared memory region (see `write_arrow_to_shm`).
-pub fn write_batches_to_shm(name: &str, batches: &[RecordBatch]) -> SharedMemory {
-    let mut ipc_buf = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut ipc_buf, &batches[0].schema()).unwrap();
-        for batch in batches {
-            writer.write(batch).unwrap();
-        }
-        writer.finish().unwrap();
-    }
-
-    let mut shm = SharedMemory::create(name, ipc_buf.len()).unwrap();
-    shm.as_mut_slice()[..ipc_buf.len()].copy_from_slice(&ipc_buf);
-    shm
-}
 
 /// The records of a FASTA text: (header line, sequence without line
 /// breaks).
@@ -146,21 +108,6 @@ pub fn prediction_of(output: Result<ToolOutput, String>) -> Result<Prediction, S
         genes,
         contigs,
     })
-}
-
-/// Every output of a response, in order, as (label, its one record
-/// batch); each segment is read, then unlinked.
-pub fn take_outputs(response: &Response) -> Vec<(String, RecordBatch)> {
-    response
-        .shm_outputs
-        .iter()
-        .map(|out| {
-            let mut batches = read_arrow_from_shm(&out.name, out.size);
-            let _ = SharedMemory::unlink(&out.name);
-            assert_eq!(batches.len(), 1, "{}", out.name);
-            (out.label.clone(), batches.remove(0))
-        })
-        .collect()
 }
 
 /// Check a tool's output against its description: the output labels, in
@@ -265,22 +212,6 @@ pub fn scratch_dir() -> tempfile::TempDir {
     let base = concat!(env!("CARGO_MANIFEST_DIR"), "/target/test-scratch");
     std::fs::create_dir_all(base).unwrap();
     tempfile::tempdir_in(base).unwrap()
-}
-
-/// Read all Arrow RecordBatches from an IPC stream in shared memory.
-///
-/// Delegates to `arrow_ipc::read_batches_from_shm` so tests exercise the
-/// **same** decoder (`StreamDecoder::with_require_alignment(true)`) as
-/// production. Using a separate `StreamReader`-based path here would
-/// hide alignment / trailing-data bugs from the test suite — exactly
-/// the class of mismatch that masked the original macOS `fstat` bug.
-///
-/// `size` is the exact data byte count. Callers reading their own input
-/// segments can use `holder.len()` from the `SharedMemory` returned by
-/// `write_arrow_to_shm`; callers reading gpl-boundary output segments
-/// should pass `ShmOutput::size` from the response.
-pub fn read_arrow_from_shm(name: &str, size: usize) -> Vec<RecordBatch> {
-    crate::arrow_ipc::read_batches_from_shm(name, size).unwrap()
 }
 
 /// Extract `16S500/16S.1.p` from `ext/fasttree/16S_500.tar.gz` to
@@ -399,7 +330,9 @@ pub fn subset_alignment(alignment: &[(String, String)], n: usize) -> Vec<(String
 
 #[cfg(test)]
 mod tests {
+    use super::shm::{read_arrow_from_shm, unique_shm_name, write_arrow_to_shm};
     use super::*;
+    use crate::shm::SharedMemory;
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
@@ -462,5 +395,83 @@ mod tests {
         assert_eq!(subset.len(), 50);
         assert_eq!(subset[0], alignment[0]);
         assert_eq!(subset[49], alignment[49]);
+    }
+}
+
+/// Helpers for tests that read and write shared memory: the front end's,
+/// the arrow_ipc and shm modules', and the workers'. Tool tests take and
+/// return record batches and need none of these.
+pub mod shm {
+    use crate::protocol::Response;
+    use crate::shm::SharedMemory;
+    use arrow::ipc::writer::StreamWriter;
+    use arrow::record_batch::RecordBatch;
+
+    /// Generate a unique shm name using prefix, PID, and an atomic counter.
+    /// Uses a counter instead of a timestamp to keep names under the macOS
+    /// POSIX shm 31-character limit. PID prevents collisions across concurrent
+    /// test processes; the counter prevents collisions within a process.
+    pub fn unique_shm_name(prefix: &str) -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        format!("/{prefix}-{pid}-{n}")
+    }
+
+    /// Write an Arrow RecordBatch as IPC stream into a new shared memory region.
+    ///
+    /// The returned `SharedMemory` holds the mapping open. The shm segment is
+    /// unlinked on drop, so keep the return value alive as long as readers need it.
+    pub fn write_arrow_to_shm(name: &str, batch: &RecordBatch) -> SharedMemory {
+        write_batches_to_shm(name, std::slice::from_ref(batch))
+    }
+
+    /// Write record batches, which share a schema, as one Arrow IPC stream
+    /// into a new shared memory region (see `write_arrow_to_shm`).
+    pub fn write_batches_to_shm(name: &str, batches: &[RecordBatch]) -> SharedMemory {
+        let mut ipc_buf = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut ipc_buf, &batches[0].schema()).unwrap();
+            for batch in batches {
+                writer.write(batch).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+
+        let mut shm = SharedMemory::create(name, ipc_buf.len()).unwrap();
+        shm.as_mut_slice()[..ipc_buf.len()].copy_from_slice(&ipc_buf);
+        shm
+    }
+
+    /// Every output of a response, in order, as (label, its one record
+    /// batch); each segment is read, then unlinked.
+    pub fn take_outputs(response: &Response) -> Vec<(String, RecordBatch)> {
+        response
+            .shm_outputs
+            .iter()
+            .map(|out| {
+                let mut batches = read_arrow_from_shm(&out.name, out.size);
+                let _ = SharedMemory::unlink(&out.name);
+                assert_eq!(batches.len(), 1, "{}", out.name);
+                (out.label.clone(), batches.remove(0))
+            })
+            .collect()
+    }
+
+    /// Read all Arrow RecordBatches from an IPC stream in shared memory.
+    ///
+    /// Delegates to `arrow_ipc::read_batches_from_shm` so tests exercise the
+    /// **same** decoder (`StreamDecoder::with_require_alignment(true)`) as
+    /// production. Using a separate `StreamReader`-based path here would
+    /// hide alignment / trailing-data bugs from the test suite — exactly
+    /// the class of mismatch that masked the original macOS `fstat` bug.
+    ///
+    /// `size` is the exact data byte count. Callers reading their own input
+    /// segments can use `holder.len()` from the `SharedMemory` returned by
+    /// `write_arrow_to_shm`; callers reading gpl-boundary output segments
+    /// should pass `ShmOutput::size` from the response.
+    pub fn read_arrow_from_shm(name: &str, size: usize) -> Vec<RecordBatch> {
+        crate::arrow_ipc::read_batches_from_shm(name, size).unwrap()
     }
 }

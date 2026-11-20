@@ -4,8 +4,9 @@
 //! and serves batches submitted to that fingerprint. Phase 4 ships two
 //! implementations:
 //!
-//! - `InProcessSlot` — wraps an optional `ShmContext` (for tools that
-//!   support it) or falls through to `tools::dispatch` (for tools that don't).
+//! - `InProcessSlot` — runs the tool's `tools::Runner`: its streaming
+//!   context (for tools that have one) or the tool per batch (for tools
+//!   that don't), through the native front end (`frontend::respond`).
 //!   Used by every tool the registry does not route to a subprocess.
 //!   Each slot owns a dedicated worker thread that drains a per-slot mpsc
 //!   queue, so same-fingerprint batches are naturally serialized while
@@ -35,8 +36,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::frontend;
 use crate::protocol::{BatchRequest, Response};
-use crate::tools::{self, ShmContext};
+use crate::tools::{self, Runner};
 
 /// Channel the coordinator listens on for completed batch responses. Every
 /// `Worker` impl is constructed with a clone of this sender. The coordinator
@@ -111,17 +113,14 @@ pub trait Worker: Send + Sync {
 /// In-process worker.
 ///
 /// Three states matter for `submit`:
-/// - **Streaming, open** — context exists, `closed == false`. Worker thread
-///   runs `ctx.run_batch`.
-/// - **Non-streaming** — context never existed (the tool's
-///   `create_streaming_context` returned `Ok(None)`), `closed == false`.
-///   Each batch goes through the stateless `tools::dispatch` path.
+/// - **Streaming, open** — the runner is the tool's streaming context,
+///   `closed == false`. The worker thread runs each batch on it.
+/// - **Non-streaming** — the tool's `create_streaming_context` returned
+///   `Ok(None)`, so the runner is the tool itself, `closed == false`. Each
+///   batch runs the tool afresh.
 /// - **Closed** — `closed == true`. New submits respond with an error
 ///   without entering the worker thread; the worker thread itself has
 ///   already exited.
-///
-/// We track "closed" separately from "context is None" because both
-/// non-streaming tools and closed streaming tools have `ctx: None`.
 pub struct InProcessSlot {
     /// Sender into the worker thread's input queue. Wrapped in
     /// `Mutex<Option<...>>` so `close()` can drop it (signaling EOF to the
@@ -131,8 +130,8 @@ pub struct InProcessSlot {
     thread: Mutex<Option<JoinHandle<()>>>,
     response_tx: ResponseTx,
     /// Static for the lifetime of the slot. Currently only used by the
-    /// `non_streaming_routes_via_dispatch` test to verify routing
-    /// without inferring it from a failure response.
+    /// `non_streaming_runs_per_batch` test to verify routing without
+    /// inferring it from a failure response.
     #[cfg_attr(not(test), allow(dead_code))]
     streaming_supported: bool,
     closed: AtomicBool,
@@ -158,11 +157,8 @@ impl InProcessSlot {
         config: &serde_json::Value,
         response_tx: ResponseTx,
     ) -> Result<Self, Response> {
-        let session = tools::streaming_setup(tool_name, config)?;
-        let (ctx_opt, streaming_supported, schema_version) = match session {
-            Some((c, sv)) => (Some(c), true, Some(sv)),
-            None => (None, false, None),
-        };
+        let (runner, schema_version) = tools::open(tool_name, config)?;
+        let streaming_supported = matches!(runner, Runner::Streaming(_));
 
         let (tx, rx) = mpsc::channel::<BatchRequest>();
         let in_flight = Arc::new(AtomicU32::new(0));
@@ -174,8 +170,7 @@ impl InProcessSlot {
             .spawn(move || {
                 worker_thread_main(
                     rx,
-                    ctx_opt,
-                    streaming_supported,
+                    Some(runner),
                     schema_version,
                     tool_name_for_thread,
                     worker_response_tx,
@@ -197,8 +192,8 @@ impl InProcessSlot {
     }
 }
 
-/// Worker-thread loop body. Owns the streaming context (if any) and exits
-/// when the input channel is closed. Drops the context on exit so any C
+/// Worker-thread loop body. Owns the runner and exits when the input
+/// channel is closed. Drops the runner on exit so a streaming context's C
 /// `destroy` hook runs before the thread terminates.
 ///
 /// The `in_flight` decrement happens *after* `response_tx.send` so the
@@ -207,39 +202,31 @@ impl InProcessSlot {
 ///
 /// A panic in a tool call answers its batch with an error rather than
 /// ending the thread, which would leave that batch and the queued ones
-/// unanswered and `in_flight` raised. The streaming context, which the
-/// panic may have left mid-update, is dropped, so later batches fail fast.
+/// unanswered and `in_flight` raised. A streaming context, which the panic
+/// may have left mid-update, is dropped, so later batches fail fast; a
+/// per-batch runner holds no state and runs on.
 fn worker_thread_main(
     rx: mpsc::Receiver<BatchRequest>,
-    mut ctx_opt: Option<Box<dyn ShmContext>>,
-    streaming_supported: bool,
-    schema_version: Option<u32>,
+    mut runner: Option<Runner>,
+    schema_version: u32,
     tool_name: String,
     response_tx: ResponseTx,
     in_flight: Arc<AtomicU32>,
 ) {
     while let Ok(batch) = rx.recv() {
-        let run = panic::catch_unwind(AssertUnwindSafe(|| {
-            if streaming_supported {
-                match ctx_opt.as_mut() {
-                    Some(ctx) => {
-                        let mut r = ctx.run_batch(&batch.shm_input, batch.shm_input_size);
-                        if r.success {
-                            r.schema_version = schema_version;
-                        }
-                        r
-                    }
-                    None => Response::error(format!(
-                        "Worker for tool '{tool_name}' has no streaming context: \
-                         a tool call panicked on an earlier batch"
-                    )),
-                }
-            } else {
-                tools::dispatch(&batch)
-            }
+        let run = panic::catch_unwind(AssertUnwindSafe(|| match runner.as_mut() {
+            Some(runner) => frontend::respond(&batch, schema_version, |input| {
+                runner.run(&batch.config, input)
+            }),
+            None => Response::error(format!(
+                "Worker for tool '{tool_name}' has no streaming context: \
+                 a tool call panicked on an earlier batch"
+            )),
         }));
         let mut response = run.unwrap_or_else(|payload| {
-            ctx_opt = None;
+            if matches!(runner, Some(Runner::Streaming(_))) {
+                runner = None;
+            }
             Response::error(format!(
                 "Tool '{tool_name}' panicked: {}",
                 panic_message(payload.as_ref())
@@ -255,9 +242,9 @@ fn worker_thread_main(
             break;
         }
     }
-    // Drop the streaming context here so its C `destroy` runs on this
-    // worker thread, not on whoever happens to drop the slot.
-    drop(ctx_opt);
+    // Drop the runner here so a streaming context's C `destroy` runs on
+    // this worker thread, not on whoever happens to drop the slot.
+    drop(runner);
 }
 
 /// A panic's message, when it has one.
@@ -850,6 +837,8 @@ impl Worker for SubprocessWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::{StreamingContext, ToolOutput};
+    use arrow::record_batch::RecordBatch;
 
     fn make_response_channel() -> (ResponseTx, mpsc::Receiver<Response>) {
         mpsc::channel()

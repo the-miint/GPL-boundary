@@ -6,7 +6,7 @@ use arrow::array::{Array, StringArray};
 use arrow::record_batch::RecordBatch;
 
 use crate::tools::{
-    ConfigParam, FieldDescription, GplTool, OnShm, ToolDescription, ToolOutput, ToolRegistration,
+    ConfigParam, FieldDescription, GplTool, ToolDescription, ToolOutput, ToolRegistration,
 };
 
 // ---------------------------------------------------------------------------
@@ -89,7 +89,7 @@ pub struct Bowtie2BuildTool;
 
 inventory::submit! {
     ToolRegistration {
-        create: || Box::new(OnShm(Bowtie2BuildTool)),
+        create: || Box::new(Bowtie2BuildTool),
     }
 }
 

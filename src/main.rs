@@ -388,9 +388,9 @@ fn run_worker(tool_name: &str) -> i32 {
         }
     };
 
-    let mut ctx = match tools::streaming_setup(tool_name, &config) {
-        Ok(Some((c, _sv))) => c,
-        Ok(None) => {
+    let (mut ctx, schema_version) = match tools::open(tool_name, &config) {
+        Ok((tools::Runner::Streaming(ctx), schema_version)) => (ctx, schema_version),
+        Ok((tools::Runner::PerBatch(_), _)) => {
             let resp = Response::error(format!(
                 "worker '{tool_name}': tool does not support streaming; \
                  cannot run as a subprocess worker"
@@ -398,16 +398,11 @@ fn run_worker(tool_name: &str) -> i32 {
             let _ = write_response(&mut stdout, &resp);
             return 1;
         }
-        Err(mut resp) => {
+        Err(resp) => {
             let _ = write_response(&mut stdout, &resp);
-            // Touch the response so clippy doesn't flag the mutable binding
-            // we keep so callers can inspect/extend before write.
-            resp.success = false;
             return 1;
         }
     };
-
-    let schema_version = tools::tool_schema_version(tool_name).unwrap_or_default();
 
     // Counts batches actually run against this resident context. Used to set
     // `worker_reused`: the first batch after spawn hits a cold index; later
@@ -446,20 +441,15 @@ fn run_worker(tool_name: &str) -> i32 {
         // + /proc deltas. Skipped entirely when the caller didn't ask, so a
         // production batch pays nothing.
         let reused = batches_processed > 0;
-        let mut response = if batch.metrics {
-            let (mut resp, metrics) = rusage::measure(reused, || {
-                ctx.run_batch(&batch.shm_input, batch.shm_input_size)
-            });
+        let mut run = || frontend::respond(&batch, schema_version, |input| ctx.run_batch(input));
+        let response = if batch.metrics {
+            let (mut resp, metrics) = rusage::measure(reused, run);
             resp.metrics = Some(metrics);
             resp
         } else {
-            ctx.run_batch(&batch.shm_input, batch.shm_input_size)
+            run()
         };
         batches_processed += 1;
-        if response.success {
-            response.schema_version = Some(schema_version);
-        }
-        response.batch_id = batch.batch_id;
 
         if write_response(&mut stdout, &response).is_err() {
             break;

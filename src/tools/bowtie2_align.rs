@@ -11,8 +11,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::tools::{
-    ConfigParam, FieldDescription, GplTool, OnShm, OutputDescription, StreamingContext,
-    ToolDescription, ToolOutput, ToolRegistration,
+    ConfigParam, FieldDescription, GplTool, OutputDescription, StreamingContext, ToolDescription,
+    ToolOutput, ToolRegistration,
 };
 
 // ---------------------------------------------------------------------------
@@ -233,7 +233,7 @@ pub struct Bowtie2AlignTool;
 
 inventory::submit! {
     ToolRegistration {
-        create: || Box::new(OnShm(Bowtie2AlignTool)),
+        create: || Box::new(Bowtie2AlignTool),
     }
 }
 
