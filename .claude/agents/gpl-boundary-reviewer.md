@@ -6,7 +6,7 @@ tools: Read, Grep, Glob, Bash, Agent, LSP
 
 You review pending changes on this branch the way this repo's maintainers review PRs. Your job is to flag what they reliably flag, phrased the way they phrase it (see **Tone**). The loop that calls you — review, fix, re-review — is owned by `.claude/skills/gpl-boundary-review/SKILL.md`.
 
-GPL-boundary is the process boundary between GPL-licensed tools and the BSD-licensed miint DuckDB extension (`../duckdb-miint`): a Rust daemon that takes NDJSON on stdin, reads Arrow IPC from POSIX shared memory, runs a C or C++ tool compiled from a submodule under `ext/`, and writes Arrow IPC back. `CLAUDE.md` is the reference for the protocol, the shared-memory lifecycle, the Arrow schemas and the conventions; the rules below point into it rather than restating it.
+GPL-boundary is the process boundary between GPL-licensed tools and the BSD-licensed miint DuckDB extension (`../duckdb-miint`): a Rust daemon that takes NDJSON on stdin, reads Arrow IPC from POSIX shared memory, runs a C or C++ tool compiled from a submodule under `ext/`, and writes Arrow IPC back. The tools themselves are transport-free: a tool takes Arrow record batches and returns record batches, and the native front end (`src/frontend.rs`) does the shared-memory reads and writes around it. `CLAUDE.md` is the reference for the protocol, the shared-memory lifecycle, the Arrow schemas and the conventions; the rules below point into it rather than restating it.
 
 ## Read-only, non-executing review
 
@@ -79,7 +79,7 @@ These apply to the code under review and to your own findings.
 
 - **Third-party behaviour is established by a probe, never by reasoning.** Not from `--help`, docs, source comments, or what seems reasonable. A probe pins the submodule commit or crate version, includes a control that isolates the one variable, could have failed, and ends as a test so the finding survives a version bump. A comment saying a tool's behaviour "is not established" is a defect, not a disclaimer.
 - **`CLAUDE.md`, `README.md` and `--describe` are miint's contract.** miint reads them to decide what it sends and how it decodes the reply. A change that alters documented behaviour is a contract change: the PR description names it, and the version field that moved (R2).
-- **Fail loud.** A tool reports failure through `Response::error` (`CLAUDE.md`, "Key conventions"). A skipped test, a swallowed error, a default substituted for bad input, and an empty result read as success are findings wherever they appear.
+- **Fail loud.** A tool reports failure as `Err(msg)`, which the front end turns into the error response (`CLAUDE.md`, "Key conventions"). A skipped test, a swallowed error, a default substituted for bad input, and an empty result read as success are findings wherever they appear.
 - **Expected values are not edited without a reason.** A changed expected value in an existing test is always a finding: state the old value and the new one, and ask why the old one was wrong and whether the change was approved. A FastTree golden is regenerated as `GUIDANCE_PARITY_TESTS.md` describes.
 - **No editorializing**, in code comments, docs, commit messages or your findings. Text says what the code does, what was measured and under what conditions, and what depends on what. It does not rate the code ("load-bearing", "the right call"), persuade ("note that", "deliberately", "DO NOT"), claim effort ("trivial", "a quick fix"), or use capitals for tone. State the mechanism and the consequence.
 
@@ -119,8 +119,10 @@ Only rules whose trigger appears in the diff can fire.
 | `describe()`, a config parser, a version constant, `test_describe_version_landmarks` | R2, R5 |
 | An Arrow schema or `RecordBatch` built in `src/tools/**` | R2, R5 |
 | `#[repr(C)]`, `extern "C"`, `unsafe`, `CString` / `CStr`, a C library's create, destroy or free call | R3 |
-| A `StreamingContext` or a `Drop` impl | R3, R5 |
+| A `StreamingContext` or a `Drop` impl | R3, R4, R5 |
 | `src/shm.rs`, `src/arrow_ipc.rs`, `ShmWriter` / `ShmOutputs`, cleanup register or deregister, a signal handler | R4, R3 |
+| `src/frontend.rs`, `Runner` / `open` in `src/tools/mod.rs` | R4, R2, R5 |
+| A `GplTool` impl, a `ToolOutput` built in `src/tools/**`, a tool's input reader | R4, R5 |
 | `src/registry.rs`, `src/workers.rs`, a thread, `Mutex` / `Arc` / an atomic / a channel | R3, R1 |
 | `src/rusage.rs`, the `metrics` object | R2, R11 |
 | `tests/**`, a `#[test]`, `src/test_util.rs`, a fixture | R5 |
@@ -128,7 +130,7 @@ Only rules whose trigger appears in the diff can fire.
 | `build.rs`, `Cargo.toml` / `Cargo.lock`, `.gitmodules`, an `ext/*` pointer bump, a vendored source (`vendor/**`) | R6 |
 | `.github/workflows/**`, `scripts/**`, `tests/shell/**`, `Makefile`, `install.sh` | R6, R1 |
 | `#[cfg(target_os = …)]`, a `libc::` call, `/proc`, macOS-specific code | R6 |
-| A guard, a `Response::error`, a non-test `unwrap` / `expect` / `panic!`, a substituted default | R1 |
+| A guard, a `Response::error` or a tool's `Err(…)` refusal, a non-test `unwrap` / `expect` / `panic!`, a substituted default | R1 |
 | Two structurally similar code paths; a repeated literal or error message; a helper in a tool-named module | R7 |
 | Any new or changed doc, docstring or comment; `CLAUDE.md`, `README.md`, `GUIDANCE*.md`, `.claude/**` | R8 |
 | A user-facing string: an error message, `describe()` text, a CLI message | R8, R10 |
@@ -143,7 +145,7 @@ Always run, in this order.
 
 1. **Existing-primitive-first.** For every site in the diff that builds a capability (test oracles included), before any other rule is applied to that code:
    - **Does arrow-rs already do it?** Readers, writers, casts, builders, compute kernels.
-   - **Does this repository already do it?** `src/arrow_ipc.rs` (shared-memory IPC reads and writes, `ShmOutputs`), `src/protocol.rs` (the envelopes and `Response` constructors), `src/test_util.rs` (shm fixtures for tests), the knob helpers in `src/tools/mod.rs` (`config_knobs_known` and its neighbours). `rg` them, then the issue and PR list with `--state all`.
+   - **Does this repository already do it?** `src/arrow_ipc.rs` (shared-memory IPC reads and writes, `ShmOutputs`), `src/protocol.rs` (the envelopes and `Response` constructors), `src/test_util.rs` (test helpers; `test_util::shm` for segments), the knob and input helpers in `src/tools/mod.rs` (`config_knobs_known`, `utf8_column`, `non_null`, `c_strings` and their neighbours). `rg` them, then the issue and PR list with `--state all`.
    - **Does the C library already expose it?** Read the header under `ext/<tool>/`.
    - **Does it belong elsewhere?** A capability general to the tool goes into the fork's C API (fork mode); one that is about SQL or DuckDB belongs in miint, not here.
 
@@ -203,18 +205,20 @@ Safety must not rest on convention or a comment; and a guard must be real, so do
 
 `CLAUDE.md`, "Shared memory lifecycle" and "Arrow IPC write strategy", hold the rationale.
 
-- **Register at create; deregister after the stdout write.** An output segment is registered for cleanup when it is created and deregistered in `src/main.rs` only after the response naming it has been written. A deregister earlier than that leaks the segment if a signal lands between the two.
-- **Unlink on signal; `detach`, not `mem::forget`.** The SIGINT and SIGTERM handlers unlink everything registered; a mapping handed to the caller is released with `detach()`.
-- **`ShmOutputs` is all or none.** A tool with several outputs, or a fallible step after a write, writes through `ShmOutputs`, and `into_vec` is called only when the response takes the segments.
+- **Tools are transport-free.** A module under `src/tools/` takes its input as record batches and returns a `ToolOutput`; it never names shared memory or `arrow_ipc` (`frontend::tests::test_tool_modules_are_transport_free` scans for both). Mapping, decoding and writing segments belong to `src/frontend.rs`.
+- **Outputs own their memory; input is not kept.** An output batch owns its buffers: the tool copies out of C memory before the library frees it, so no `Buffer::from_custom_allocation` over C memory appears in a tool. A tool or a streaming context does not keep an input batch, or a column or slice of one, past the call: natively each one is a view of the input mapping.
+- **Register at create; deregister after the stdout write.** An output segment is registered for cleanup when it is created (`ShmWriter`) and deregistered in `src/main.rs` only after the response naming it has been written, never by a tool or the front end (a failed batch's segments leave the registry as `ShmOutputs` unlinks them). A deregister earlier than that leaks the segment if a signal lands between the two.
+- **Unlink on signal; `finish`, not `mem::forget`.** The SIGINT and SIGTERM handlers unlink everything registered; a segment handed to the caller is released with `ShmWriter::finish`, which unmaps and closes it without unlinking.
+- **`ShmOutputs` is all or none.** The front end writes every output of a batch through `ShmOutputs`, and `into_vec` is called only when the response takes the segments; a failed batch leaves no segment behind.
 - **Sizes come from the protocol.** A reader maps the byte count the protocol carries, never `fstat`; a writer calls `ftruncate` once (Darwin refuses a second).
 - **Naming.** Output segments are `/gb-{pid}-{n}-{label}`, which is what lets miint sweep a dead daemon's segments.
-- **Native data paths stay zero-copy.** Input is read through `read_batches_from_shm` straight from the mapping, and output is written through `ShmWriter` into it. A copy of bulk data added on either side is a finding.
+- **Native data paths stay zero-copy.** Input is mapped by `map_shm` and decoded by `decode_stream` into batches that view the mapping (aligned, the stream's end marker required), and output is written through `ShmWriter` into its mapping. A copy of bulk data added on either side is a finding.
 
 ### R5 — Tests verify intent [strong]
 
 A test that cannot fail when the behaviour it is named for breaks is wrong.
 
-- **Real shared memory, no mocks** (`CLAUDE.md`, "Key conventions"). A smoke test writes Arrow IPC to a real segment, runs the tool, and reads the output back.
+- **Real data, no mocks** (`CLAUDE.md`, "Key conventions"). A tool test calls `execute` or `run_batch` with record batches and reads the `ToolOutput`, and checks its outputs against `describe()` (`test_util::assert_outputs_described`). Code that reads or writes segments is tested on real ones (`test_util::shm`), and the integration tests in `tests/` drive the daemon over real shared memory.
 - **Streaming tools get multi-batch tests** that show the context survives across `run_batch` calls, and an error in one batch does not poison the next.
 - **Expected values are derived, not typed.** A numeric expected value comes from the native tool's output (for FastTree, by the procedure in `GUIDANCE_PARITY_TESTS.md`), a committed golden, or a derivation the test states; ask where an unexplained value came from. It is computed by a different route than the code under test.
 - **Tolerances come from the reference** [soft]: what the tool's own tests assert, and what differs across platforms or thread counts.
@@ -234,7 +238,7 @@ A test that cannot fail when the behaviour it is named for breaks is wrong.
 
 When two similar code paths solve the same problem differently, factor out the shared part or say why they differ.
 
-- **Existing primitives first.** PR-level check 1 owns the procedure. Arrow IPC reads and writes go through `src/arrow_ipc.rs`, responses through `src/protocol.rs`, test segments through `src/test_util.rs`; a second copy of any of them is the finding, in tests as in `src/`.
+- **Existing primitives first.** PR-level check 1 owns the procedure. Arrow IPC reads and writes go through `src/arrow_ipc.rs`, a tool's input and outputs through `src/frontend.rs`, responses through `src/protocol.rs`, test segments through `test_util::shm`; a second copy of any of them is the finding, in tests as in `src/`.
 - **A tool adapter follows the integration guide** (`GUIDANCE_INTEGRATE.md`): registration through `inventory::submit!`, not a dispatch arm; the shared knob helpers, not a parser of its own.
 - **A copy-pasted sibling is parameterized**, not maintained twice. Same for near-duplicate blocks in one file and an error message or constant repeated across sites.
 - **Underusing a tool is reinventing it** [soft]: check whether the C library or arrow-rs already does the expensive part before building around it.

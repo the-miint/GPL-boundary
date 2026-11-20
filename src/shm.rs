@@ -4,9 +4,10 @@
 //!
 //! ## Lifecycle
 //!
-//! gpl-boundary creates output shm regions with PID-based names
-//! (e.g., `/gb-1234-out`). On normal exit or trappable signals
-//! (SIGINT, SIGTERM), output shm is unlinked via the cleanup registry.
+//! gpl-boundary creates output shm regions with PID-based names,
+//! `/gb-{pid}-{n}-{label}` (e.g., `/gb-1234-0-tree`). On normal exit or
+//! trappable signals (SIGINT, SIGTERM), output shm is unlinked via the
+//! cleanup registry.
 //! SIGKILL cannot be trapped; the caller (miint) should clean up stale
 //! segments by checking if the PID in the name is still alive.
 
@@ -21,9 +22,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 // async-signal-safety forbids `pthread_mutex_lock` (and therefore
 // `std::sync::Mutex::lock`) inside a handler — if the signal lands
 // while the main thread already holds the lock, the handler
-// deadlocks. With Phase 4 spinning up subprocess workers, every
-// process inherits this exposure, so we replaced the prior
-// `Mutex<Vec<String>>` with a fixed-size pool of atomic slots.
+// deadlocks. The daemon and every subprocess worker install the
+// handlers, so the registry is a fixed-size pool of atomic slots, not a
+// `Mutex`.
 //
 // Each slot stores its own NUL-terminated byte buffer (no heap
 // allocation per registration after startup). Producers claim a
@@ -192,6 +193,13 @@ pub fn cleanup_all() {
     }
 }
 
+/// Test-only: held by every test that asserts its own name is registered,
+/// and by the test that fills the registry (which then drops names
+/// silently), so neither runs while the other does. The long-name test
+/// takes no slot and skips it.
+#[cfg(test)]
+pub(crate) static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Test-only: report whether `name` is currently in the registry.
 /// Walks the slot pool without locking.
 #[cfg(test)]
@@ -319,8 +327,8 @@ impl SharedMemory {
     ///
     /// The production read path uses `ReadOnlyShm::open(name, size)`
     /// — it takes the data length out-of-band (the protocol is the
-    /// authoritative size source) and integrates with
-    /// `arrow_ipc::read_batches_from_shm`'s zero-copy `Buffer`. This
+    /// authoritative size source) and `arrow_ipc::map_shm` wraps it as a
+    /// zero-copy `Buffer`. This
     /// entry point uses `fstat` to size its mapping, which is
     /// unreliable on Darwin POSIX shm; it remains only for the
     /// existence-probe pattern in tests (`open_readonly(name).is_ok()`
@@ -455,9 +463,10 @@ impl SharedMemory {
     /// The shm object remains available for other processes to read.
     /// Consumes self, munmaps but does not shm_unlink.
     ///
-    /// Used by `test_util` to hand a writable fixed-size shm off to a
-    /// reader; production output paths use `ShmWriter::finish` which
-    /// performs the equivalent munmap + ftruncate-down + close in one step.
+    /// Used by this module's tests to leave a segment for a reader;
+    /// production outputs use `ShmWriter::finish`, which munmaps and closes
+    /// without unlinking (and without a second `ftruncate`, which Darwin
+    /// refuses).
     #[cfg(unix)]
     #[allow(dead_code)]
     pub fn detach(mut self) {
@@ -512,9 +521,8 @@ fn to_cstring(name: &str) -> io::Result<CString> {
 /// An immutable mmap of a POSIX shm segment, opened with `O_RDONLY` and
 /// mapped `PROT_READ`. Write attempts would be SIGBUS at the OS level, so
 /// the mapping is genuinely shareable across threads — `Send + Sync` is
-/// sound by construction. Used by `arrow_ipc::read_batches_from_shm` and
-/// `read_batches_from_shm` to wrap a segment as a zero-copy
-/// `arrow_buffer::Buffer`.
+/// sound by construction. Used by `arrow_ipc::map_shm` to wrap a segment
+/// as a zero-copy `arrow_buffer::Buffer`.
 ///
 /// The struct does NOT unlink on drop; it only munmaps. The shm name is
 /// owned by the caller (typically miint).
@@ -537,15 +545,20 @@ impl ReadOnlyShm {
     /// must travel out-of-band via the protocol (`BatchRequest::shm_input_size`
     /// for inputs, `ShmOutput::size` for outputs).
     ///
-    /// `size == 0` is allowed only when the segment is genuinely empty —
-    /// a freshly-created shm whose `ftruncate` has not yet enlarged it,
-    /// or a tool whose input batch is intentionally zero-length. Passing
-    /// `size == 0` for a non-empty segment is treated as a caller bug
-    /// (forgot to plumb `shm_input_size`) and surfaced as an error
-    /// rather than silently returning an empty handle. The check uses
-    /// `fstat` solely as a sanity gate — `st_size > 0` is a reliable
-    /// signal of "non-empty" on both Linux and macOS even when its exact
-    /// value isn't trustworthy on Darwin.
+    /// `fstat` serves only as a sanity gate on `size`: its `st_size` is
+    /// not the data length on Darwin (it is rounded up to a page), but it
+    /// is never less than the data, and `st_size > 0` reliably means
+    /// "non-empty", on both Linux and macOS. Two sizes are caller bugs and
+    /// refused:
+    ///
+    /// - past the end of the segment: mapping it would succeed, and a read
+    ///   past the object's last page would be SIGBUS, which kills the
+    ///   process without running the cleanup handler;
+    /// - `size == 0` against a non-empty segment (forgot to plumb
+    ///   `shm_input_size`), rather than silently returning an empty
+    ///   handle. `size == 0` is allowed when the segment is genuinely
+    ///   empty — a freshly-created shm whose `ftruncate` has not yet
+    ///   enlarged it, or an input that is intentionally empty.
     #[cfg(unix)]
     pub fn open(name: &str, size: usize) -> io::Result<Self> {
         let c_name = to_cstring(name)?;
@@ -554,24 +567,33 @@ impl ReadOnlyShm {
             if fd < 0 {
                 return Err(io::Error::last_os_error());
             }
-            // Special-case the empty mapping: mmap with len=0 is undefined.
-            // Reject `size == 0` against a non-empty segment as a caller
-            // bug (likely forgot to plumb shm_input_size).
-            if size == 0 {
-                let mut stat: libc::stat = std::mem::zeroed();
-                let rc = libc::fstat(fd, &mut stat);
+            let mut stat: libc::stat = std::mem::zeroed();
+            if libc::fstat(fd, &mut stat) < 0 {
+                let err = io::Error::last_os_error();
                 libc::close(fd);
-                if rc < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if stat.st_size > 0 {
+                return Err(err);
+            }
+            let segment_len = u64::try_from(stat.st_size).unwrap_or(0);
+            if size as u64 > segment_len {
+                libc::close(fd);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "size {size} is past the end of segment '{name}' \
+                         (fstat reports {segment_len} bytes)"
+                    ),
+                ));
+            }
+            // Special-case the empty mapping: mmap with len=0 is undefined.
+            if size == 0 {
+                libc::close(fd);
+                if segment_len > 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
                             "ReadOnlyShm::open called with size=0 against non-empty \
-                             segment '{name}' (fstat reports {} bytes); caller likely \
-                             forgot to plumb shm_input_size",
-                            stat.st_size
+                             segment '{name}' (fstat reports {segment_len} bytes); caller \
+                             likely forgot to plumb shm_input_size"
                         ),
                     ));
                 }
@@ -712,13 +734,6 @@ mod tests {
         assert!(output_shm_name("").is_err());
     }
 
-    /// Serializes tests that compete for slots in the global pool: any test
-    /// that asserts on its own slot landing must run while no other slot-
-    /// pressure test is filling the pool. The basic and overflow tests
-    /// share this lock; the long-name test doesn't consume slots and skips
-    /// it.
-    static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn test_cleanup_registry() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
@@ -801,5 +816,19 @@ mod tests {
         let long = format!("/gb-{}", "x".repeat(NAME_BUF_LEN));
         register_for_cleanup(&long);
         assert!(!is_registered(&long), "Over-long name must not register");
+    }
+
+    /// A size past the segment's end is refused at open: a read past the
+    /// object's last page would be SIGBUS, which kills the daemon.
+    #[test]
+    fn test_read_only_open_refuses_a_size_past_the_segment() {
+        let name = format!("/gb-test-past-{}", std::process::id());
+        let _segment = SharedMemory::create(&name, 16).unwrap();
+        // Past any page rounding of the 16 bytes
+        match ReadOnlyShm::open(&name, 1 << 20) {
+            Ok(_) => panic!("a size past the segment was mapped"),
+            Err(e) => assert!(e.to_string().contains("past the end"), "{e}"),
+        }
+        assert!(ReadOnlyShm::open(&name, 16).is_ok());
     }
 }

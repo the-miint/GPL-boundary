@@ -2,10 +2,12 @@ use std::ffi::{CStr, CString};
 use std::io::Write;
 use std::os::raw::{c_char, c_int, c_void};
 
-use arrow::array::StringArray;
+use arrow::record_batch::RecordBatch;
 
-use crate::protocol::Response;
-use crate::tools::{ConfigParam, FieldDescription, GplTool, ToolDescription, ToolRegistration};
+use crate::tools::{
+    holds_nul, non_null, utf8_column, ConfigParam, FieldDescription, GplTool, ToolDescription,
+    ToolOutput, ToolRegistration,
+};
 
 // ---------------------------------------------------------------------------
 // FFI bindings — mirror ext/bowtie2/bt2_api.h (build API)
@@ -101,27 +103,22 @@ struct BuildInput {
     n_bases: i64,
 }
 
-fn read_input(shm_input: &str, shm_input_size: usize) -> Result<BuildInput, String> {
-    let batches = crate::arrow_ipc::read_batches_from_shm(shm_input, shm_input_size)?;
+fn read_input(batches: &[RecordBatch]) -> Result<BuildInput, String> {
     let mut names = Vec::new();
     let mut seqs = Vec::new();
     let mut n_bases: i64 = 0;
-    for batch in &batches {
-        let name_col = batch
-            .column_by_name("name")
-            .ok_or("Input missing 'name' column")?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or("'name' column is not Utf8")?;
-        let seq_col = batch
-            .column_by_name("sequence")
-            .ok_or("Input missing 'sequence' column")?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or("'sequence' column is not Utf8")?;
+    for batch in batches {
+        let (name_col, seq_col) = (utf8_column(batch, "name")?, utf8_column(batch, "sequence")?);
         for i in 0..batch.num_rows() {
-            let n = name_col.value(i);
-            let s = seq_col.value(i);
+            let row = names.len() + 1;
+            let n = non_null(name_col, i, row, "name")?;
+            let s = non_null(seq_col, i, row, "sequence")?;
+            // Refused before the FASTA, as the other tools refuse a NUL
+            for (value, column) in [(n, "name"), (s, "sequence")] {
+                if value.contains('\0') {
+                    return Err(holds_nul(row, column));
+                }
+            }
             // FASTA convention is that bowtie2-build splits names on the
             // first whitespace character — `>chr1 dna:primary` becomes
             // reference name `chr1` in the index, silently dropping the
@@ -131,18 +128,18 @@ fn read_input(shm_input: &str, shm_input_size: usize) -> Result<BuildInput, Stri
             // the FASTA record boundary) up front so the failure mode is
             // a clear error rather than silent name truncation.
             if n.is_empty() {
-                return Err(format!("Sequence name {i} is empty"));
+                return Err(format!("input row {row}: empty name"));
             }
             if n.chars().any(|c| c.is_whitespace()) || n.contains('>') {
                 return Err(format!(
-                    "Sequence name {i} contains whitespace or '>'; bowtie2 \
+                    "input row {row}: name contains whitespace or '>'; bowtie2 \
                      would silently truncate it (FASTA name = first token). \
                      Strip these before submitting.",
                 ));
             }
             if s.contains('\n') || s.contains('\r') || s.contains('>') {
                 return Err(format!(
-                    "Sequence body {i} contains a newline or '>' character"
+                    "input row {row}: sequence contains a newline or '>' character"
                 ));
             }
             n_bases += s.len() as i64;
@@ -311,55 +308,40 @@ impl GplTool for Bowtie2BuildTool {
     fn execute(
         &self,
         config: &serde_json::Value,
-        shm_input: &str,
-        shm_input_size: usize,
-    ) -> Response {
-        let index_path = match config.get("index_path").and_then(|v| v.as_str()) {
-            Some(s) => s.to_string(),
-            None => {
-                return Response::error("index_path is required (output basename for .bt2 files)");
-            }
-        };
+        batches: Vec<RecordBatch>,
+    ) -> Result<ToolOutput, String> {
+        let index_path = (config.get("index_path").and_then(|v| v.as_str()))
+            .ok_or("index_path is required (output basename for .bt2 files)")?
+            .to_string();
 
         let verbose = config
             .get("verbose")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let input = match read_input(shm_input, shm_input_size) {
-            Ok(v) => v,
-            Err(e) => return Response::error(e),
-        };
+        let input = read_input(&batches)?;
+        // Copied out: release the batches before the build
+        drop(batches);
 
         if input.names.is_empty() {
-            return Response::error("At least 1 sequence required");
+            return Err("At least 1 sequence required".to_string());
         }
         let n_seqs = input.names.len() as i64;
         let n_bases = input.n_bases;
 
-        // Materialize a tempfile FASTA. Suboptimal: bowtie2's C builder API
-        // only accepts disk paths today (`ref_paths`). Phase 6 adds an
-        // in-memory path — see GUIDANCE_BT2_BUILD_API.md.
-        let tmpfile = match tempfile::Builder::new()
+        // Materialize a tempfile FASTA: bowtie2's C builder API takes disk
+        // paths only (`ref_paths`).
+        let tmpfile = (tempfile::Builder::new()
             .prefix("gb-bt2-build-")
-            .suffix(".fa")
-            .tempfile()
-        {
-            Ok(f) => f,
-            Err(e) => return Response::error(format!("Failed to create FASTA tempfile: {e}")),
-        };
-        if let Err(e) = write_fasta(tmpfile.path(), &input) {
-            return Response::error(e);
-        }
+            .suffix(".fa"))
+        .tempfile()
+        .map_err(|e| format!("Failed to create FASTA tempfile: {e}"))?;
+        write_fasta(tmpfile.path(), &input)?;
 
-        let ref_path_c = match CString::new(tmpfile.path().to_string_lossy().as_ref()) {
-            Ok(c) => c,
-            Err(_) => return Response::error("FASTA tempfile path contains a null byte"),
-        };
-        let output_base_c = match CString::new(index_path.as_str()) {
-            Ok(c) => c,
-            Err(_) => return Response::error("index_path contains a null byte"),
-        };
+        let ref_path_c = CString::new(tmpfile.path().to_string_lossy().as_ref())
+            .map_err(|_| "FASTA tempfile path contains a null byte")?;
+        let output_base_c =
+            CString::new(index_path.as_str()).map_err(|_| "index_path contains a null byte")?;
         let ref_ptrs: [*const c_char; 1] = [ref_path_c.as_ptr()];
 
         // SAFETY: `bt2.ref_paths`, `bt2.output_base`, and the `ref_ptrs`
@@ -402,7 +384,7 @@ impl GplTool for Bowtie2BuildTool {
                 let cat = CStr::from_ptr(bt2_strerror(error_code))
                     .to_string_lossy()
                     .into_owned();
-                return Response::error(format!("Failed to create bowtie2 build context: {cat}"));
+                return Err(format!("Failed to create bowtie2 build context: {cat}"));
             }
 
             let mut stats: Bt2BuildStats = std::mem::zeroed();
@@ -415,7 +397,7 @@ impl GplTool for Bowtie2BuildTool {
                     .to_string_lossy()
                     .into_owned();
                 bt2_build_destroy(ctx);
-                return Response::error(format!("{cat}: {detail}"));
+                return Err(format!("{cat}: {detail}"));
             }
 
             bt2_build_destroy(ctx);
@@ -438,7 +420,7 @@ impl GplTool for Bowtie2BuildTool {
             .filter(|s| index_files.iter().any(|f| f.ends_with(*s)))
             .count();
         if small_count != INDEX_SUFFIXES_SMALL.len() && large_count != INDEX_SUFFIXES_LARGE.len() {
-            return Response::error(format!(
+            return Err(format!(
                 "bowtie2-build returned success but only {} of {} index files \
                  were found at {} (found: {:?}). The index is incomplete.",
                 index_files.len(),
@@ -454,7 +436,10 @@ impl GplTool for Bowtie2BuildTool {
             "n_bases": n_bases,
             "index_files": index_files,
         });
-        Response::ok(result, vec![])
+        Ok(ToolOutput {
+            outputs: vec![],
+            result,
+        })
     }
 }
 
@@ -465,7 +450,7 @@ impl GplTool for Bowtie2BuildTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{unique_shm_name, write_arrow_to_shm};
+    use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
@@ -507,16 +492,32 @@ mod tests {
 
     #[test]
     fn test_missing_index_path() {
-        // Validates that index_path is rejected before we touch the shm at
-        // all — pass a name that doesn't exist, and rely on the validation
-        // failing first. If the field-order in execute() is ever reshuffled
-        // and shm is read before config validation, this test will start
-        // failing with an "open shm" error and that's a deliberate signal
-        // to put validation back in front.
+        // index_path is checked before the input: an input the reader
+        // refuses still gives the index_path error.
         let tool = Bowtie2BuildTool;
-        let resp = tool.execute(&serde_json::json!({}), "/never-created-bt2-shm", 0);
-        assert!(!resp.success);
-        assert!(resp.error.unwrap().contains("index_path"));
+        let refused = make_batch(&["chr1 dna"], &["ACGT"]);
+        assert!(read_input(std::slice::from_ref(&refused)).is_err());
+        let err = tool
+            .execute(&serde_json::json!({}), vec![refused])
+            .unwrap_err();
+        assert!(err.contains("index_path"), "{err}");
+    }
+
+    /// A NUL byte in a name or a sequence is refused, naming its row: the
+    /// C builder would read the FASTA record short.
+    #[test]
+    fn test_rejects_nul_byte() {
+        let first = make_batch(&["chr1"], &["ACGT"]);
+        for (name, seq, wanted) in [
+            ("chr\0", "ACGT", "input row 2: name holds a NUL byte"),
+            ("chr2", "AC\0GT", "input row 2: sequence holds a NUL byte"),
+        ] {
+            let batch = make_batch(&[name], &[seq]);
+            match read_input(&[first.clone(), batch]) {
+                Ok(_) => panic!("expected {wanted:?}, got Ok"),
+                Err(e) => assert_eq!(e, wanted),
+            }
+        }
     }
 
     fn make_batch(names: &[&str], seqs: &[&str]) -> RecordBatch {
@@ -536,14 +537,11 @@ mod tests {
 
     #[test]
     fn test_rejects_name_with_newline() {
-        let shm = unique_shm_name("bt2b-bad-name-nl");
         let batch = make_batch(&["bad\nname"], &["ACGT"]);
-        let holder = write_arrow_to_shm(&shm, &batch);
-        let err = match read_input(&shm, holder.len()) {
+        let err = match read_input(&[batch]) {
             Err(e) => e,
             Ok(_) => panic!("Expected error for name containing newline"),
         };
-        let _ = crate::shm::SharedMemory::unlink(&shm);
         assert!(err.contains("whitespace"), "Unexpected error: {err}");
     }
 
@@ -552,28 +550,50 @@ mod tests {
         // bowtie2 silently truncates `chr1 dna:primary` to `chr1`. Detect
         // the bad input here so the user gets an explanation, not a quiet
         // mismatch between input names and aligned output names.
-        let shm = unique_shm_name("bt2b-bad-name-sp");
         let batch = make_batch(&["chr1 dna:primary"], &["ACGT"]);
-        let holder = write_arrow_to_shm(&shm, &batch);
-        let err = match read_input(&shm, holder.len()) {
+        let err = match read_input(&[batch]) {
             Err(e) => e,
             Ok(_) => panic!("Expected error for name containing space"),
         };
-        let _ = crate::shm::SharedMemory::unlink(&shm);
         assert!(err.contains("whitespace"), "Unexpected error: {err}");
         assert!(err.contains("truncate"), "Error should explain why: {err}");
     }
 
+    /// A null name or sequence is refused, naming its input row (1-based,
+    /// counted across batches), not read as an empty string.
+    #[test]
+    fn test_rejects_null_name_or_sequence() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("sequence", DataType::Utf8, true),
+        ]));
+        let first = make_batch(&["chr1", "chr2"], &["ACGT", "ACGT"]);
+        for (name, seq, wanted) in [
+            (None, Some("ACGT"), "input row 3: null name"),
+            (Some("chr3"), None, "input row 3: null sequence"),
+        ] {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec![name])),
+                    Arc::new(StringArray::from(vec![seq])),
+                ],
+            )
+            .unwrap();
+            match read_input(&[first.clone(), batch]) {
+                Ok(_) => panic!("expected {wanted:?}, got Ok"),
+                Err(e) => assert!(e.contains(wanted), "expected {wanted:?}, got: {e}"),
+            }
+        }
+    }
+
     #[test]
     fn test_rejects_empty_name() {
-        let shm = unique_shm_name("bt2b-empty-name");
         let batch = make_batch(&[""], &["ACGT"]);
-        let holder = write_arrow_to_shm(&shm, &batch);
-        let err = match read_input(&shm, holder.len()) {
+        let err = match read_input(&[batch]) {
             Err(e) => e,
             Ok(_) => panic!("Expected error for empty name"),
         };
-        let _ = crate::shm::SharedMemory::unlink(&shm);
         assert!(err.contains("empty"), "Unexpected error: {err}");
     }
 

@@ -5,8 +5,11 @@ pub mod fasttree;
 pub mod prodigal;
 pub mod prodigal_train;
 
-use crate::protocol::{BatchRequest, Response};
+use crate::protocol::Response;
+use arrow::array::{Array, AsArray, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use std::ffi::CString;
 use std::os::raw::c_int;
 
 /// Description of an Arrow schema field for introspection.
@@ -46,8 +49,8 @@ pub(crate) fn arrow_schema(fields: &[FieldDescription]) -> Result<Schema, String
     Ok(Schema::new(fields?))
 }
 
-/// Description of one of a tool's shm outputs: its label (as the response's
-/// `shm_outputs` carry it) and its Arrow schema.
+/// Description of one of a tool's outputs: its label (as the response
+/// carries it) and its Arrow schema.
 #[derive(serde::Serialize)]
 pub struct OutputDescription {
     pub label: &'static str,
@@ -84,6 +87,69 @@ pub(crate) fn checked_cint(name: &str, v: impl Into<i128>) -> Result<c_int, Stri
         return Err(format!("{name}={v} below C int range (min {})", c_int::MIN));
     }
     Ok(v as c_int)
+}
+
+// --- Input ---
+//
+// An input error names its input row where there is one: 1-based, counted
+// across the request's record batches.
+
+/// A batch's Utf8 column by name; one missing or of another type is
+/// refused.
+pub(crate) fn utf8_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a StringArray, String> {
+    optional_utf8_column(batch, name)?.ok_or_else(|| format!("Input missing '{name}' column"))
+}
+
+/// As `utf8_column`, for a column the input may leave out.
+pub(crate) fn optional_utf8_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<Option<&'a StringArray>, String> {
+    (batch.column_by_name(name))
+        .map(|c| (c.as_string_opt::<i32>()).ok_or_else(|| format!("'{name}' column is not Utf8")))
+        .transpose()
+}
+
+/// Value `i` of a Utf8 column, which is input row `row`; a null is refused.
+pub(crate) fn non_null<'a>(
+    column: &'a StringArray,
+    i: usize,
+    row: usize,
+    name: &str,
+) -> Result<&'a str, String> {
+    if column.is_null(i) {
+        return Err(format!("input row {row}: null {name}"));
+    }
+    Ok(column.value(i))
+}
+
+/// C strings of a column's values, one per input row in order. A value
+/// holding a NUL byte would reach the C library cut short, so it is
+/// refused.
+pub(crate) fn c_strings(values: &[String], column: &str) -> Result<Vec<CString>, String> {
+    (values.iter().enumerate())
+        .map(|(i, s)| CString::new(s.as_str()).map_err(|_| holds_nul(i + 1, column)))
+        .collect()
+}
+
+/// As `c_strings`, for a nullable column; a null stays None.
+pub(crate) fn c_optional_strings(
+    values: &[Option<String>],
+    column: &str,
+) -> Result<Vec<Option<CString>>, String> {
+    (values.iter().enumerate())
+        .map(|(i, v)| {
+            (v.as_deref().map(CString::new).transpose()).map_err(|_| holds_nul(i + 1, column))
+        })
+        .collect()
+}
+
+/// The refusal of a NUL byte in `column` at input row `row`.
+pub(crate) fn holds_nul(row: usize, column: &str) -> String {
+    format!("input row {row}: {column} holds a NUL byte")
 }
 
 /// Check that `config` is an object (null: no knobs) whose knobs are all
@@ -193,60 +259,82 @@ pub struct ToolDescription {
     pub description: &'static str,
     pub config_params: Vec<ConfigParam>,
     pub input_schema: Vec<FieldDescription>,
-    /// Every shm output a successful batch carries, in response order.
+    /// Every output a successful batch carries, in response order.
     pub outputs: Vec<OutputDescription>,
     pub response_metadata: Vec<FieldDescription>,
 }
 
-/// A reusable tool context for batched streaming. Created once per session
-/// via `GplTool::create_streaming_context`, then used for multiple batches.
-/// Holds expensive state (loaded index, reference DB) that is reused across
-/// `run_batch` calls. The `Drop` impl must call the C library's `destroy()`.
+/// What a tool returns for one batch.
 ///
-/// `Send` is required because the Phase 4 worker registry stores contexts
-/// inside an `Arc<dyn Worker>` whose `Mutex<Option<Box<dyn StreamingContext>>>`
-/// must be `Send + Sync`. The contexts themselves are not accessed concurrently
-/// — the Mutex guarantees single-threaded use of the underlying C state — but
-/// they may be created on one thread and dropped on another (e.g. during
-/// step-4 idle-deadline eviction from a sweeper thread). Any C library held
-/// inside a context must therefore be safe to free from a thread other than
-/// the one that constructed it. All current submodules satisfy this.
-pub trait StreamingContext: Send {
-    /// Process one batch of input. Same contract as `GplTool::execute()` but
-    /// against a pre-loaded context: reads input from shm, creates output shm,
-    /// returns Response.
-    ///
-    /// **Caller responsibility**: after writing the Response to stdout, the
-    /// caller must call `shm::deregister_cleanup` for each `shm_outputs` entry.
-    /// Output shm is registered for signal-handler cleanup inside `run_batch`;
-    /// deregistering transfers ownership to miint. This must happen *after*
-    /// the response is on stdout to prevent leaks if a signal arrives mid-write.
-    fn run_batch(&mut self, shm_input: &str, shm_input_size: usize) -> Response;
+/// `outputs` are the batch's output tables, each one record batch under
+/// its label, in the order the response lists them. They are the labels
+/// and order of the tool's `ToolDescription::outputs`, which the tool's
+/// tests check; at run time only a label's syntax is checked, when its
+/// segment is named. `result` is the response's `result` JSON.
+///
+/// Each output record batch owns its memory. One must not view memory the
+/// C library frees, since the front end writes it out after the call has
+/// returned and the tool has released its C state.
+#[derive(Debug)]
+pub struct ToolOutput {
+    pub outputs: Vec<(&'static str, RecordBatch)>,
+    pub result: serde_json::Value,
 }
 
-/// Trait for GPL-licensed tools that can be dispatched.
-pub trait GplTool {
+/// A tool's loaded state for a run of batches under one config: an index,
+/// a model. Created by `GplTool::create_streaming_context` and kept by the
+/// fingerprint's worker, which calls `run_batch` once per batch, one at a
+/// time. The `Drop` impl must call the C library's `destroy()`.
+///
+/// `Send` because a context is made on one thread, then used and dropped
+/// on its worker's own thread, so the C state it holds must not be tied
+/// to the thread that made it.
+pub trait StreamingContext: Send {
+    /// Run one batch against the context. Input, output and errors are
+    /// those of `GplTool::execute`. An error fails only this batch: the
+    /// context must stay usable for the next.
+    fn run_batch(&mut self, input: Vec<RecordBatch>) -> Result<ToolOutput, String>;
+}
+
+/// A GPL tool, free of any transport: it takes decoded record batches and
+/// returns record batches. A front end moves them between the tool and
+/// the caller; natively that is `crate::frontend`.
+///
+/// `Send` so that a worker can make the tool on one thread and run it on
+/// its own.
+pub trait GplTool: Send {
     fn name(&self) -> &str;
     fn version(&self) -> String;
     /// Output Arrow schema version. Bump on any breaking schema change
     /// (new/removed/renamed columns, type changes) so consumers can fail fast.
     fn schema_version(&self) -> u32;
     fn describe(&self) -> ToolDescription;
-    /// Execute the tool (single-shot). The tool reads `shm_input_size`
-    /// bytes from `shm_input` (the protocol's authoritative size — `fstat`
-    /// is not reliable on Darwin), creates its own output shm, and
-    /// returns a Response.
+
+    /// Run the tool on one batch.
+    ///
+    /// `input` is every record batch of the request's Arrow stream, in
+    /// order; there may be none. Natively the record batches are read-only
+    /// views of the caller's input segment. A tool must not keep them, or
+    /// any array sliced from them, past the call: one kept keeps the whole
+    /// input mapped, and a pointer the C library holds into them dangles
+    /// once they drop. The tool takes them by value so that one which
+    /// copies its input can drop them, and the mapping with them, before
+    /// the C library runs. Natively the batches are one stream's and share
+    /// its schema; a tool looks its columns up in each batch rather than
+    /// rely on that.
+    ///
+    /// An `Err` becomes the error response, its message the response's
+    /// `error`, and no output is written. On `Ok` the front end writes
+    /// every output or, if one write fails, none.
     fn execute(
         &self,
         config: &serde_json::Value,
-        shm_input: &str,
-        shm_input_size: usize,
-    ) -> Response;
+        input: Vec<RecordBatch>,
+    ) -> Result<ToolOutput, String>;
 
-    /// Create a streaming context for batched execution. Returns `Ok(Some(ctx))`
-    /// if the tool supports streaming, `Ok(None)` if it does not (default).
-    /// The context holds expensive state (loaded index, models) and is reused
-    /// across multiple `run_batch()` calls.
+    /// The tool's streaming context for `config`: `Ok(Some(ctx))` if the
+    /// tool streams, `Ok(None)` if it does not (the default), and `Err`
+    /// if the context cannot be made (a missing index, a bad config).
     fn create_streaming_context(
         &self,
         config: &serde_json::Value,
@@ -272,58 +360,48 @@ fn all_tools() -> Vec<Box<dyn GplTool>> {
         .collect()
 }
 
-/// Dispatch a single batch to the appropriate tool. Stateless: each call
-/// runs the tool's `execute` from scratch. Phase 4's worker pool will keep
-/// long-lived contexts; Phase 3 still falls through to this path for tools
-/// that don't expose `create_streaming_context`.
-pub fn dispatch(request: &BatchRequest) -> Response {
-    let tool = all_tools().into_iter().find(|t| t.name() == request.tool);
-    match tool {
-        Some(t) => {
-            let mut response =
-                t.execute(&request.config, &request.shm_input, request.shm_input_size);
-            if response.success {
-                response.schema_version = Some(t.schema_version());
-            }
-            response
+/// The registered tool named `name`.
+fn find_tool(name: &str) -> Option<Box<dyn GplTool>> {
+    (inventory::iter::<ToolRegistration>.into_iter())
+        .map(|reg| (reg.create)())
+        .find(|tool| tool.name() == name)
+}
+
+/// What a worker runs its batches on: the tool's streaming context, made
+/// once for the worker's config, or, for a tool without one, the tool
+/// itself, run afresh for each batch.
+pub enum Runner {
+    Streaming(Box<dyn StreamingContext>),
+    PerBatch(Box<dyn GplTool>),
+}
+
+impl Runner {
+    /// Run one batch. `config` is the batch's own (a per-batch tool reads
+    /// it); a streaming context was made from the same config.
+    pub fn run(
+        &mut self,
+        config: &serde_json::Value,
+        input: Vec<RecordBatch>,
+    ) -> Result<ToolOutput, String> {
+        match self {
+            Self::Streaming(ctx) => ctx.run_batch(input),
+            Self::PerBatch(tool) => tool.execute(config, input),
         }
-        None => Response::error(format!("Unknown tool: {}", request.tool)),
     }
 }
 
-/// `(streaming context, tool schema_version)` returned by a successful
-/// `streaming_setup` call.
-pub type StreamingSession = (Box<dyn StreamingContext>, u32);
-
-/// Try to set up a streaming context for the named tool.
-///
-/// Three outcomes:
-/// - `Err(response)` — real failure: unknown tool name, OR the tool supports
-///   streaming but `create_streaming_context` returned an error (e.g.
-///   bowtie2 index not found). The caller should surface this response
-///   directly to the client; do NOT fall back to per-batch dispatch.
-/// - `Ok(None)` — the tool exists but does not implement streaming (i.e.
-///   `create_streaming_context` returned `Ok(None)`). Caller should fall
-///   through to `dispatch` for each batch; there is no long-lived context
-///   to set up.
-/// - `Ok(Some((ctx, schema_version)))` — context successfully created;
-///   reuse `ctx` across all batches in the session.
+/// The runner for the tool named `tool` under `config`, and the tool's
+/// schema_version. The error response names an unknown tool, or a
+/// streaming context that cannot be made (e.g. a bowtie2 index not found),
+/// prefixed with the tool's name; the caller surfaces it as it is.
 #[allow(clippy::result_large_err)] // see registry::build_worker
-pub fn streaming_setup(
-    tool_name: &str,
-    config: &serde_json::Value,
-) -> Result<Option<StreamingSession>, Response> {
-    let tool = all_tools().into_iter().find(|t| t.name() == tool_name);
-    match tool {
-        None => Err(Response::error(format!("Unknown tool: {tool_name}"))),
-        Some(t) => {
-            let schema_version = t.schema_version();
-            match t.create_streaming_context(config) {
-                Ok(Some(ctx)) => Ok(Some((ctx, schema_version))),
-                Ok(None) => Ok(None),
-                Err(e) => Err(Response::error(format!("{tool_name}: {e}"))),
-            }
-        }
+pub fn open(tool: &str, config: &serde_json::Value) -> Result<(Runner, u32), Response> {
+    let found = find_tool(tool).ok_or_else(|| Response::error(format!("Unknown tool: {tool}")))?;
+    let schema_version = found.schema_version();
+    match found.create_streaming_context(config) {
+        Ok(Some(ctx)) => Ok((Runner::Streaming(ctx), schema_version)),
+        Ok(None) => Ok((Runner::PerBatch(found), schema_version)),
+        Err(e) => Err(Response::error(format!("{tool}: {e}"))),
     }
 }
 
@@ -334,20 +412,7 @@ pub fn list_tools() -> Vec<String> {
 
 /// Describe a specific tool, or None if not found.
 pub fn describe_tool(name: &str) -> Option<ToolDescription> {
-    all_tools()
-        .into_iter()
-        .find(|t| t.name() == name)
-        .map(|t| t.describe())
-}
-
-/// Look up the schema version for `name` without paying the cost of a full
-/// `describe()`. Used by the subprocess worker to populate response
-/// `schema_version` after `streaming_setup` succeeds.
-pub fn tool_schema_version(name: &str) -> Option<u32> {
-    all_tools()
-        .into_iter()
-        .find(|t| t.name() == name)
-        .map(|t| t.schema_version())
+    find_tool(name).map(|t| t.describe())
 }
 
 /// (name, schema_version) for every registered tool, sorted by name for
@@ -406,24 +471,79 @@ mod tests {
         );
     }
 
+    /// A required column missing or not Utf8 is refused, naming it; an
+    /// optional one may be absent.
     #[test]
-    fn test_dispatch_unknown_tool() {
-        let request = BatchRequest {
-            tool: "nonexistent".to_string(),
-            config: serde_json::json!({}),
-            shm_input: "/dummy".to_string(),
-            shm_input_size: 0,
-            batch_id: None,
-            metrics: false,
-            received_at: None,
-        };
-        let response = dispatch(&request);
-        assert!(!response.success);
-        assert!(response
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("Unknown tool: nonexistent"));
+    fn test_utf8_columns_are_looked_up_by_name_and_type() {
+        use arrow::array::{ArrayRef, Int32Array};
+        use std::sync::Arc;
+        let batch = RecordBatch::try_from_iter([
+            ("name", Arc::new(StringArray::from(vec!["a"])) as ArrayRef),
+            ("count", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+        ])
+        .unwrap();
+        assert_eq!(utf8_column(&batch, "name").unwrap().value(0), "a");
+        assert_eq!(
+            utf8_column(&batch, "sequence").unwrap_err(),
+            "Input missing 'sequence' column"
+        );
+        assert_eq!(
+            utf8_column(&batch, "count").unwrap_err(),
+            "'count' column is not Utf8"
+        );
+        assert!(optional_utf8_column(&batch, "qual1").unwrap().is_none());
+        assert!(optional_utf8_column(&batch, "name").unwrap().is_some());
+        assert_eq!(
+            optional_utf8_column(&batch, "count").unwrap_err(),
+            "'count' column is not Utf8"
+        );
+    }
+
+    #[test]
+    fn test_c_strings_name_the_row_of_a_nul_byte() {
+        let values = ["a".to_string(), "b\0".to_string()];
+        let err = c_strings(&values, "name").unwrap_err();
+        assert_eq!(err, "input row 2: name holds a NUL byte");
+        let optional = [None, Some("q".to_string()), Some("\0".to_string())];
+        let err = c_optional_strings(&optional, "qual1").unwrap_err();
+        assert_eq!(err, "input row 3: qual1 holds a NUL byte");
+        let ok = c_optional_strings(&optional[..2], "qual1").unwrap();
+        assert!(ok[0].is_none());
+        assert_eq!(ok[1].as_deref(), Some(c"q"));
+    }
+
+    #[test]
+    fn test_open_unknown_tool() {
+        match open("nonexistent", &serde_json::json!({})) {
+            Err(resp) => assert!(resp.error.unwrap().contains("Unknown tool: nonexistent")),
+            Ok(_) => panic!("Expected Err for unknown tool"),
+        }
+    }
+
+    /// A tool without a streaming context runs per batch; one with runs
+    /// its context; one whose context cannot be made is an error naming
+    /// the tool. Each comes with the tool's schema_version.
+    #[test]
+    fn test_open_gives_each_tool_its_runner_or_its_error() {
+        let schema_version = |name: &str| describe_tool(name).unwrap().schema_version;
+        match open("fasttree", &serde_json::json!({})) {
+            Ok((Runner::PerBatch(tool), sv)) => {
+                assert_eq!(tool.name(), "fasttree");
+                assert_eq!(sv, schema_version("fasttree"));
+            }
+            Ok((Runner::Streaming(_), _)) => panic!("fasttree has no streaming context"),
+            Err(resp) => panic!("fasttree: {:?}", resp.error),
+        }
+        match open("prodigal", &serde_json::json!({})) {
+            Ok((Runner::Streaming(_), sv)) => assert_eq!(sv, schema_version("prodigal")),
+            Ok((Runner::PerBatch(_), _)) => panic!("prodigal streams"),
+            Err(resp) => panic!("prodigal: {:?}", resp.error),
+        }
+        let config = serde_json::json!({"index_path": "/nonexistent/idx"});
+        match open("bowtie2-align", &config) {
+            Err(resp) => assert!(resp.error.unwrap().starts_with("bowtie2-align: ")),
+            Ok(_) => panic!("bowtie2-align opened without an index"),
+        }
     }
 
     #[test]
@@ -496,21 +616,6 @@ mod tests {
         );
     }
 
-    // -- StreamingContext and streaming_setup tests --
-
-    #[test]
-    fn test_streaming_context_trait_is_object_safe() {
-        struct DummyCtx;
-        impl StreamingContext for DummyCtx {
-            fn run_batch(&mut self, _shm_input: &str, _shm_input_size: usize) -> Response {
-                Response::error("stub")
-            }
-        }
-        let mut ctx: Box<dyn StreamingContext> = Box::new(DummyCtx);
-        let resp = ctx.run_batch("/dummy", 0);
-        assert!(!resp.success);
-    }
-
     #[test]
     fn test_default_create_streaming_context_returns_none() {
         let tools = all_tools();
@@ -518,29 +623,6 @@ mod tests {
         let result = fasttree.create_streaming_context(&serde_json::json!({}));
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
-    }
-
-    #[test]
-    fn test_streaming_setup_unknown_tool() {
-        match streaming_setup("nonexistent", &serde_json::json!({})) {
-            Err(resp) => assert!(resp.error.as_ref().unwrap().contains("Unknown tool")),
-            Ok(_) => panic!("Expected Err for unknown tool"),
-        }
-    }
-
-    #[test]
-    fn test_streaming_setup_non_streaming_tool_returns_ok_none() {
-        // FastTree exists but does not support streaming. Returning
-        // `Ok(None)` lets the caller fall through to `dispatch` per batch
-        // without conflating "no streaming support" with "init failed".
-        match streaming_setup("fasttree", &serde_json::json!({})) {
-            Ok(None) => {}
-            Ok(Some(_)) => panic!("FastTree should not return a streaming context"),
-            Err(resp) => panic!(
-                "Expected Ok(None) for non-streaming tool, got Err: {:?}",
-                resp.error
-            ),
-        }
     }
 
     #[test]
