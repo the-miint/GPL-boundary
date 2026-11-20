@@ -337,9 +337,8 @@ impl GplTool for Bowtie2BuildTool {
         let n_seqs = input.names.len() as i64;
         let n_bases = input.n_bases;
 
-        // Materialize a tempfile FASTA. Suboptimal: bowtie2's C builder API
-        // only accepts disk paths today (`ref_paths`). Phase 6 adds an
-        // in-memory path — see GUIDANCE_BT2_BUILD_API.md.
+        // Materialize a tempfile FASTA: bowtie2's C builder API takes disk
+        // paths only (`ref_paths`).
         let tmpfile = (tempfile::Builder::new()
             .prefix("gb-bt2-build-")
             .suffix(".fa"))

@@ -619,7 +619,7 @@ mod tests {
         let _ = SharedMemory::unlink(&shm_out.name);
     }
 
-    // --- Phase 2 additions: zero-copy output + zero-copy input ---
+    // --- Zero-copy output and zero-copy input ---
 
     /// Build a RecordBatch large enough that the IPC body cannot be confused
     /// with the small framing bytes — easily detects truncation, page-fault,

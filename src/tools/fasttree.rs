@@ -125,7 +125,7 @@ pub fn input_schema() -> Schema {
 
 /// Output schema: SOA tree columnar data for miint.
 ///
-/// Schema version 2 (Phase 5) renames and widens for miint's tree-edge
+/// Schema version 2 renames and widens for miint's tree-edge
 /// join semantics:
 /// - `node_index` (Int64): node index `[0, n_nodes)`. Renamed from `id`.
 /// - `parent_index` (Int64, nullable): parent's `node_index`; NULL for the
@@ -166,7 +166,7 @@ fn output_schema() -> Schema {
 /// before this function so unsupplied knobs sit at their C-library defaults
 /// (e.g., `n_bootstrap = 1000`, `nni_rounds = -1` (auto), etc.).
 ///
-/// Wired-up knobs (Phase 1 onward):
+/// Wired-up knobs:
 /// - `seq_type`: "auto" (default) | "nucleotide" | "protein"
 /// - `seed`: i64, default 314159
 /// - `verbose`: bool, default false (routes stderr log if true)
@@ -713,10 +713,10 @@ impl GplTool for FastTreeTool {
     }
 
     /// CHANGELOG: `describe_version`
-    /// - 1: Phase 1 — bootstrap, nosupport, pseudo, pseudo_weight,
+    /// - 1: bootstrap, nosupport, pseudo, pseudo_weight,
     ///   nni, spr, mlnni, mlacc, cat, noml.
-    /// - 2: Phase 2 — threads.
-    /// - 3: Phase 3 — model, gtrrates, gtrfreq, slow, bionj, nj,
+    /// - 2: threads.
+    /// - 3: model, gtrrates, gtrfreq, slow, bionj, nj,
     ///   top, notop, topm, quote, fastest (rejected when true),
     ///   gamma.
     /// - 4: the output listed by label (`outputs`).
@@ -743,13 +743,6 @@ impl GplTool for FastTreeTool {
                     description: "Random seed for reproducibility",
                     allowed_values: vec![],
                 },
-                // NOTE: `model`, `fastest`, `gamma` were advertised here in the
-                // initial 6-param describe() surface but their JSON paths were
-                // never wired into the decoder. They are intentionally absent
-                // until Phase 3 wires them with proper validation (model needs
-                // gtrrates/gtrfreq companions; fastest interacts with nni —
-                // see TODO in apply_json_to_config; gamma is observable only in
-                // the response stats, not the tree).
                 ConfigParam {
                     name: "verbose",
                     param_type: "boolean",
@@ -1587,10 +1580,9 @@ mod tests {
         );
     }
 
-    /// Phase 0 smoke test: build a tree from the first 50 sequences of
-    /// `ext/fasttree/16S_500.tar.gz`'s `16S.1.p` PHYLIP file under the
-    /// current 6-param adapter surface. No native-FastTree parity yet —
-    /// that arrives in Phase 1 alongside each new wired knob.
+    /// Smoke test: build a tree from the first 50 sequences of
+    /// `ext/fasttree/16S_500.tar.gz`'s `16S.1.p` PHYLIP file and check its
+    /// shape. Parity with native FastTree is the parity tests' job.
     ///
     /// Validates: extraction works, the PHYLIP parser feeds clean input
     /// to the adapter, the tree-shape invariants hold, and the test-only
@@ -1632,10 +1624,9 @@ mod tests {
         assert_eq!(total, (n_nodes - 1) as i64);
     }
 
-    /// Phase 0 sanity: `fasttree_tree_soa_to_newick` round-trips the
-    /// in-process tree to a Newick string. Establishes that the
-    /// test-only FFI binding works end-to-end before Phase 1 starts
-    /// using it for parity comparisons.
+    /// `fasttree_tree_soa_to_newick` turns the in-process tree into a
+    /// Newick string: the test-only FFI binding the parity tests compare
+    /// through works end to end.
     #[test]
     fn test_soa_to_newick_via_c_smoke() {
         let alignment = subset_alignment(&parse_interleaved_phylip(&extracted_16s_phylip()), 20);
@@ -1800,7 +1791,7 @@ mod tests {
         assert_eq!(actual, EXPECTED);
     }
 
-    // === Phase 1, knob 1: bootstrap + nosupport ===
+    // === bootstrap + nosupport ===
 
     /// `bootstrap=100` overrides the C default of 1000. Smaller resample
     /// count → different SH-like support values; topology + branch lengths
@@ -1901,7 +1892,7 @@ mod tests {
         );
     }
 
-    // === Phase 1, knob 2: pseudo + pseudo_weight ===
+    // === pseudo + pseudo_weight ===
 
     /// `pseudo=true` with no explicit weight uses the default of 1.0.
     /// Verifies bit-equality against:
@@ -1988,7 +1979,7 @@ mod tests {
         );
     }
 
-    // === Phase 1, knob 3: nni ===
+    // === nni ===
 
     /// `nni=0` disables ME-NNI rounds. The JSON `nni` knob is **literal**:
     /// it sets only `nni_rounds`. The upstream `FastTree` CLI's `-nni 0`
@@ -2049,7 +2040,7 @@ mod tests {
         assert!(err.contains("nni"), "expected 'nni' in error, got: {err}");
     }
 
-    // === Phase 1, knob 4: spr ===
+    // === spr ===
 
     /// SPR rounds don't visibly affect the 50-seq tree (all values 0..=20
     /// converge to the same topology). 100 sequences give SPR room to find
@@ -2110,7 +2101,7 @@ mod tests {
         assert!(err.contains("spr"), "expected 'spr' in error, got: {err}");
     }
 
-    // === Phase 1, knob 5: mlnni ===
+    // === mlnni ===
 
     /// `mlnni=0` disables ML NNI rounds. Output differs from the auto
     /// default (2*log2(N)).
@@ -2169,7 +2160,7 @@ mod tests {
         );
     }
 
-    // === Phase 1, knob 6: mlacc ===
+    // === mlacc ===
 
     /// `mlacc=3` (vs C default 1) changes branch-length numerics.
     ///
@@ -2204,7 +2195,7 @@ mod tests {
         );
     }
 
-    // === Phase 1, knob 7: cat ===
+    // === cat ===
 
     /// `cat=5` (vs C default 20) changes ML rate-categorization.
     ///
@@ -2236,7 +2227,7 @@ mod tests {
         assert!(err.contains("cat"), "expected 'cat' in error, got: {err}");
     }
 
-    // === Phase 1, knob 8: noml ===
+    // === noml ===
 
     /// `noml=true` is exactly equivalent to `mlnni=0` (same C field set
     /// to 0, same Newick output). The dedicated parity reference is the
@@ -2288,7 +2279,7 @@ mod tests {
         assert_eq!(cfg.ml_nni_rounds, 0);
     }
 
-    // === Phase 2: threads ===
+    // === threads ===
 
     /// `threads=1` reproduces the existing 50-seq parity baseline, proving
     /// the JSON knob plumbs through to `n_threads` and that single-thread
@@ -2431,7 +2422,7 @@ mod tests {
         );
     }
 
-    // === Phase 3, knob 1: model + gtrrates + gtrfreq ===
+    // === model + gtrrates + gtrfreq ===
 
     /// `model="gtr"` (with FastTree estimating rates from the alignment)
     /// produces a tree distinct from the JC default. Verified bit-equal
@@ -2661,7 +2652,7 @@ mod tests {
         );
     }
 
-    // === Phase 3, knob 2: slow ===
+    // === slow ===
 
     /// `slow=true` sets `cfg.slow=1`. Output on the 16S 50-seq fixture
     /// is identical to the heuristic path; we still assert it equals
@@ -2715,7 +2706,7 @@ mod tests {
         assert_eq!(cfg.slow, 0);
     }
 
-    // === Phase 3, knob 3: bionj + nj ===
+    // === bionj + nj ===
 
     /// `bionj=true` enables weighted neighbor-joins; output differs
     /// from the (NJ-default) baseline.
@@ -2789,7 +2780,7 @@ mod tests {
         assert_eq!(cfg.use_bionj, 0);
     }
 
-    // === Phase 3, knob 4: top + notop + topm ===
+    // === top + notop + topm ===
 
     /// `notop=true` disables the top-hits heuristic. On 100-seq the
     /// resulting tree differs from the default (50-seq is too small
@@ -2915,7 +2906,7 @@ mod tests {
         assert!(err.contains("topm"));
     }
 
-    // === Phase 3, knob 5: quote ===
+    // === quote ===
 
     /// `quote=true` flips `cfg.quote_names`. Has no observable effect
     /// via the SOA → Arrow path (the test-only FFI emits raw names),
@@ -2938,7 +2929,7 @@ mod tests {
         assert_eq!(cfg.quote_names, 0);
     }
 
-    // === Phase 3, knob 6: fastest (rejected when true) ===
+    // === fastest (rejected when true) ===
 
     /// `fastest=true` is rejected. The C library API exposes a strict
     /// subset of the CLI's `-fastest` flag (missing `tophitsRefresh`
@@ -2969,7 +2960,7 @@ mod tests {
         assert_eq!(cfg.fastest, 0);
     }
 
-    // === Phase 3, knob 7: gamma ===
+    // === gamma ===
 
     /// `gamma=true` flips `cfg.gamma_log_lk = 1`. Topology is
     /// unchanged; observable effect is that

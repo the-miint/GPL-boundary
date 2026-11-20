@@ -21,9 +21,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 // async-signal-safety forbids `pthread_mutex_lock` (and therefore
 // `std::sync::Mutex::lock`) inside a handler — if the signal lands
 // while the main thread already holds the lock, the handler
-// deadlocks. With Phase 4 spinning up subprocess workers, every
-// process inherits this exposure, so we replaced the prior
-// `Mutex<Vec<String>>` with a fixed-size pool of atomic slots.
+// deadlocks. The daemon and every subprocess worker install the
+// handlers, so the registry is a fixed-size pool of atomic slots, not a
+// `Mutex`.
 //
 // Each slot stores its own NUL-terminated byte buffer (no heap
 // allocation per registration after startup). Producers claim a

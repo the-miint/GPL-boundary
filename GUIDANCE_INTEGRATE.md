@@ -496,8 +496,7 @@ tools:
 Bump `schema_version()` whenever you make a breaking change to the
 output schema (renames, type changes, removed columns). The version
 is per-tool and surfaces in every response's `schema_version` field
-plus the `--describe` output. Phase 5 conventions worth following on
-new tools:
+plus the `--describe` output. Conventions to follow on new tools:
 
 - Prefer `Int64` for index columns; reserve `Int32` for bounded
   counts.
@@ -610,8 +609,7 @@ batches, or under LRU pressure when a new fingerprint would exceed
 
 `bowtie2-build` materializes its input Arrow batches to a temporary
 FASTA file before invoking the C builder API (the builder takes disk
-paths today; see `localdocs/GUIDANCE_BT2_BUILD_API.md` for the
-future in-memory-builder path). Two contract points:
+paths only). Two contract points:
 
 - **`TMPDIR` is honored.** The temp FASTA is created via
   `tempfile::Builder::new().tempfile()`, which calls

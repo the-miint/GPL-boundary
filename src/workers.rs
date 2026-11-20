@@ -1,7 +1,7 @@
 //! Worker abstraction for the per-fingerprint dispatcher.
 //!
 //! A `Worker` owns the long-lived state for one `(tool, config)` fingerprint
-//! and serves batches submitted to that fingerprint. Phase 4 ships two
+//! and serves batches submitted to that fingerprint. There are two
 //! implementations:
 //!
 //! - `InProcessSlot` — runs the tool's `tools::Runner`: its streaming
@@ -383,9 +383,8 @@ struct InFlight {
 /// crash.
 pub struct SubprocessWorker {
     /// Pipe to the child's stdin. Wrapped so `close()` can drop it
-    /// (sending EOF) idempotently. Locked across writes because Phase 4
-    /// step 3 dispatches submits one at a time, but defensive against
-    /// any future caller that submits concurrently from multiple threads.
+    /// (sending EOF) idempotently. Locked across each write, so two
+    /// submits from different threads cannot interleave their lines.
     stdin: Mutex<Option<ChildStdin>>,
     /// Reader thread join handle.
     reader: Mutex<Option<JoinHandle<()>>>,

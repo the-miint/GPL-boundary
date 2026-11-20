@@ -864,8 +864,7 @@ fn build_config(
     // with shared page-cache-backed mmap (cheap minor faults). It therefore
     // defaults to on. It is exposed as a caller knob so a diagnostic run can
     // turn it off and contrast the fault/RSS profile (the upstream C API caps
-    // the win — see the Bowtie2StreamingContext note and
-    // localdocs/REQUEST-bowtie2-index-reload-fix-and-mm.md).
+    // the win — see the Bowtie2StreamingContext note).
     bt2.memory_mapped = 1;
     if let Some(v) = config.get("memory_mapped").and_then(|v| v.as_bool()) {
         bt2.memory_mapped = if v { 1 } else { 0 };
@@ -901,8 +900,7 @@ fn build_config(
 /// page-cache pages instead of a full whole-index read-copy, which removed the
 /// bulk of the ~30-40% reload tax. A fully resident index would need the
 /// upstream persistent-`Ebwt` refactor, declined as too complex (the
-/// `driver<T>()` surgery). Background:
-/// `localdocs/REQUEST-bowtie2-index-reload-fix-and-mm.md`.
+/// `driver<T>()` surgery).
 struct Bowtie2StreamingContext {
     ctx: *mut bt2_align_ctx_t,
     /// CStrings backing the config's raw pointers. Kept alive for the session
