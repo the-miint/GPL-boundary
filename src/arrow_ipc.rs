@@ -422,7 +422,7 @@ pub fn decode_stream(mut stream: Buffer) -> Result<Vec<RecordBatch>, String> {
 mod tests {
     use super::*;
     use crate::shm::SharedMemory;
-    use crate::test_util::{unique_shm_name, write_arrow_to_shm};
+    use crate::test_util::shm::{unique_shm_name, write_arrow_to_shm};
     use arrow::array::{Array, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;

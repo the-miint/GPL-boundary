@@ -538,23 +538,37 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_unknown_tool() {
-        let request = BatchRequest {
-            tool: "nonexistent".to_string(),
-            config: serde_json::json!({}),
-            shm_input: "/dummy".to_string(),
-            shm_input_size: 0,
-            batch_id: None,
-            metrics: false,
-            received_at: None,
-        };
-        let response = dispatch(&request);
-        assert!(!response.success);
-        assert!(response
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("Unknown tool: nonexistent"));
+    fn test_open_unknown_tool() {
+        match open("nonexistent", &serde_json::json!({})) {
+            Err(resp) => assert!(resp.error.unwrap().contains("Unknown tool: nonexistent")),
+            Ok(_) => panic!("Expected Err for unknown tool"),
+        }
+    }
+
+    /// A tool without a streaming context runs per batch; one with runs
+    /// its context; one whose context cannot be made is an error naming
+    /// the tool. Each comes with the tool's schema_version.
+    #[test]
+    fn test_open_gives_a_per_batch_runner_without_streaming() {
+        let schema_version = |name: &str| describe_tool(name).unwrap().schema_version;
+        match open("fasttree", &serde_json::json!({})) {
+            Ok((Runner::PerBatch(tool), sv)) => {
+                assert_eq!(tool.name(), "fasttree");
+                assert_eq!(sv, schema_version("fasttree"));
+            }
+            Ok((Runner::Streaming(_), _)) => panic!("fasttree has no streaming context"),
+            Err(resp) => panic!("fasttree: {:?}", resp.error),
+        }
+        match open("prodigal", &serde_json::json!({})) {
+            Ok((Runner::Streaming(_), sv)) => assert_eq!(sv, schema_version("prodigal")),
+            Ok((Runner::PerBatch(_), _)) => panic!("prodigal streams"),
+            Err(resp) => panic!("prodigal: {:?}", resp.error),
+        }
+        let config = serde_json::json!({"index_path": "/nonexistent/idx"});
+        match open("bowtie2-align", &config) {
+            Err(resp) => assert!(resp.error.unwrap().starts_with("bowtie2-align: ")),
+            Ok(_) => panic!("bowtie2-align opened without an index"),
+        }
     }
 
     #[test]
@@ -627,21 +641,6 @@ mod tests {
         );
     }
 
-    // -- ShmContext and streaming_setup tests --
-
-    #[test]
-    fn test_streaming_context_trait_is_object_safe() {
-        struct DummyCtx;
-        impl ShmContext for DummyCtx {
-            fn run_batch(&mut self, _shm_input: &str, _shm_input_size: usize) -> Response {
-                Response::error("stub")
-            }
-        }
-        let mut ctx: Box<dyn ShmContext> = Box::new(DummyCtx);
-        let resp = ctx.run_batch("/dummy", 0);
-        assert!(!resp.success);
-    }
-
     #[test]
     fn test_default_create_streaming_context_returns_none() {
         let tools = all_tools();
@@ -649,29 +648,6 @@ mod tests {
         let result = fasttree.create_streaming_context(&serde_json::json!({}));
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
-    }
-
-    #[test]
-    fn test_streaming_setup_unknown_tool() {
-        match streaming_setup("nonexistent", &serde_json::json!({})) {
-            Err(resp) => assert!(resp.error.as_ref().unwrap().contains("Unknown tool")),
-            Ok(_) => panic!("Expected Err for unknown tool"),
-        }
-    }
-
-    #[test]
-    fn test_streaming_setup_non_streaming_tool_returns_ok_none() {
-        // FastTree exists but does not support streaming. Returning
-        // `Ok(None)` lets the caller fall through to `dispatch` per batch
-        // without conflating "no streaming support" with "init failed".
-        match streaming_setup("fasttree", &serde_json::json!({})) {
-            Ok(None) => {}
-            Ok(Some(_)) => panic!("FastTree should not return a streaming context"),
-            Err(resp) => panic!(
-                "Expected Ok(None) for non-streaming tool, got Err: {:?}",
-                resp.error
-            ),
-        }
     }
 
     #[test]

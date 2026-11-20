@@ -858,8 +858,8 @@ mod tests {
     /// A streaming context whose every batch panics.
     struct PanickingContext;
 
-    impl ShmContext for PanickingContext {
-        fn run_batch(&mut self, _shm_input: &str, _shm_input_size: usize) -> Response {
+    impl StreamingContext for PanickingContext {
+        fn run_batch(&mut self, _input: Vec<RecordBatch>) -> Result<ToolOutput, String> {
             panic!("the test context panics");
         }
     }
@@ -872,14 +872,19 @@ mod tests {
         let (response_tx, response_rx) = make_response_channel();
         let (tx, rx) = mpsc::channel::<BatchRequest>();
         let in_flight = Arc::new(AtomicU32::new(2));
+        // The panicking batch must not need an input: write a real one
+        let name = crate::test_util::shm::unique_shm_name("wk-panic");
+        let input = crate::test_util::shm::write_arrow_to_shm(
+            &name,
+            &crate::test_util::prodigal_batch(&["c1"], &["ACGT"]),
+        );
         let thread = {
             let in_flight = Arc::clone(&in_flight);
             thread::spawn(move || {
                 worker_thread_main(
                     rx,
-                    Some(Box::new(PanickingContext)),
-                    true,
-                    Some(1),
+                    Some(Runner::Streaming(Box::new(PanickingContext))),
+                    1,
                     "panicky".to_string(),
                     response_tx,
                     in_flight,
@@ -890,8 +895,8 @@ mod tests {
             tx.send(BatchRequest {
                 tool: "panicky".to_string(),
                 config: serde_json::json!({}),
-                shm_input: "/gb-unused".to_string(),
-                shm_input_size: 0,
+                shm_input: name.clone(),
+                shm_input_size: input.len(),
                 batch_id: Some(batch_id),
                 metrics: false,
                 received_at: None,
@@ -927,11 +932,11 @@ mod tests {
     }
 
     #[test]
-    fn test_in_process_slot_non_streaming_routes_via_dispatch() {
+    fn test_in_process_slot_non_streaming_runs_per_batch() {
         // FastTree's `create_streaming_context` returns `Ok(None)`, so the
-        // slot's worker thread runs `tools::dispatch` per batch. We verify
-        // by submitting a batch with a bogus shm and observing the dispatch
-        // error response — plus checking `streaming_supported` directly.
+        // slot's worker thread runs the tool per batch. We verify by
+        // submitting a batch with a bogus segment and observing the error
+        // response — plus checking `streaming_supported` directly.
         let (tx, rx) = make_response_channel();
         let slot = InProcessSlot::new(
             "fasttree",

@@ -55,11 +55,13 @@ fn run_on_buffer(
 mod tests {
     use super::*;
     use crate::arrow_ipc::map_shm;
+    use crate::protocol::BatchRequest;
     use crate::shm::{self, SharedMemory};
-    use crate::test_util::{
-        column, take_outputs, unique_shm_name, write_arrow_to_shm, write_batches_to_shm,
+    use crate::test_util::column;
+    use crate::test_util::shm::{
+        take_outputs, unique_shm_name, write_arrow_to_shm, write_batches_to_shm,
     };
-    use crate::tools::{GplTool, OnShm, ShmTool, StreamingContext, ToolDescription, ToolOutput};
+    use crate::tools::{GplTool, Runner, StreamingContext, ToolDescription, ToolOutput};
     use arrow::array::{Array, ArrayData, Int64Array, ListArray, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use serde_json::json;
@@ -73,6 +75,19 @@ mod tests {
     fn names_of(batch: &RecordBatch) -> Vec<Option<String>> {
         let col: &StringArray = column(batch, "name");
         col.iter().map(|v| v.map(str::to_string)).collect()
+    }
+
+    /// A batch request for an input segment, as the coordinator gets it.
+    fn request(shm_input: &str, shm_input_size: usize, batch_id: u64) -> BatchRequest {
+        BatchRequest {
+            tool: "fe-row-counter".to_string(),
+            config: json!({}),
+            shm_input: shm_input.to_string(),
+            shm_input_size,
+            batch_id: Some(batch_id),
+            metrics: false,
+            received_at: None,
+        }
     }
 
     /// The number the next output segment name takes, less one: the
@@ -443,7 +458,9 @@ mod tests {
 
         let name = unique_shm_name("fe-fasttree");
         let holder = write_arrow_to_shm(&name, &batch);
-        let response = OnShm(FastTreeTool).execute(&config, &name, holder.len());
+        let response = respond(&request(&name, holder.len(), 1), 2, |input| {
+            FastTreeTool.execute(&config, input)
+        });
 
         assert!(response.success, "{:?}", response.error);
         assert_eq!(response.result.as_ref(), Some(&direct.result));
@@ -453,11 +470,72 @@ mod tests {
         assert_eq!(written[0].1, direct.outputs[0].1);
     }
 
+    /// A response carries its request's batch_id, and on success the
+    /// tool's schema_version: the error response has no schema_version.
     #[test]
-    fn test_on_shm_serves_a_context_across_batches() {
-        let tool = OnShm(RowCounter);
-        assert_eq!(tool.name(), "fe-row-counter");
-        assert_eq!(tool.schema_version(), 7);
+    fn test_respond_stamps_batch_id_and_schema_version() {
+        let name = unique_shm_name("fe-stamp");
+        let holder = write_arrow_to_shm(&name, &names_batch(&[Some("a")]));
+        let ok = respond(&request(&name, holder.len(), 41), 9, |_| {
+            Ok(ToolOutput {
+                outputs: vec![],
+                result: json!({}),
+            })
+        });
+        assert!(ok.success, "{:?}", ok.error);
+        assert_eq!((ok.batch_id, ok.schema_version), (Some(41), Some(9)));
+
+        let refused = respond(&request(&name, holder.len(), 42), 9, |_| {
+            Err("fe: refused".to_string())
+        });
+        assert!(!refused.success);
+        assert_eq!((refused.batch_id, refused.schema_version), (Some(42), None));
+
+        let unreadable = respond(&request("/gb-fe-no-such-input", 0, 43), 9, |_| {
+            Err("ran".to_string())
+        });
+        assert!(unreadable.error.unwrap().contains("Failed to open shm"));
+        assert_eq!(
+            (unreadable.batch_id, unreadable.schema_version),
+            (Some(43), None)
+        );
+    }
+
+    /// The tools take and return record batches: no tool module names the
+    /// transport, which is the front end's and arrow_ipc's alone.
+    #[test]
+    fn test_tool_modules_are_transport_free() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/tools");
+        let mut files: Vec<_> = (std::fs::read_dir(dir).unwrap())
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            .collect();
+        files.sort();
+        assert!(files.len() >= 7, "{files:?}");
+        let mut found = Vec::new();
+        for path in &files {
+            let file = path.file_name().unwrap().to_string_lossy();
+            for (i, line) in std::fs::read_to_string(path).unwrap().lines().enumerate() {
+                let lower = line.to_lowercase();
+                if ["shm", "shared memory", "arrow_ipc"]
+                    .iter()
+                    .any(|word| lower.contains(word))
+                {
+                    found.push(format!("{file}:{}: {}", i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "tool modules name the transport:\n{}",
+            found.join("\n")
+        );
+    }
+
+    /// A streaming runner keeps its context across batches, a failed batch
+    /// included; a per-batch runner runs the tool afresh.
+    #[test]
+    fn test_a_streaming_runner_keeps_its_context_across_batches() {
         let config = json!({});
 
         // Three rows in two batches, then one row.
@@ -472,8 +550,11 @@ mod tests {
         let one = unique_shm_name("fe-one");
         let one_holder = write_arrow_to_shm(&one, &names_batch(&[Some("d")]));
 
-        let mut ctx = tool.create_streaming_context(&config).unwrap().unwrap();
-        let first = ctx.run_batch(&three, three_holder.len());
+        let context = RowCounter.create_streaming_context(&config).unwrap();
+        let mut runner = Runner::Streaming(context.unwrap());
+        let first = respond(&request(&three, three_holder.len(), 1), 7, |input| {
+            runner.run(&config, input)
+        });
         assert!(first.success, "{:?}", first.error);
         assert_eq!(first.result, Some(json!({"total": 3})));
         let first = take_outputs(&first);
@@ -481,15 +562,22 @@ mod tests {
         assert_eq!(count_of(&first[0].1), 3);
 
         // A batch that fails leaves the context as it was
-        let failed = ctx.run_batch("/gb-fe-no-such-input", 0);
+        let failed = respond(&request("/gb-fe-no-such-input", 0, 2), 7, |input| {
+            runner.run(&config, input)
+        });
         assert!(!failed.success);
 
-        let second = ctx.run_batch(&one, one_holder.len());
+        let second = respond(&request(&one, one_holder.len(), 3), 7, |input| {
+            runner.run(&config, input)
+        });
         assert!(second.success, "{:?}", second.error);
         assert_eq!(second.result, Some(json!({"total": 4})));
         assert_eq!(count_of(&take_outputs(&second)[0].1), 4);
 
-        let single = tool.execute(&config, &three, three_holder.len());
+        let mut per_batch = Runner::PerBatch(Box::new(RowCounter));
+        let single = respond(&request(&three, three_holder.len(), 4), 7, |input| {
+            per_batch.run(&config, input)
+        });
         assert!(single.success, "{:?}", single.error);
         assert_eq!(single.result, Some(json!({"rows": 3})));
         assert_eq!(count_of(&take_outputs(&single)[0].1), 3);
