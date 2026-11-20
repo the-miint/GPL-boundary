@@ -462,9 +462,10 @@ impl SharedMemory {
     /// The shm object remains available for other processes to read.
     /// Consumes self, munmaps but does not shm_unlink.
     ///
-    /// Used by `test_util` to hand a writable fixed-size shm off to a
-    /// reader; production output paths use `ShmWriter::finish` which
-    /// performs the equivalent munmap + ftruncate-down + close in one step.
+    /// Used by this module's tests to leave a segment for a reader;
+    /// production outputs use `ShmWriter::finish`, which munmaps and closes
+    /// without unlinking (and without a second `ftruncate`, which Darwin
+    /// refuses).
     #[cfg(unix)]
     #[allow(dead_code)]
     pub fn detach(mut self) {

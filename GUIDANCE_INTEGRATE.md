@@ -18,10 +18,17 @@ The reference integration is FastTree (`ext/fasttree/`, `build.rs`,
 | `src/tools/<tool>.rs` | **New file**: FFI bindings, Arrow schemas, `GplTool` impl, tests |
 | `src/tools/mod.rs` | Add `pub mod <tool>;` |
 
-You do **not** need to modify `main.rs`, `protocol.rs`, `arrow_ipc.rs`,
-`shm.rs`, or `Cargo.toml` (unless the tool requires new Rust dependencies).
-The `inventory` crate handles dispatch, introspection, and registry
-automatically.
+You do **not** need to modify `main.rs`, `protocol.rs`, `frontend.rs`,
+`arrow_ipc.rs`, `shm.rs`, or `Cargo.toml` (unless the tool requires new Rust
+dependencies). The `inventory` crate handles dispatch, introspection, and
+registry automatically.
+
+A tool never touches shared memory. It takes its input as Arrow record
+batches and returns its outputs as record batches; the native front end
+(`src/frontend.rs`) reads the request's input segment, runs the tool, and
+writes the outputs to new segments. A tool module that names the transport
+(`shm`, shared memory, `arrow_ipc`) fails
+`frontend::tests::test_tool_modules_are_transport_free`.
 
 ## Step 1: Add the git submodule
 
@@ -239,7 +246,7 @@ impl GplTool for NewTool {
                 // ... all config params
             ],
             input_schema: INPUT_FIELDS.to_vec(),
-            // One per shm output, in the order the response lists them
+            // One per output, in the order the response lists them
             outputs: vec![RESULTS],
             response_metadata: vec![/* FieldDescription for JSON result fields */],
         }
@@ -248,9 +255,8 @@ impl GplTool for NewTool {
     fn execute(
         &self,
         config: &serde_json::Value,
-        shm_input: &str,
-        shm_input_size: usize,
-    ) -> Response {
+        input: Vec<RecordBatch>,
+    ) -> Result<ToolOutput, String> {
         // See below
     }
 }
@@ -258,9 +264,14 @@ impl GplTool for NewTool {
 
 **`execute()` follows this pattern:**
 
-1. Read Arrow input: `crate::arrow_ipc::read_batches_from_shm(shm_input, shm_input_size)?`
-   (the size comes from the request; `fstat` is not used)
-2. Extract columns, validate, convert to C types (`Vec<CString>` etc.)
+1. Read the input batches: every batch of the request's stream, in order;
+   there may be none. Natively they are read-only views of the caller's
+   input segment: don't keep them, or anything sliced from them, past the
+   call.
+2. Extract columns, validate (a null where the tool needs a value is an
+   error naming the input row), convert to C types (`Vec<CString>` etc.;
+   a NUL byte is an error, not an `unwrap`). Once the input is copied out,
+   `drop(input)` before the C library runs.
 3. Initialize C config via FFI: `zeroed()` + `config_init()`, then apply
    the JSON strictly: `config_knobs_known(config, &params)` refuses a knob
    `--describe` doesn't list, and `config_bool`/`config_str`/`config_f64`/
@@ -268,15 +279,16 @@ impl GplTool for NewTool {
    integer outside C int, naming the knob, and take null as the default
 4. Create context: `newtool_create(&config)`, check for null
 5. Call the computation: `newtool_run(ctx, ...)`
-6. On error: `strerror(rc)` + `last_error(ctx)` → `Response::error(...)`,
+6. On error: `strerror(rc)` + `last_error(ctx)` → `Err(format!(...))`,
    then `destroy(ctx)`
 7. On success: convert SOA output → Arrow `RecordBatch` using
-   `arrow_schema(RESULTS.schema)`
-8. Write output: `crate::arrow_ipc::write_batch_to_output_shm(&batch, RESULTS.label)`
-   as the last fallible step; with several outputs, or work after the
-   write, use `crate::arrow_ipc::ShmOutputs` (all or none)
-9. Free C output + destroy context
-10. Return `Response::ok(result_json, vec![shm_output])`
+   `arrow_schema(RESULTS.schema)`. The batch must own its memory (copy the
+   C arrays, as below): the front end writes it after the call returns.
+8. Free C output + destroy context, whether the conversion succeeded or not
+9. Return `Ok(ToolOutput { outputs: vec![(RESULTS.label, batch)], result })`,
+   the outputs under their `OutputDescription` labels, in `describe()`'s
+   order. The front end writes them all or none and builds the response;
+   an `Err` becomes the error response.
 
 **Important**: always free C resources (output, context) on every code path,
 including errors. The tool must never panic across FFI.
@@ -319,49 +331,37 @@ unsafe fn soa_to_record_batch(output: &NewToolOutput) -> Result<RecordBatch, Str
 
 Three required tests in a `#[cfg(test)] mod tests` block:
 
+Tool tests call the tool directly with record batches; no shared memory
+(the front end has its own tests on real segments, and `tests/` drives the
+daemon).
+
 **1. Happy-path roundtrip:**
 
 ```rust
 #[test]
 fn test_newtool_roundtrip() {
-    let input_name = unique_shm_name("nt-in");
     let batch = make_input_batch(/* test data */);
-    let input_shm = write_arrow_to_shm(&input_name, &batch);
-
-    let tool = NewTool;
     let config = serde_json::json!({ "seed": 42 });
-    let response = tool.execute(&config, &input_name, input_shm.len());
+    let output = NewTool.execute(&config, vec![batch]).expect("newtool failed");
 
-    assert!(response.success, "Failed: {:?}", response.error);
-    assert_eq!(response.shm_outputs.len(), 1);
-    assert!(response.shm_outputs[0].name.starts_with("/gb-"));
-    assert_eq!(response.shm_outputs[0].label, RESULTS.label);
-    assert!(response.shm_outputs[0].size > 0);
+    // The labels, order and columns `describe()` lists
+    assert_outputs_described(&NewTool.describe(), &output);
+    // ... assert expected metadata fields in output.result ...
 
-    let result = response.result.unwrap();
-    // ... assert expected metadata fields ...
-
-    let out = &response.shm_outputs[0];
-    let out_batches = read_arrow_from_shm(&out.name, out.size);
-    assert_eq!(out_batches.len(), 1);
-    // ... assert schema, row count, column values ...
-
-    let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
+    let (label, results) = &output.outputs[0];
+    assert_eq!(*label, RESULTS.label);
+    // ... assert row count, column values ...
 }
 ```
 
-Key: keep `input_shm` alive until after `execute()` returns.
-
-**2. Bad shm name:**
+**2. A refused input** (a config knob is checked before the input, so an
+empty input still names it; a null or a malformed column names its row):
 
 ```rust
 #[test]
-fn test_newtool_bad_input_shm() {
-    let tool = NewTool;
-    let config = serde_json::json!({});
-    let response = tool.execute(&config, "/nonexistent-shm-name", 0);
-    assert!(!response.success);
-    assert!(response.error.unwrap().contains("Failed to open shm"));
+fn test_newtool_refuses_bad_input() {
+    let err = NewTool.execute(&serde_json::json!({}), vec![]).unwrap_err();
+    assert!(err.contains("At least 1"), "{err}");
 }
 ```
 
@@ -430,8 +430,12 @@ FastTree) do not need streaming.
    share one context still gets a context that does the per-batch work
    (e.g., prodigal's `train_on_batch` trains a fresh one on each batch), so
    execute() and the session run the same code.
-3. Implement `StreamingContext::run_batch()`. Read input from shm, call C
-   `run()`, convert output, write to output shm, return Response.
+3. Implement `StreamingContext::run_batch()`: the same input, output and
+   errors as `execute`, against the loaded context: read the input
+   batches, call C `run()`, convert the output, return the `ToolOutput`.
+   An error fails only that batch; the context must stay usable. Share
+   the per-batch code between `execute` and `run_batch` (bowtie2-align's
+   `Bowtie2StreamingContext::open` and `align`), rather than two copies.
 
 ### Streaming test template
 
@@ -445,18 +449,13 @@ fn test_newtool_streaming_two_batches() {
         .expect("tool should support streaming");
 
     // Batch 1
-    let input1 = unique_shm_name("nt-str-1");
-    let shm1 = write_arrow_to_shm(&input1, &make_input_batch(/* data */));
-    let resp1 = ctx.run_batch(&input1, shm1.len());
-    assert!(resp1.success, "Batch 1 failed: {:?}", resp1.error);
-    let _ = SharedMemory::unlink(&resp1.shm_outputs[0].name);
+    let first = ctx.run_batch(vec![make_input_batch(/* data */)]);
+    let first = first.expect("Batch 1 failed");
 
-    // Batch 2
-    let input2 = unique_shm_name("nt-str-2");
-    let shm2 = write_arrow_to_shm(&input2, &make_input_batch(/* data */));
-    let resp2 = ctx.run_batch(&input2, shm2.len());
-    assert!(resp2.success, "Batch 2 failed: {:?}", resp2.error);
-    let _ = SharedMemory::unlink(&resp2.shm_outputs[0].name);
+    // Batch 2, on the same context
+    let second = ctx.run_batch(vec![make_input_batch(/* data */)]);
+    let second = second.expect("Batch 2 failed");
+    // ... assert the context carried over (e.g. a model trained once) ...
 }
 ```
 
@@ -468,8 +467,9 @@ canonical_config)` fingerprint. Two routing decisions matter for new
 tools:
 
 - **In-process vs. subprocess.** Default is in-process: the registry
-  spawns a dedicated worker thread per fingerprint, the streaming
-  context (or stateless dispatch) runs there, responses flow back via
+  spawns a dedicated worker thread per fingerprint, the tool's runner
+  (`tools::open`: its streaming context, or the tool itself per batch)
+  runs there through the front end, responses flow back via
   the worker's `Sender<Response>`. Same-fingerprint batches serialize
   through the worker thread's mpsc queue; distinct fingerprints run
   concurrently. The exception is **subprocess routing**, used today
@@ -526,7 +526,7 @@ input Arrow stream:
 
 The rules:
 
-1. **Within a single shared-memory submission, paired/single mode is
+1. **Within a single submission (one request's input batches), paired/single mode is
    uniform.** A submission containing one paired batch and one
    all-null-`sequence2` batch under the same schema is rejected with
    "inconsistent paired-end mode across batches". Mode-mixing here
@@ -636,17 +636,19 @@ plausible but explicitly out of scope.
 Without these directives, cargo won't recompile the C sources when they
 change. List every `.c` and `.h` file used by the build.
 
-### Dropping the input shm handle before execute()
+### Returning output that views C memory
 
-In tests, the `SharedMemory` returned by `write_arrow_to_shm` unlinks the
-segment on drop. If you don't bind it to a variable (or bind it to `_`
-instead of `input_shm`), the segment is unlinked immediately and the tool
-gets a "Failed to open shm" error.
+An output record batch must own its memory. One built over the C library's
+arrays (`Buffer::from_custom_allocation`, or a slice of a C pointer) dangles
+once the tool frees its C output, which happens before the front end writes
+the batch. Copy the arrays into Arrow builders or `Vec`s.
 
-### Not cleaning up output shm in tests
+### Keeping the input past the call
 
-The tool creates output shm but does not unlink it (that is the caller's
-job). Each test must call `SharedMemory::unlink(&output_name)` at the end.
+The input batches are views of the caller's segment. A tool that keeps one,
+or a column sliced from it, in a streaming context keeps the whole input
+mapped across batches; a C library that keeps a pointer into it reads freed
+memory once the batch drops. Copy out what must outlive the call.
 
 ### Struct field order mismatch
 

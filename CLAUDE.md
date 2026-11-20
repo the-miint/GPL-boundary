@@ -21,6 +21,13 @@ spawns it as a long-lived daemon (one per DuckDB instance).
   macOS (not `/dev/shm` file paths, which are Linux-only)
 - **WASM is a future goal**, not currently targeted
 
+**Transport-free tools**: a tool (`GplTool`) takes its input as Arrow record
+batches and returns its outputs as labelled record batches (`ToolOutput`)
+and the result JSON. It never sees shared memory: the native front end
+(`src/frontend.rs`) maps and decodes the input segment, runs the tool, and
+writes its outputs to new segments, all or none. A front end for the
+WebAssembly build will pass the same batches without shared memory.
+
 **Batched streaming**: Tools with expensive context creation (bowtie2: index
 loading, prodigal: metagenomic bins or a single-genome model) support batched
 streaming. The `StreamingContext`
@@ -54,6 +61,9 @@ in-flight batch, marks the fingerprint dead so subsequent same-fingerprint
 batches fail fast, and best-effort sweeps any orphan
 `/dev/shm/gb-{child_pid}-*` segments. Distinct fingerprints are unaffected;
 no auto-respawn — restart gpl-boundary to recover the dead fingerprint.
+In an in-process worker, a tool call that panics answers its batch with an
+error; a streaming context is dropped, so later same-fingerprint batches
+fail fast until the worker is evicted, and a tool without one runs on.
 
 ## Shared memory lifecycle (critical)
 
@@ -84,18 +94,20 @@ by checking if the PID is still alive.
 ### Cleanup registry
 
 - `shm::register_for_cleanup(name)` -- called when output shm is created
-  (inside `arrow_ipc::write_batch_to_output_shm`)
+  (inside `arrow_ipc::ShmWriter::new_with_capacity`, before `shm_open`)
 - `shm::deregister_cleanup(name)` -- called in `main.rs` **after** the JSON
-  response has been written to stdout (not inside `execute()`)
+  response has been written to stdout (never by a tool or the front end)
 - Signal handler and `cleanup_all()` iterate the registry and unlink everything
 
 **Important**: deregister must happen after stdout write, not before. If a
 signal arrives between deregister and stdout write, the shm leaks.
 
-### SharedMemory::detach()
+### ShmWriter::finish()
 
-When output shm is ready for the caller to read, we call `detach()` which
-munmaps without unlinking. This is the proper API -- never use `mem::forget`.
+When an output segment is ready for the caller to read, `ShmWriter::finish`
+munmaps and closes it without unlinking, and returns its `ShmOutput`. A
+writer dropped without `finish` (a failed write) unlinks its segment. This
+is the proper API -- never use `mem::forget`.
 
 ## Submodules
 
@@ -130,17 +142,21 @@ Each tool gets:
 6. Tool-specific API documentation (input/output schemas, config params) via
    the `describe()` method on `GplTool`
 7. An ABI size-check test for each `#[repr(C)]` config struct
-8. Smoke tests using real shared memory (use `test_util` helpers)
+8. Smoke tests that call `execute` (and `run_batch`) with record batches and
+   read the `ToolOutput` (`test_util` helpers; `assert_outputs_described`
+   checks the outputs against `describe()`)
 9. **(Optional) Streaming support** via `create_streaming_context()` on
    `GplTool`. Required if the tool has expensive context creation and processes
    independent records per batch. See `GUIDANCE_INTEGRATE.md` Step 6.
 
-Use `arrow_ipc::write_batch_to_output_shm()` and
-`arrow_ipc::read_batches_from_shm()` for Arrow IPC marshaling -- do not
-duplicate this logic in tool modules. A tool with several outputs, or a
-fallible step after a write, writes through `arrow_ipc::ShmOutputs`, which
-unlinks what it wrote unless the response takes the segments
-(`into_vec`), so a failed batch leaves none behind.
+A tool module never names the transport: no shared memory, no `arrow_ipc`
+(`frontend::tests::test_tool_modules_are_transport_free` scans for it). It
+returns each output as a record batch that owns its memory (copy out of C
+memory before the C library frees it), under the label of its
+`OutputDescription`, and does not keep its input batches past the call. The
+front end writes the outputs through `arrow_ipc::ShmOutputs`, which unlinks
+what it wrote unless the response takes the segments (`into_vec`), so a
+failed batch leaves none behind.
 
 We do not exhaustively test submodules; that is their own CI's job.
 
@@ -165,15 +181,16 @@ SDK) and, on macOS, Homebrew's libomp for FastTree's OpenMP
 ```
 src/
   main.rs            # Entry point: CLI flags, stdin JSON dispatch, shm deregister
-  arrow_ipc.rs       # Shared Arrow IPC helpers (write_batch_to_output_shm, read_batches_from_shm)
+  frontend.rs        # Native front end: input segment → tool → output segments (respond)
+  arrow_ipc.rs       # Arrow IPC over shm: map_shm + decode_stream (read), ShmWriter/ShmOutputs (write)
   protocol.rs        # Request/Response/ShmOutput JSON types (serde)
   registry.rs        # Per-fingerprint worker registry: routing, eviction, budget
   workers.rs         # Worker implementations: in-process slots and subprocess workers
   rusage.rs          # Per-batch worker telemetry (the opt-in metrics object)
   shm.rs             # POSIX shared memory, cleanup registry, signal handlers
-  test_util.rs       # Shared test helpers (cfg(test) only)
+  test_util.rs       # Shared test helpers (cfg(test) only); test_util::shm for shm tests
   tools/
-    mod.rs           # GplTool trait, ToolRegistration, StreamingContext trait, inventory-based dispatch
+    mod.rs           # GplTool/StreamingContext traits, ToolOutput, Runner + open, inventory registry
     fasttree.rs      # FastTree FFI bindings + GplTool impl + tests
     prodigal.rs      # Prodigal FFI bindings + GplTool impl + tests
     prodigal_train.rs # prodigal-train: writes a single-genome model (uses prodigal.rs's FFI)
@@ -265,8 +282,11 @@ thread.
 ## Key conventions
 
 - **Rust edition 2021**, standard cargo project
-- **Tests use real shared memory**: smoke tests create POSIX shm segments,
-  write Arrow IPC, run tools, read Arrow IPC output. No mocking.
+- **Tests use real data, no mocking**: tool tests call `execute`/`run_batch`
+  with record batches and read the `ToolOutput`. The front end, `arrow_ipc`
+  and `shm` are tested on real POSIX shm segments (`test_util::shm`), and
+  fasttree once through the front end on real shm; the integration tests in
+  `tests/` drive the daemon over real shm.
 - **FFI**: manual `#[repr(C)]` bindings in each tool module (not bindgen).
   Structs must match C headers exactly. Each config struct must have an ABI
   size-check test. Size checks catch added/removed fields but not reordering;
@@ -275,8 +295,8 @@ thread.
   field's offset and size with the library's `prodigal_abi_layout()`, which
   catches reordering too, but not a wrong type of the same size: review the
   types against the header.
-- **Error handling**: tools return `Response::error(msg)`. Never panic across
-  FFI.
+- **Error handling**: tools return `Err(msg)`; the front end turns it into
+  the error response. Never panic across FFI.
 - **Tool registration**: tools self-register via `inventory::submit!`. No
   manual dispatch match arms. Duplicate names are caught at startup.
 - **CI**: GitHub Actions on Linux + macOS. Runs `cargo test`, `cargo clippy`,
@@ -713,22 +733,30 @@ POSIX shm only allows `ftruncate` to set the size **once**; a second call
 is therefore the canonical, cross-platform source of truth — not a
 side-channel through `fstat`.
 
-**Reading (`read_batches_from_shm(name, size)`)** — single read API, used
-for both inputs and outputs. Caller supplies the data length out-of-band:
-`BatchRequest::shm_input_size` for input segments, `ShmOutput::size` for
-output segments. `fstat` is **not** consulted — Darwin POSIX shm has
-unreliable `fstat` semantics, and gpl-boundary's own outputs are
-over-allocated to a sparse-mmap reservation, so neither input nor output
-segments can rely on `fstat` for cross-platform correctness. The protocol's
-explicit byte counts are the canonical source of truth.
+**Reading (`map_shm(name, size)`, then `decode_stream(buffer)`)** — the
+front end's read of an input segment; tests read output segments the same
+way (`read_batches_from_shm`, test-only). Caller supplies the data length
+out-of-band: `BatchRequest::shm_input_size` for input segments,
+`ShmOutput::size` for output segments. `fstat` does not size the mapping —
+Darwin POSIX shm has unreliable `fstat` semantics, and gpl-boundary's own
+outputs are over-allocated to a sparse-mmap reservation, so neither input
+nor output segments can rely on `fstat` for cross-platform correctness. The
+protocol's explicit byte counts are the canonical source of truth. `fstat`
+is only a sanity gate: a `size` past the segment's end (which would map,
+then SIGBUS on access) or a `size` of 0 against a non-empty segment is
+refused.
 
-Zero-copy via Arrow's `Buffer::from_custom_allocation`: the `ReadOnlyShm`
-mmap is wrapped as a `Buffer` whose Arc-counted `Allocation` owner is the
-mapping itself. Arrow's `StreamDecoder::with_require_alignment(true)`
-slices that buffer for each batch body without copying. The returned
-`RecordBatch`es reference the mmap directly; the mapping survives until
+Zero-copy via Arrow's `Buffer::from_custom_allocation`: `map_shm` wraps the
+`ReadOnlyShm` mmap as a `Buffer` whose Arc-counted `Allocation` owner is the
+mapping itself. `decode_stream` (shm-free, for any `Buffer`) uses Arrow's
+`StreamDecoder::with_require_alignment(true)`, which slices that buffer for
+each batch body without copying and refuses a misaligned body rather than
+copying it; it also refuses a stream without its EOS marker. The tool gets
+`RecordBatch`es that reference the mmap directly; the mapping survives until
 the last batch (and any column derived from it) is dropped, even after
-`shm_unlink`. Verified by `arrow_ipc::tests::test_input_mmap_outlives_unlink`.
+`shm_unlink`. Verified by `arrow_ipc::tests::test_input_mmap_outlives_unlink`,
+`test_input_values_buffer_points_into_mmap` and
+`frontend::tests::test_the_tool_reads_the_input_segment_in_place`.
 
 ## C API contract for submodules
 

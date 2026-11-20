@@ -681,43 +681,32 @@ extract any Arrow column type.
 ## Smoke tests
 
 Once the Rust adapter compiles and registers with `inventory::submit!`, you
-need smoke tests that exercise the full roundtrip: Arrow IPC input in shared
-memory → tool execution → Arrow IPC output in shared memory. These tests use
-real POSIX shared memory, not mocks.
+need smoke tests that exercise the roundtrip through the adapter: Arrow
+record batches in → FFI → tool execution → Arrow record batches out. The
+adapter never sees shared memory (the native front end, `src/frontend.rs`,
+handles it, and has its own tests on real POSIX shared memory), so tool
+tests pass batches directly. They run the real C library, not mocks.
 
 ### Test infrastructure
 
-The `test_util` module (compiled only under `cfg(test)`) provides three
-helpers:
+The `test_util` module (compiled only under `cfg(test)`) provides input
+fixtures and output checks, among them:
 
-- `unique_shm_name(prefix)` -- generates a unique shm name using PID + atomic
-  counter, safe for parallel test execution and within the macOS 31-character
-  shm name limit
-- `write_arrow_to_shm(name, batch)` -- writes a `RecordBatch` as Arrow IPC
-  stream into a new shared memory region; returns a `SharedMemory` handle that
-  keeps the segment alive (unlinks on drop)
-- `read_arrow_from_shm(name)` -- reads all `RecordBatch`es from Arrow IPC
-  stream in shared memory
-
-Import them in your test module:
-
-```rust
-use crate::shm::SharedMemory;
-use crate::test_util::{read_arrow_from_shm, unique_shm_name, write_arrow_to_shm};
-```
+- `assert_outputs_described(&desc, &output)` -- checks a `ToolOutput`'s
+  labels, their order and each output's columns (name, Arrow type,
+  nullability) against the tool's `describe()`
+- `column::<T>(batch, name)` -- a column of an output batch, by name and type
 
 ### Writing a smoke test
 
-A smoke test has four phases: build input, run the tool, verify the JSON
-response, and verify the Arrow output. Here is the pattern, using FastTree as
-the reference:
+A smoke test has three phases: build the input, run the tool, and verify
+its result JSON and output batches. Here is the pattern:
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shm::SharedMemory;
-    use crate::test_util::{read_arrow_from_shm, unique_shm_name, write_arrow_to_shm};
+    use crate::test_util::assert_outputs_described;
     use arrow::array::StringArray;
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
@@ -737,68 +726,38 @@ mod tests {
 
     #[test]
     fn test_tool_roundtrip() {
-        // 1. Build input and write to shared memory
-        let input_name = unique_shm_name("tool-in");
+        // 1. Build the input
         let batch = make_input_batch(/* your test data */);
-        let _input_shm = write_arrow_to_shm(&input_name, &batch);
 
         // 2. Run the tool via GplTool::execute()
-        let tool = YourTool;
         let config = serde_json::json!({ /* tool-specific config */ });
-        let response = tool.execute(&config, &input_name);
+        let output = YourTool.execute(&config, vec![batch]).expect("tool failed");
 
-        // 3. Verify JSON response
-        assert!(response.success, "Tool failed: {:?}", response.error);
-        assert_eq!(response.shm_outputs.len(), 1);
-
-        let output = &response.shm_outputs[0];
-        assert!(output.name.starts_with("/gb-"));
-        assert_eq!(output.label, "your-label");
-        assert!(output.size > 0);
-
-        let result = response.result.unwrap();
-        // ... assert expected metadata fields ...
-
-        // 4. Verify Arrow IPC output in shared memory
-        let out_batches = read_arrow_from_shm(&output.name);
-        assert_eq!(out_batches.len(), 1);
-        let out = &out_batches[0];
-        // ... assert schema, row count, column values ...
-
-        // 5. Clean up output shm (simulating what miint does)
-        let _ = SharedMemory::unlink(&output.name);
+        // 3. Verify the outputs against describe(), the result, the batches
+        assert_outputs_described(&YourTool.describe(), &output);
+        // ... assert expected metadata fields in output.result ...
+        let (label, out) = &output.outputs[0];
+        assert_eq!(*label, "your-label");
+        // ... assert row count, column values ...
     }
 }
 ```
-
-Key points:
-
-- **Keep `_input_shm` alive** until after `execute()` returns. If you drop
-  it, the input segment is unlinked before the tool reads it.
-- **Clean up output shm** at the end of each test with `SharedMemory::unlink`.
-  The tool creates output shm but does not unlink it (that is the caller's
-  job).
-- **Use `unique_shm_name`** for input names. Output names are generated
-  internally by `write_batch_to_output_shm` using the PID, so they are
-  already unique.
 
 ### Required test cases
 
 Each tool must have at minimum:
 
-1. **Happy-path roundtrip** -- valid input → success response → correct Arrow
-   output. If your tool accepts meaningfully different input types (e.g.,
-   nucleotide vs. protein), test each.
-2. **Bad shm name** -- pass a nonexistent shm name and assert the response
-   is `success: false` with a useful error message:
+1. **Happy-path roundtrip** -- valid input → `Ok(ToolOutput)` → correct
+   Arrow output. If your tool accepts meaningfully different input types
+   (e.g., nucleotide vs. protein), test each.
+2. **Refused input** -- an input the tool cannot run (none, a missing
+   column, a null where a value is needed) is an `Err` with a useful
+   message, naming the row where there is one:
    ```rust
    #[test]
-   fn test_bad_input_shm() {
-       let tool = YourTool;
-       let config = serde_json::json!({});
-       let response = tool.execute(&config, "/nonexistent-shm-name");
-       assert!(!response.success);
-       assert!(response.error.unwrap().contains("Failed to open shm"));
+   fn test_refuses_empty_input() {
+       let err = YourTool.execute(&serde_json::json!({}), vec![]).unwrap_err();
+       assert!(err.contains("At least 1"), "{err}");
    }
    ```
 3. **ABI size check** -- verify the Rust `#[repr(C)]` config struct matches
@@ -822,18 +781,19 @@ Each tool must have at minimum:
 
 We do not exhaustively test submodule correctness (that is the submodule's
 own CI). Smoke tests verify the integration boundary: that data flows
-correctly through Arrow IPC → FFI → Arrow IPC, that the tool runs without
+correctly through Arrow → FFI → Arrow, that the tool runs without
 crashing, and that the output schema and metadata match expectations.
 
 ### Running tests
 
 ```bash
-cargo test                    # all tests (uses real POSIX shared memory)
-cargo test --lib tools::      # just tool module tests
+cargo test                    # all tests (the front end's use real POSIX shared memory)
+cargo test --bin gpl-boundary tools::   # just tool module tests
 make check                    # fmt + clippy + test + test-scripts
 ```
 
-Tests require POSIX shared memory support (`/dev/shm` on Linux, `shm_open`
+The front end's, the shared memory modules' and the daemon's integration
+tests require POSIX shared memory support (`/dev/shm` on Linux, `shm_open`
 on macOS). CI runs on both platforms.
 
 ## Checklist
@@ -866,6 +826,7 @@ Before starting integration, verify your C API against this list:
 - [ ] Public header declares only API surface (no internal types or helpers)
 - [ ] C++ implementations wrap internals in a tool-specific `namespace`
 - [ ] ABI size-check test for config struct
-- [ ] Happy-path smoke test (Arrow IPC roundtrip through shared memory)
-- [ ] Bad-shm-name error test
+- [ ] Happy-path smoke test (record batches in, `ToolOutput` out, checked
+      with `assert_outputs_described`)
+- [ ] Refused-input error test
 - [ ] Context supports multiple `run()` calls without `destroy()`/`create()` (required for batched streaming; skip if all input must be present at once)
