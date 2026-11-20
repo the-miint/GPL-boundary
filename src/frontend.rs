@@ -80,7 +80,10 @@ mod tests {
         write_stream_to_shm,
     };
     use crate::tools::{GplTool, Runner, StreamingContext, ToolDescription, ToolOutput};
-    use arrow::array::{Array, ArrayData, Int64Array, ListArray, StringArray};
+    use arrow::array::{
+        Array, ArrayData, ArrayRef, Int32Array, Int64Array, ListArray, StringArray, UInt16Array,
+        UInt8Array,
+    };
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use serde_json::json;
     use std::sync::Arc;
@@ -123,8 +126,28 @@ mod tests {
         let name = unique_shm_name("fe-order");
         let holder = write_arrow_to_shm(&name, &names_batch(&[Some("a")]));
         let first = names_batch(&[Some("x"), Some("y")]);
-        let second = names_batch(&[Some("z")]);
-        let outputs = vec![("fe-first", first.clone()), ("fe-second", second.clone())];
+        // Column types the tools emit beyond fasttree's, and no rows at all
+        let typed = RecordBatch::try_from_iter([
+            (
+                "flags",
+                Arc::new(UInt16Array::from(vec![0u16, 16])) as ArrayRef,
+            ),
+            (
+                "mapq",
+                Arc::new(UInt8Array::from(vec![42u8, 0])) as ArrayRef,
+            ),
+            (
+                "tag_xs",
+                Arc::new(Int32Array::from(vec![Some(-3), None])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let empty = names_batch(&[]);
+        let outputs = vec![
+            ("fe-first", first.clone()),
+            ("fe-typed", typed.clone()),
+            ("fe-empty", empty.clone()),
+        ];
 
         let response = run_on_shm(&name, holder.len(), |input| {
             Ok(ToolOutput {
@@ -140,9 +163,10 @@ mod tests {
         }
         let written = take_outputs(&response);
         let labels: Vec<&str> = written.iter().map(|(l, _)| l.as_str()).collect();
-        assert_eq!(labels, ["fe-first", "fe-second"]);
+        assert_eq!(labels, ["fe-first", "fe-typed", "fe-empty"]);
         assert_eq!(written[0].1, first);
-        assert_eq!(written[1].1, second);
+        assert_eq!(written[1].1, typed);
+        assert_eq!(written[2].1, empty);
     }
 
     #[test]
