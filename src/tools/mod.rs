@@ -91,8 +91,8 @@ pub(crate) fn checked_cint(name: &str, v: impl Into<i128>) -> Result<c_int, Stri
 
 // --- Input ---
 //
-// An input error names its input row: 1-based, counted across the
-// request's record batches.
+// An input error names its input row where there is one: 1-based, counted
+// across the request's record batches.
 
 /// A batch's Utf8 column by name; one missing or of another type is
 /// refused.
@@ -468,6 +468,34 @@ mod tests {
                 "prodigal",
                 "prodigal-train"
             ]
+        );
+    }
+
+    /// A required column missing or not Utf8 is refused, naming it; an
+    /// optional one may be absent.
+    #[test]
+    fn test_utf8_columns_are_looked_up_by_name_and_type() {
+        use arrow::array::{ArrayRef, Int32Array};
+        use std::sync::Arc;
+        let batch = RecordBatch::try_from_iter([
+            ("name", Arc::new(StringArray::from(vec!["a"])) as ArrayRef),
+            ("count", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+        ])
+        .unwrap();
+        assert_eq!(utf8_column(&batch, "name").unwrap().value(0), "a");
+        assert_eq!(
+            utf8_column(&batch, "sequence").unwrap_err(),
+            "Input missing 'sequence' column"
+        );
+        assert_eq!(
+            utf8_column(&batch, "count").unwrap_err(),
+            "'count' column is not Utf8"
+        );
+        assert!(optional_utf8_column(&batch, "qual1").unwrap().is_none());
+        assert!(optional_utf8_column(&batch, "name").unwrap().is_some());
+        assert_eq!(
+            optional_utf8_column(&batch, "count").unwrap_err(),
+            "'count' column is not Utf8"
         );
     }
 

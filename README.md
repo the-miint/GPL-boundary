@@ -299,7 +299,8 @@ string on an existing knob) bump only `describe_version`.
   of the segment is refused.
 - **End**: the stream ends with its end-of-stream marker. An input stream
   without it is refused, rather than read as however many batches precede
-  the cut.
+  the cut. An empty input (`shm_input_size` 0, on an empty segment) holds no
+  batches.
 - **Batches**: a single RecordBatch per stream (current convention; consumers
   should handle multiple batches for forward compatibility).
 

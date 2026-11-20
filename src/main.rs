@@ -552,8 +552,8 @@ fn recv_event(rx: &mpsc::Receiver<Event>, idle_timeout_ms: u64) -> Result<Option
 /// Build an `EvictionConfig` from the init knobs the client sent. Missing
 /// fields fall back to `EvictionConfig::default()`. `workers_per_fingerprint`
 /// is accepted in the protocol but not used: a fingerprint has one worker,
-/// because bowtie2 keeps process-wide state behind a mutex, and more than
-/// one child for the same fingerprint would only load the index again.
+/// which serializes its batches and keeps them in order (`CLAUDE.md`,
+/// "Per-fingerprint dispatch").
 fn eviction_config_from(init: &InitParams) -> EvictionConfig {
     let mut cfg = EvictionConfig::default();
     if let Some(v) = init.max_workers {
@@ -565,7 +565,7 @@ fn eviction_config_from(init: &InitParams) -> EvictionConfig {
     if let Some(v) = init.worker_idle_ms {
         cfg.worker_idle_ms = v;
     }
-    // workers_per_fingerprint is accepted for forward-compat; no-op today.
+    // Accepted, not used (see above)
     let _ = init.workers_per_fingerprint;
     cfg
 }

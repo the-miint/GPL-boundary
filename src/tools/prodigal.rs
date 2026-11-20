@@ -983,7 +983,8 @@ impl Context {
     }
 
     /// Check the loaded sequence is `length` characters long.
-    /// Contigs::from_batches refused what the library drops: this catches a change in that rule.
+    /// Contigs::from_batches refused what the library drops: this catches a
+    /// change in that rule.
     fn check_kept(&self, length: i64) -> Result<(), String> {
         let mut info: ProdigalSeqInfo = unsafe { std::mem::zeroed() };
         if unsafe { prodigal_get_seq_info(self.0, &mut info) } != PRODIGAL_OK {
@@ -2005,8 +2006,8 @@ mod tests {
         }
     }
 
-    /// Contigs::from_batches refuses what the library drops. Should the library's
-    /// rule change, a contig it doesn't keep whole is an error, when
+    /// Contigs::from_batches refuses what the library drops. Should the
+    /// library's rule change, a contig it doesn't keep whole is an error, when
     /// predicting and when training, not shifted coordinates or a model of
     /// other bases.
     #[test]

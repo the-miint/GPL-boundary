@@ -5,8 +5,9 @@
 //! ## Lifecycle
 //!
 //! gpl-boundary creates output shm regions with PID-based names,
-//! `/gb-{pid}-{n}-{label}` (e.g., `/gb-1234-0-tree`). On normal exit or trappable signals
-//! (SIGINT, SIGTERM), output shm is unlinked via the cleanup registry.
+//! `/gb-{pid}-{n}-{label}` (e.g., `/gb-1234-0-tree`). On normal exit or
+//! trappable signals (SIGINT, SIGTERM), output shm is unlinked via the
+//! cleanup registry.
 //! SIGKILL cannot be trapped; the caller (miint) should clean up stale
 //! segments by checking if the PID in the name is still alive.
 
@@ -557,8 +558,7 @@ impl ReadOnlyShm {
     ///   `shm_input_size`), rather than silently returning an empty
     ///   handle. `size == 0` is allowed when the segment is genuinely
     ///   empty — a freshly-created shm whose `ftruncate` has not yet
-    ///   enlarged it, or a tool whose input batch is intentionally
-    ///   zero-length.
+    ///   enlarged it, or an input that is intentionally empty.
     #[cfg(unix)]
     pub fn open(name: &str, size: usize) -> io::Result<Self> {
         let c_name = to_cstring(name)?;

@@ -10,8 +10,9 @@ process the daemon spawns. Data arrives from miint as Apache Arrow IPC in
 POSIX shared memory, and results go back the same way. Your C code never
 touches shared memory or Arrow: the daemon's front end reads and writes the
 segments, and your tool's Rust adapter turns the Arrow record batches into
-your C API's inputs, and its outputs back into record batches. But the shape of your C API determines how
-much Rust glue code is needed and how error-prone the integration is.
+your C API's inputs, and its outputs back into record batches. But the
+shape of your C API determines how much Rust glue code is needed and how
+error-prone the integration is.
 
 The reference integration is FastTree (`ext/fasttree/fasttree.h` and
 `src/tools/fasttree.rs`).
@@ -658,9 +659,9 @@ Avoid:
 ## Input format
 
 Your `tool_run()` function receives input as arrays of C strings. The Rust
-adapter takes the input as Arrow record batches, extracts the relevant columns,
-converts them to `Vec<CString>`, and passes raw pointer arrays to your
-function:
+adapter takes the input as Arrow record batches, extracts the relevant
+columns, converts them to `Vec<CString>`, and passes raw pointer arrays to
+your function:
 
 ```c
 int tool_run(tool_ctx_t *ctx,

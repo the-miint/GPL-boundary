@@ -61,9 +61,10 @@ batches fail fast, and best-effort sweeps any orphan
 `/dev/shm/gb-{child_pid}-*` segments. Distinct fingerprints are unaffected;
 no auto-respawn — restart gpl-boundary to recover the dead fingerprint.
 In an in-process worker, a batch whose handling panics (decode, tool call
-or output write) is answered with an error; a streaming context is dropped, so later same-fingerprint batches
-fail fast until the worker sits idle past `worker_idle_ms` and is evicted,
-or the daemon restarts. A tool without one runs on.
+or output write) is answered with an error; a streaming context is dropped,
+so later same-fingerprint batches fail fast until the worker sits idle past
+`worker_idle_ms` and is evicted, or the daemon restarts. A tool without one
+runs on.
 
 ## Shared memory lifecycle (critical)
 
@@ -299,10 +300,10 @@ thread.
   types against the header.
 - **Error handling**: tools return `Err(msg)`; the front end turns it into
   the error response. Never panic across FFI.
-- **Input errors name the row**: an input row is 1-based, counted across
-  the request's record batches (`input row 3: null name`). The input
-  helpers in `src/tools/mod.rs` (`utf8_column`, `non_null`, `c_strings`)
-  give the messages.
+- **Input errors name the row where there is one**: an input row is
+  1-based, counted across the request's record batches (`input row 3: null
+  name`). The input helpers in `src/tools/mod.rs` (`utf8_column`,
+  `non_null`, `c_strings`) give the messages.
 - **Tool registration**: tools self-register via `inventory::submit!`. No
   manual dispatch match arms. Duplicate names are caught at startup.
 - **CI**: GitHub Actions on Linux + macOS. Runs `cargo test`, `cargo clippy`,
@@ -412,8 +413,9 @@ advertisement:
   in `shm_input`. The reader maps exactly this many bytes; `fstat` does not
   size the mapping (Darwin POSIX shm has unreliable `fstat` semantics) and
   only refuses a size past the segment's end. miint, which created the
-  input segment, already knows this value. The stream must end with its
-  end-of-stream marker; one without it is refused.
+  input segment, already knows this value. A size of 0 (an empty segment)
+  is an input with no batches; any other stream must end with its
+  end-of-stream marker, and one without it is refused.
 - `batch_id` is optional but recommended. Echoed verbatim on the matching
   response so out-of-order completions across distinct fingerprints can be
   correlated.

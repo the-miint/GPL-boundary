@@ -372,8 +372,9 @@ pub fn map_shm(shm_name: &str, size: usize) -> Result<Buffer, String> {
 /// every array buffer is a slice of `stream`. An empty `stream` holds no
 /// batches; any other must end with the EOS marker.
 ///
-/// `StreamDecoder::with_require_alignment(true)` is the zero-copy gate: with the default (false), the decoder silently
-/// allocates and copies into an aligned buffer when an array body's offset
+/// `StreamDecoder::with_require_alignment(true)` is the zero-copy gate:
+/// with the default (false), the decoder silently allocates and copies
+/// into an aligned buffer when an array body's offset
 /// doesn't meet the type's natural alignment. Forcing strict alignment
 /// turns any misalignment into a decode error so a regression to the slow
 /// path is loud, not silent.

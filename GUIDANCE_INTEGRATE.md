@@ -271,8 +271,8 @@ impl GplTool for NewTool {
 2. Extract columns, validate (a null where the tool needs a value is an
    error naming the input row), convert to C types (`Vec<CString>` etc.;
    a NUL byte is an error, not an `unwrap`). `utf8_column`, `non_null` and
-   `c_strings` in `crate::tools` do these and word the errors. Once the input is copied out,
-   `drop(input)` before the C library runs.
+   `c_strings` in `crate::tools` do these and word the errors. Once the
+   input is copied out, `drop(input)` before the C library runs.
 3. Initialize C config via FFI: `zeroed()` + `config_init()`, then apply
    the JSON strictly: `config_knobs_known(config, &params)` refuses a knob
    `--describe` doesn't list, and `config_bool`/`config_str`/`config_f64`/
@@ -355,8 +355,8 @@ fn test_newtool_roundtrip() {
 }
 ```
 
-**2. A refused input** (an empty input is refused; a null or a malformed
-column names its row):
+**2. A refused input** (an empty input is refused; a null names its row,
+a missing or non-Utf8 column names the column):
 
 ```rust
 #[test]

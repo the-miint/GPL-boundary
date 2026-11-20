@@ -113,8 +113,7 @@ fn read_input(batches: &[RecordBatch]) -> Result<BuildInput, String> {
             let row = names.len() + 1;
             let n = non_null(name_col, i, row, "name")?;
             let s = non_null(seq_col, i, row, "sequence")?;
-            // A NUL byte would end the name or the sequence early when the
-            // C builder reads the FASTA
+            // Refused before the FASTA, as the other tools refuse a NUL
             for (value, column) in [(n, "name"), (s, "sequence")] {
                 if value.contains('\0') {
                     return Err(holds_nul(row, column));
