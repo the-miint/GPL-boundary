@@ -6,6 +6,7 @@ pub mod prodigal;
 pub mod prodigal_train;
 
 use crate::protocol::Response;
+use arrow::array::{Array, AsArray, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use std::ffi::CString;
@@ -88,14 +89,49 @@ pub(crate) fn checked_cint(name: &str, v: impl Into<i128>) -> Result<c_int, Stri
     Ok(v as c_int)
 }
 
-// --- Input to C ---
+// --- Input ---
+//
+// An input error names its input row: 1-based, counted across the
+// request's record batches.
+
+/// A batch's Utf8 column by name; one missing or of another type is
+/// refused.
+pub(crate) fn utf8_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a StringArray, String> {
+    optional_utf8_column(batch, name)?.ok_or_else(|| format!("Input missing '{name}' column"))
+}
+
+/// As `utf8_column`, for a column the input may leave out.
+pub(crate) fn optional_utf8_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<Option<&'a StringArray>, String> {
+    (batch.column_by_name(name))
+        .map(|c| (c.as_string_opt::<i32>()).ok_or_else(|| format!("'{name}' column is not Utf8")))
+        .transpose()
+}
+
+/// Value `i` of a Utf8 column, which is input row `row`; a null is refused.
+pub(crate) fn non_null<'a>(
+    column: &'a StringArray,
+    i: usize,
+    row: usize,
+    name: &str,
+) -> Result<&'a str, String> {
+    if column.is_null(i) {
+        return Err(format!("input row {row}: null {name}"));
+    }
+    Ok(column.value(i))
+}
 
 /// C strings of a column's values, one per input row in order. A value
 /// holding a NUL byte would reach the C library cut short, so it is
-/// refused, naming its 1-based input row.
+/// refused.
 pub(crate) fn c_strings(values: &[String], column: &str) -> Result<Vec<CString>, String> {
     (values.iter().enumerate())
-        .map(|(i, s)| CString::new(s.as_str()).map_err(|_| holds_nul(i, column)))
+        .map(|(i, s)| CString::new(s.as_str()).map_err(|_| holds_nul(i + 1, column)))
         .collect()
 }
 
@@ -106,13 +142,14 @@ pub(crate) fn c_optional_strings(
 ) -> Result<Vec<Option<CString>>, String> {
     (values.iter().enumerate())
         .map(|(i, v)| {
-            (v.as_deref().map(CString::new).transpose()).map_err(|_| holds_nul(i, column))
+            (v.as_deref().map(CString::new).transpose()).map_err(|_| holds_nul(i + 1, column))
         })
         .collect()
 }
 
-fn holds_nul(index: usize, column: &str) -> String {
-    format!("input row {}: {column} holds a NUL byte", index + 1)
+/// The refusal of a NUL byte in `column` at input row `row`.
+pub(crate) fn holds_nul(row: usize, column: &str) -> String {
+    format!("input row {row}: {column} holds a NUL byte")
 }
 
 /// Check that `config` is an object (null: no knobs) whose knobs are all
@@ -282,7 +319,9 @@ pub trait GplTool: Send {
     /// input mapped, and a pointer the C library holds into them dangles
     /// once they drop. The tool takes them by value so that one which
     /// copies its input can drop them, and the mapping with them, before
-    /// the C library runs.
+    /// the C library runs. Natively the batches are one stream's and share
+    /// its schema; a tool looks its columns up in each batch rather than
+    /// rely on that.
     ///
     /// An `Err` becomes the error response, its message the response's
     /// `error`, and no output is written. On `Ok` the front end writes
@@ -457,7 +496,7 @@ mod tests {
     /// its context; one whose context cannot be made is an error naming
     /// the tool. Each comes with the tool's schema_version.
     #[test]
-    fn test_open_gives_a_per_batch_runner_without_streaming() {
+    fn test_open_gives_each_tool_its_runner_or_its_error() {
         let schema_version = |name: &str| describe_tool(name).unwrap().schema_version;
         match open("fasttree", &serde_json::json!({})) {
             Ok((Runner::PerBatch(tool), sv)) => {

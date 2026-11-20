@@ -4,8 +4,8 @@
 //!
 //! ## Lifecycle
 //!
-//! gpl-boundary creates output shm regions with PID-based names
-//! (e.g., `/gb-1234-out`). On normal exit or trappable signals
+//! gpl-boundary creates output shm regions with PID-based names,
+//! `/gb-{pid}-{n}-{label}` (e.g., `/gb-1234-0-tree`). On normal exit or trappable signals
 //! (SIGINT, SIGTERM), output shm is unlinked via the cleanup registry.
 //! SIGKILL cannot be trapped; the caller (miint) should clean up stale
 //! segments by checking if the PID in the name is still alive.

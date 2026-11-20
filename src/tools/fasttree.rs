@@ -2,11 +2,11 @@
 //! and returns the SOA tree as a record batch.
 
 use crate::tools::{
-    c_strings, checked_cint, ConfigParam, FieldDescription, GplTool, OutputDescription,
-    ToolDescription, ToolOutput,
+    c_strings, checked_cint, non_null, utf8_column, ConfigParam, FieldDescription, GplTool,
+    OutputDescription, ToolDescription, ToolOutput,
 };
 use arrow::array::{
-    Array, BooleanArray, Float64Builder, Int32Array, Int64Array, Int64Builder, StringArray,
+    BooleanArray, Float64Builder, Int32Array, Int64Array, Int64Builder, StringArray,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -667,31 +667,11 @@ impl FastTreeTool {
         let mut all_seqs = Vec::new();
 
         for batch in batches {
-            let name_col = batch
-                .column_by_name("name")
-                .ok_or("Input missing 'name' column")?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or("'name' column is not Utf8")?;
-
-            let seq_col = batch
-                .column_by_name("sequence")
-                .ok_or("Input missing 'sequence' column")?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or("'sequence' column is not Utf8")?;
-
+            let (names, seqs) = (utf8_column(batch, "name")?, utf8_column(batch, "sequence")?);
             for i in 0..batch.num_rows() {
-                // 1-based, across the batches
                 let row = all_names.len() + 1;
-                if name_col.is_null(i) {
-                    return Err(format!("input row {row}: null name"));
-                }
-                if seq_col.is_null(i) {
-                    return Err(format!("input row {row}: null sequence"));
-                }
-                all_names.push(name_col.value(i).to_string());
-                all_seqs.push(seq_col.value(i).to_string());
+                all_names.push(non_null(names, i, row, "name")?.to_string());
+                all_seqs.push(non_null(seqs, i, row, "sequence")?.to_string());
             }
         }
 
@@ -1176,7 +1156,8 @@ unsafe fn soa_to_record_batch(tree: &FastTreeSoa) -> Result<RecordBatch, String>
 mod tests {
     use super::*;
     use crate::test_util::{
-        assert_outputs_described, extracted_16s_phylip, parse_interleaved_phylip, subset_alignment,
+        assert_outputs_described, extracted_16s_phylip, outputs_of, parse_interleaved_phylip,
+        subset_alignment,
     };
     use arrow::array::{Array, Float64Array};
     use std::ffi::CString;
@@ -1225,13 +1206,7 @@ mod tests {
 
     /// The result and the tree of a successful build.
     fn tree_of(output: ToolOutput) -> (serde_json::Value, RecordBatch) {
-        let ToolOutput {
-            mut outputs,
-            result,
-        } = output;
-        assert_eq!(outputs.len(), 1);
-        let (label, tree) = outputs.remove(0);
-        assert_eq!(label, "tree");
+        let (result, [tree]) = outputs_of(output, [TREE.label]);
         (result, tree)
     }
 

@@ -270,7 +270,8 @@ impl GplTool for NewTool {
    call.
 2. Extract columns, validate (a null where the tool needs a value is an
    error naming the input row), convert to C types (`Vec<CString>` etc.;
-   a NUL byte is an error, not an `unwrap`). Once the input is copied out,
+   a NUL byte is an error, not an `unwrap`). `utf8_column`, `non_null` and
+   `c_strings` in `crate::tools` do these and word the errors. Once the input is copied out,
    `drop(input)` before the C library runs.
 3. Initialize C config via FFI: `zeroed()` + `config_init()`, then apply
    the JSON strictly: `config_knobs_known(config, &params)` refuses a knob
@@ -354,8 +355,8 @@ fn test_newtool_roundtrip() {
 }
 ```
 
-**2. A refused input** (a config knob is checked before the input, so an
-empty input still names it; a null or a malformed column names its row):
+**2. A refused input** (an empty input is refused; a null or a malformed
+column names its row):
 
 ```rust
 #[test]
@@ -566,9 +567,9 @@ per-shard parallelism for free. The four invariants miint relies on:
    `(tool, config_fingerprint)` worker.** The
    `src/registry.rs::Registry` keys on canonical-config JSON, so two
    configs differing only in key order share a worker.
-2. **Each `run_batch()` call produces exactly one Arrow record batch
-   in a fresh output shared-memory segment.** No batching across
-   `run_batch` calls.
+2. **Each `run_batch()` call answers its own batch:** its outputs go
+   to fresh output segments in that batch's response. No batching
+   across `run_batch` calls.
 3. **Same `index_path` (and same other config) → same fingerprint →
    serialized through one subprocess worker.** bowtie2's
    process-wide alignment mutex makes within-fingerprint parallelism

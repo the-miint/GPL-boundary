@@ -24,13 +24,12 @@
 //! The front end (`crate::frontend`) reads a segment in two steps:
 //! `map_shm` maps the segment as a `Buffer`, and `decode_stream` decodes
 //! the batches from any `Buffer`, shared memory or not (tests read output
-//! segments the same way, through `read_batches_from_shm`). `map_shm` takes an
-//! explicit `size`: callers must supply the data length out-of-band (from
-//! `BatchRequest::shm_input_size` for inputs, or `ShmOutput::size` for
-//! outputs). `fstat` is **not** consulted — Darwin POSIX shm has
-//! unreliable `fstat` semantics, and gpl-boundary's own outputs are
-//! over-allocated to a sparse-mmap reservation, so neither input nor
-//! output segments can rely on `fstat` for cross-platform correctness.
+//! segments the same way). `map_shm` takes an explicit `size`: callers must
+//! supply the data length out-of-band (from `BatchRequest::shm_input_size`
+//! for inputs, or `ShmOutput::size` for outputs). `fstat` does not size the
+//! mapping — Darwin POSIX shm has unreliable `fstat` semantics, and
+//! gpl-boundary's own outputs are over-allocated to a sparse-mmap
+//! reservation — and only refuses a size past the segment's end.
 //!
 //! `map_shm` opens a `ReadOnlyShm` (a Sync-by-construction wrapper around
 //! an `O_RDONLY` + `PROT_READ` mmap) and wraps it as an
@@ -179,8 +178,7 @@ impl ShmWriter {
     /// left at the `max_capacity` reservation — Darwin POSIX shm
     /// forbids a second `ftruncate`, so the segment's reported size
     /// is not the data length on either platform. The reader must
-    /// honor `ShmOutput::size` rather than `fstat` (see
-    /// `read_batches_from_shm`).
+    /// honor `ShmOutput::size` rather than `fstat` (see `map_shm`).
     ///
     /// The shm remains linked; the caller (typically
     /// `write_batch_to_output_shm`) passes ownership of cleanup to
@@ -277,10 +275,9 @@ impl Drop for ShmWriter {
 /// POSIX shm region — no intermediate `Vec<u8>`. The returned `ShmOutput`
 /// names the segment, its label, and the exact byte count written.
 ///
-/// The shm is registered for signal-handler cleanup. The caller must call
-/// `shm::deregister_cleanup(&shm_out.name)` after ownership has been
-/// transferred to the reader (i.e., after the JSON response is written to
-/// stdout). See `main.rs` for the canonical pattern.
+/// The segment is registered for signal-handler cleanup when it is
+/// created; `main.rs` deregisters it once the response naming it is on
+/// stdout.
 pub fn write_batch_to_output_shm(batch: &RecordBatch, label: &str) -> Result<ShmOutput, String> {
     let mut writer =
         ShmWriter::new(label).map_err(|e| format!("Failed to create output shm: {e}"))?;
@@ -299,7 +296,7 @@ pub fn write_batch_to_output_shm(batch: &RecordBatch, label: &str) -> Result<Shm
 }
 
 /// A response's output segments, all or none: dropped before `into_vec`,
-/// it unlinks those written so far, so a tool whose second write fails
+/// it unlinks those written so far, so a batch whose second write fails
 /// leaves no first segment behind.
 #[derive(Default)]
 pub struct ShmOutputs(Vec<ShmOutput>);
@@ -325,21 +322,14 @@ impl Drop for ShmOutputs {
     }
 }
 
-/// Read all RecordBatches from an Arrow IPC stream in a shared memory
-/// segment (`map_shm`, then `decode_stream`). Test-only: the daemon reads
-/// its input through the front end, and the caller reads the outputs.
-#[cfg(test)]
-pub fn read_batches_from_shm(shm_name: &str, size: usize) -> Result<Vec<RecordBatch>, String> {
-    decode_stream(map_shm(shm_name, size)?)
-}
-
 /// Map the first `size` bytes of a segment read-only, as a `Buffer` that
 /// owns the mapping. `size` must be the exact data byte count — for input
 /// segments it comes from `BatchRequest::shm_input_size`, for output
 /// segments from `ShmOutput::size`. Only that many bytes are mapped,
 /// regardless of what `fstat` would report for the underlying shm fd.
 ///
-/// `fstat` is **not** used to size the mapping. Darwin POSIX shm has
+/// `fstat` does not size the mapping (`ReadOnlyShm::open` uses it only to
+/// refuse a size past the segment's end). Darwin POSIX shm has
 /// inconsistent `fstat` semantics for our usage pattern (the segment is
 /// either over-allocated by gpl-boundary's `ShmWriter`, or sized
 /// correctly by the writer but `fstat` returns more than the data length
@@ -382,8 +372,7 @@ pub fn map_shm(shm_name: &str, size: usize) -> Result<Buffer, String> {
 /// every array buffer is a slice of `stream`. An empty `stream` holds no
 /// batches; any other must end with the EOS marker.
 ///
-/// `StreamDecoder::with_require_alignment(true)` is the load-bearing
-/// zero-copy gate: with the default (false), the decoder silently
+/// `StreamDecoder::with_require_alignment(true)` is the zero-copy gate: with the default (false), the decoder silently
 /// allocates and copies into an aligned buffer when an array body's offset
 /// doesn't meet the type's natural alignment. Forcing strict alignment
 /// turns any misalignment into a decode error so a regression to the slow
@@ -422,7 +411,7 @@ pub fn decode_stream(mut stream: Buffer) -> Result<Vec<RecordBatch>, String> {
 mod tests {
     use super::*;
     use crate::shm::SharedMemory;
-    use crate::test_util::shm::{unique_shm_name, write_arrow_to_shm};
+    use crate::test_util::shm::{read_batches_from_shm, unique_shm_name, write_arrow_to_shm};
     use arrow::array::{Array, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;

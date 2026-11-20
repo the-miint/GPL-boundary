@@ -11,8 +11,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::tools::{
-    c_optional_strings, c_strings, ConfigParam, FieldDescription, GplTool, OutputDescription,
-    StreamingContext, ToolDescription, ToolOutput, ToolRegistration,
+    c_optional_strings, c_strings, non_null, optional_utf8_column, utf8_column, ConfigParam,
+    FieldDescription, GplTool, OutputDescription, StreamingContext, ToolDescription, ToolOutput,
+    ToolRegistration,
 };
 
 // ---------------------------------------------------------------------------
@@ -71,9 +72,9 @@ pub struct Bt2AlignConfig {
     pub mismatch_penalty_min: c_int,
     // v0.4 fields (bt2_api.h BT2_API_VERSION_MINOR=4, commit d35e377). Order
     // must match the C struct tail exactly (ABI size check catches size, not
-    // reordering). `lowseeds` + three seed-behavior knobs are NOT exposed as
-    // JSON config yet (left at config_init defaults: NULL/0); `memory_mapped`
-    // is set implicitly by build_config — see the note there.
+    // reordering). `lowseeds`, the three seed-behaviour knobs and
+    // `memory_mapped` are config knobs, applied by build_config (see the
+    // `memory_mapped` note there for its default).
     pub lowseeds: *const c_char,
     pub no_exact_upfront: c_int,
     pub no_1mm_upfront: c_int,
@@ -483,61 +484,18 @@ impl Bowtie2AlignTool {
         let mut any_qual2_column = false;
 
         for batch in batches {
-            let id_col = batch
-                .column_by_name("read_id")
-                .ok_or("Input missing 'read_id' column")?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or("'read_id' column is not Utf8")?;
-
-            let seq1_col = batch
-                .column_by_name("sequence1")
-                .ok_or("Input missing 'sequence1' column")?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or("'sequence1' column is not Utf8")?;
-
+            let id_col = utf8_column(batch, "read_id")?;
+            let seq1_col = utf8_column(batch, "sequence1")?;
             // qual1 is optional (nullable for FASTA)
-            let q1_col = batch
-                .column_by_name("qual1")
-                .map(|c| {
-                    c.as_any()
-                        .downcast_ref::<StringArray>()
-                        .ok_or("'qual1' column is not Utf8")
-                })
-                .transpose()?;
-
+            let q1_col = optional_utf8_column(batch, "qual1")?;
             // sequence2 is optional (nullable, paired indicator)
-            let seq2_col = batch
-                .column_by_name("sequence2")
-                .map(|c| {
-                    c.as_any()
-                        .downcast_ref::<StringArray>()
-                        .ok_or("'sequence2' column is not Utf8")
-                })
-                .transpose()?;
-
-            // qual2 is optional
-            let q2_col = batch
-                .column_by_name("qual2")
-                .map(|c| {
-                    c.as_any()
-                        .downcast_ref::<StringArray>()
-                        .ok_or("'qual2' column is not Utf8")
-                })
-                .transpose()?;
+            let seq2_col = optional_utf8_column(batch, "sequence2")?;
+            let q2_col = optional_utf8_column(batch, "qual2")?;
 
             for i in 0..batch.num_rows() {
-                // 1-based, across the batches
                 let row = read_ids.len() + 1;
-                if id_col.is_null(i) {
-                    return Err(format!("input row {row}: null read_id"));
-                }
-                if seq1_col.is_null(i) {
-                    return Err(format!("input row {row}: null sequence1"));
-                }
-                read_ids.push(id_col.value(i).to_string());
-                seqs1.push(seq1_col.value(i).to_string());
+                read_ids.push(non_null(id_col, i, row, "read_id")?.to_string());
+                seqs1.push(non_null(seq1_col, i, row, "sequence1")?.to_string());
 
                 quals1.push(match q1_col {
                     Some(col) if !col.is_null(i) => Some(col.value(i).to_string()),
@@ -909,9 +867,13 @@ struct Bowtie2StreamingContext {
     _config_cstrings: Vec<CString>,
 }
 
-// Safety: The underlying C context is not thread-safe, but no shared
-// references to self.ctx are handed out. Only &mut self methods reach it
-// (align, run_batch), so exclusive access is enforced at the type level.
+// Safety (Send, which StreamingContext requires): the context may be
+// made on one thread and used and destroyed on another, because between
+// calls its state is heap memory reached through `ctx` (the configuration;
+// each run rebuilds the index, see above), not thread-local storage. The
+// only thread-local storage in the library's sources is its read queues'
+// (concurrentqueue.h), within a run. One thread at a time reaches `ctx`:
+// only `&mut self` methods and Drop use it.
 unsafe impl Send for Bowtie2StreamingContext {}
 
 impl Drop for Bowtie2StreamingContext {
@@ -1786,7 +1748,8 @@ impl GplTool for Bowtie2AlignTool {
         config: &serde_json::Value,
         input: Vec<RecordBatch>,
     ) -> Result<ToolOutput, String> {
-        // The input is checked before the context is made
+        // The input's columns and nulls are checked before the context is
+        // made; a NUL byte is found when `align` converts the reads
         let reads = Self::reads(&input)?;
         drop(input);
         Bowtie2StreamingContext::open(config)?.align(&reads)
@@ -1807,7 +1770,7 @@ impl GplTool for Bowtie2AlignTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::assert_outputs_described;
+    use crate::test_util::{assert_outputs_described, outputs_of};
     use crate::tools::bowtie2_build::{
         bt2_build_config_init, bt2_build_create, bt2_build_destroy, bt2_build_run, Bt2BuildConfig,
         Bt2BuildStats,
@@ -1865,13 +1828,7 @@ mod tests {
 
     /// The result and the alignments of a successful run.
     fn alignments_of(output: ToolOutput) -> (serde_json::Value, RecordBatch) {
-        let ToolOutput {
-            mut outputs,
-            result,
-        } = output;
-        assert_eq!(outputs.len(), 1);
-        let (label, alignments) = outputs.remove(0);
-        assert_eq!(label, "alignments");
+        let (result, [alignments]) = outputs_of(output, [ALIGNMENTS.label]);
         (result, alignments)
     }
 
@@ -2513,13 +2470,11 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
 
     #[test]
     fn test_read_input_rejects_mixed_paired_single_across_batches() {
-        // Surface the prior UB: an input of two RecordBatches with the
-        // same paired schema, but the second batch
-        // has all-null sequence2 (single-end mode within the paired
-        // schema). Before this fix, the paired branch ran for batch 1 and
-        // skipped batch 2, leaving seqs2.len() < read_ids.len(); the FFI
-        // call then passed `n_reads2 = read_ids.len()`, so the C library
-        // would read past the end of the pointer array.
+        // Two record batches with the paired schema, the second with an
+        // all-null sequence2 (single-end within the paired schema). Read
+        // as they come, seqs2 would cover fewer reads than read_ids, and
+        // the C library, given `n_reads2 = read_ids.len()`, would read past
+        // the end of the pointer array.
         let qual = "IIIIIIIIIIII";
         let paired = make_paired_end_input(
             &["pair1"],

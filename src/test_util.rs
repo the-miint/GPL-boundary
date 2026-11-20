@@ -1,9 +1,9 @@
 //! Shared test utilities: input batches and fixtures for the tools' tests,
 //! checks on their outputs, and (`shm`) helpers for tests on shared memory.
 //!
-//! `shm` intentionally duplicates IPC serialization logic from `arrow_ipc.rs`
-//! so that tests exercise production read/write paths against
-//! independently-written data.
+//! `shm` writes its segments with arrow's own `StreamWriter`, not through
+//! `arrow_ipc`, so the production read path is tested on data it did not
+//! write.
 
 use crate::tools::{ToolDescription, ToolOutput};
 use arrow::array::{Array, Int32Array, StringArray};
@@ -96,13 +96,22 @@ pub struct Prediction {
     pub contigs: RecordBatch,
 }
 
+/// A tool output's result and its record batches, whose labels must be
+/// `labels`, in order.
+pub fn outputs_of<const N: usize>(
+    output: ToolOutput,
+    labels: [&str; N],
+) -> (serde_json::Value, [RecordBatch; N]) {
+    let ToolOutput { outputs, result } = output;
+    let (found, batches): (Vec<&str>, Vec<RecordBatch>) = outputs.into_iter().unzip();
+    assert_eq!(found, labels);
+    (result, <[RecordBatch; N]>::try_from(batches).unwrap())
+}
+
 /// A prodigal call's result and outputs, genes then contigs (their labels
 /// checked), or its error.
 pub fn prediction_of(output: Result<ToolOutput, String>) -> Result<Prediction, String> {
-    let ToolOutput { outputs, result } = output?;
-    let (labels, outputs): (Vec<&str>, Vec<RecordBatch>) = outputs.into_iter().unzip();
-    assert_eq!(labels, ["genes", "contigs"]);
-    let [genes, contigs] = <[RecordBatch; 2]>::try_from(outputs).unwrap();
+    let (result, [genes, contigs]) = outputs_of(output?, ["genes", "contigs"]);
     Ok(Prediction {
         result,
         genes,
@@ -398,12 +407,13 @@ mod tests {
     }
 }
 
-/// Helpers for tests that read and write shared memory: the front end's,
-/// the arrow_ipc and shm modules', and the workers'. Tool tests take and
-/// return record batches and need none of these.
+/// Helpers for tests of code that reads or writes segments. Tool tests
+/// take and return record batches and need none of these.
 pub mod shm {
+    use crate::arrow_ipc::{decode_stream, map_shm};
     use crate::protocol::Response;
     use crate::shm::SharedMemory;
+    use arrow::datatypes::SchemaRef;
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
 
@@ -430,9 +440,19 @@ pub mod shm {
     /// Write record batches, which share a schema, as one Arrow IPC stream
     /// into a new shared memory region (see `write_arrow_to_shm`).
     pub fn write_batches_to_shm(name: &str, batches: &[RecordBatch]) -> SharedMemory {
+        write_stream_to_shm(name, &batches[0].schema(), batches)
+    }
+
+    /// Write a stream of `schema` holding `batches`, possibly none, into a
+    /// new shared memory region (see `write_arrow_to_shm`).
+    pub fn write_stream_to_shm(
+        name: &str,
+        schema: &SchemaRef,
+        batches: &[RecordBatch],
+    ) -> SharedMemory {
         let mut ipc_buf = Vec::new();
         {
-            let mut writer = StreamWriter::try_new(&mut ipc_buf, &batches[0].schema()).unwrap();
+            let mut writer = StreamWriter::try_new(&mut ipc_buf, schema).unwrap();
             for batch in batches {
                 writer.write(batch).unwrap();
             }
@@ -459,19 +479,17 @@ pub mod shm {
             .collect()
     }
 
-    /// Read all Arrow RecordBatches from an IPC stream in shared memory.
-    ///
-    /// Delegates to `arrow_ipc::read_batches_from_shm` so tests exercise the
-    /// **same** decoder (`StreamDecoder::with_require_alignment(true)`) as
-    /// production. Using a separate `StreamReader`-based path here would
-    /// hide alignment / trailing-data bugs from the test suite — exactly
-    /// the class of mismatch that masked the original macOS `fstat` bug.
-    ///
-    /// `size` is the exact data byte count. Callers reading their own input
-    /// segments can use `holder.len()` from the `SharedMemory` returned by
-    /// `write_arrow_to_shm`; callers reading gpl-boundary output segments
-    /// should pass `ShmOutput::size` from the response.
+    /// Read every record batch of the Arrow IPC stream in a segment through
+    /// the production read path (`map_shm`, then `decode_stream`), so a
+    /// test reads with the decoder the daemon uses. `size` is the data's
+    /// byte count: `holder.len()` for a segment `write_arrow_to_shm` wrote,
+    /// `ShmOutput::size` for an output segment.
+    pub fn read_batches_from_shm(name: &str, size: usize) -> Result<Vec<RecordBatch>, String> {
+        decode_stream(map_shm(name, size)?)
+    }
+
+    /// `read_batches_from_shm`, which must succeed.
     pub fn read_arrow_from_shm(name: &str, size: usize) -> Vec<RecordBatch> {
-        crate::arrow_ipc::read_batches_from_shm(name, size).unwrap()
+        read_batches_from_shm(name, size).unwrap()
     }
 }

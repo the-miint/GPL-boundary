@@ -2,11 +2,11 @@ use std::ffi::{CStr, CString};
 use std::io::Write;
 use std::os::raw::{c_char, c_int, c_void};
 
-use arrow::array::{Array, StringArray};
 use arrow::record_batch::RecordBatch;
 
 use crate::tools::{
-    ConfigParam, FieldDescription, GplTool, ToolDescription, ToolOutput, ToolRegistration,
+    holds_nul, non_null, utf8_column, ConfigParam, FieldDescription, GplTool, ToolDescription,
+    ToolOutput, ToolRegistration,
 };
 
 // ---------------------------------------------------------------------------
@@ -108,29 +108,18 @@ fn read_input(batches: &[RecordBatch]) -> Result<BuildInput, String> {
     let mut seqs = Vec::new();
     let mut n_bases: i64 = 0;
     for batch in batches {
-        let name_col = batch
-            .column_by_name("name")
-            .ok_or("Input missing 'name' column")?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or("'name' column is not Utf8")?;
-        let seq_col = batch
-            .column_by_name("sequence")
-            .ok_or("Input missing 'sequence' column")?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or("'sequence' column is not Utf8")?;
+        let (name_col, seq_col) = (utf8_column(batch, "name")?, utf8_column(batch, "sequence")?);
         for i in 0..batch.num_rows() {
-            // 1-based, across the batches
             let row = names.len() + 1;
-            if name_col.is_null(i) {
-                return Err(format!("input row {row}: null name"));
+            let n = non_null(name_col, i, row, "name")?;
+            let s = non_null(seq_col, i, row, "sequence")?;
+            // A NUL byte would end the name or the sequence early when the
+            // C builder reads the FASTA
+            for (value, column) in [(n, "name"), (s, "sequence")] {
+                if value.contains('\0') {
+                    return Err(holds_nul(row, column));
+                }
             }
-            if seq_col.is_null(i) {
-                return Err(format!("input row {row}: null sequence"));
-            }
-            let n = name_col.value(i);
-            let s = seq_col.value(i);
             // FASTA convention is that bowtie2-build splits names on the
             // first whitespace character — `>chr1 dna:primary` becomes
             // reference name `chr1` in the index, silently dropping the
@@ -462,6 +451,7 @@ impl GplTool for Bowtie2BuildTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
@@ -503,12 +493,32 @@ mod tests {
 
     #[test]
     fn test_missing_index_path() {
-        // index_path is checked before the input: with no input at all, the
-        // error still names index_path. If execute() ever reads the input
-        // first, this fails with "At least 1 sequence required" instead.
+        // index_path is checked before the input: an input the reader
+        // refuses still gives the index_path error.
         let tool = Bowtie2BuildTool;
-        let err = tool.execute(&serde_json::json!({}), vec![]).unwrap_err();
+        let refused = make_batch(&["chr1 dna"], &["ACGT"]);
+        assert!(read_input(std::slice::from_ref(&refused)).is_err());
+        let err = tool
+            .execute(&serde_json::json!({}), vec![refused])
+            .unwrap_err();
         assert!(err.contains("index_path"), "{err}");
+    }
+
+    /// A NUL byte in a name or a sequence is refused, naming its row: the
+    /// C builder would read the FASTA record short.
+    #[test]
+    fn test_rejects_nul_byte() {
+        let first = make_batch(&["chr1"], &["ACGT"]);
+        for (name, seq, wanted) in [
+            ("chr\0", "ACGT", "input row 2: name holds a NUL byte"),
+            ("chr2", "AC\0GT", "input row 2: sequence holds a NUL byte"),
+        ] {
+            let batch = make_batch(&[name], &[seq]);
+            match read_input(&[first.clone(), batch]) {
+                Ok(_) => panic!("expected {wanted:?}, got Ok"),
+                Err(e) => assert_eq!(e, wanted),
+            }
+        }
     }
 
     fn make_batch(names: &[&str], seqs: &[&str]) -> RecordBatch {

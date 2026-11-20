@@ -47,7 +47,7 @@ use crate::tools::{self, Runner};
 /// type, which keeps the dispatch glue out of this module.
 pub type ResponseTx = Sender<Response>;
 
-/// Wall-clock instant captured as epoch-millis. The eviction sweeper (step 4)
+/// Wall-clock instant captured as epoch-millis. The eviction sweeper
 /// reads `last_used` on every tick across many workers; an `AtomicU64` is
 /// cheaper than a `Mutex<Instant>` and avoids contention with active
 /// `submit` callers.
@@ -129,9 +129,9 @@ pub struct InProcessSlot {
     /// Worker thread handle, taken by `close()` to join.
     thread: Mutex<Option<JoinHandle<()>>>,
     response_tx: ResponseTx,
-    /// Static for the lifetime of the slot. Currently only used by the
-    /// `non_streaming_runs_per_batch` test to verify routing without
-    /// inferring it from a failure response.
+    /// Whether the runner is a streaming context; static for the slot's
+    /// lifetime. Read by tests, to check routing without inferring it from
+    /// a failure response.
     #[cfg_attr(not(test), allow(dead_code))]
     streaming_supported: bool,
     closed: AtomicBool,
@@ -200,11 +200,12 @@ impl InProcessSlot {
 /// registry's eviction sweeper, which checks `in_flight() == 0`, never
 /// observes idle while a response is still in transit.
 ///
-/// A panic in a tool call answers its batch with an error rather than
-/// ending the thread, which would leave that batch and the queued ones
-/// unanswered and `in_flight` raised. A streaming context, which the panic
-/// may have left mid-update, is dropped, so later batches fail fast; a
-/// per-batch runner holds no state and runs on.
+/// A panic while a batch is handled (decoding it, the tool call, writing
+/// its outputs) answers the batch with an error rather than ending the
+/// thread, which would leave that batch and the queued ones unanswered and
+/// `in_flight` raised. A streaming context, which the panic may have left
+/// mid-update, is dropped, so later batches fail fast; a per-batch runner
+/// holds no state and runs on.
 fn worker_thread_main(
     rx: mpsc::Receiver<BatchRequest>,
     mut runner: Option<Runner>,
@@ -220,7 +221,7 @@ fn worker_thread_main(
             }),
             None => Response::error(format!(
                 "Worker for tool '{tool_name}' has no streaming context: \
-                 a tool call panicked on an earlier batch"
+                 an earlier batch panicked"
             )),
         }));
         let mut response = run.unwrap_or_else(|payload| {
@@ -228,7 +229,7 @@ fn worker_thread_main(
                 runner = None;
             }
             Response::error(format!(
-                "Tool '{tool_name}' panicked: {}",
+                "Tool '{tool_name}' panicked handling this batch: {}",
                 panic_message(payload.as_ref())
             ))
         });
@@ -427,10 +428,9 @@ impl SubprocessWorker {
     /// initializes its streaming context, then loops reading
     /// `BatchRequest` lines until EOF.
     ///
-    /// Returns `Err(response)` if the spawn itself fails or the child
-    /// fails to acknowledge init. Step 5 will add explicit init-handshake
-    /// surfacing; step 3 lets dispatch errors travel through the normal
-    /// response path.
+    /// Returns `Err(response)` if the spawn or the config write fails. The
+    /// child sends no acknowledgement: an error making its context reaches
+    /// the caller through the normal response path.
     #[allow(clippy::result_large_err)] // see registry::build_worker
     pub fn new(
         tool_name: &str,
@@ -835,7 +835,7 @@ impl Worker for SubprocessWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{StreamingContext, ToolOutput};
+    use crate::tools::{GplTool, StreamingContext, ToolDescription, ToolOutput};
     use arrow::record_batch::RecordBatch;
 
     fn make_response_channel() -> (ResponseTx, mpsc::Receiver<Response>) {
@@ -851,15 +851,59 @@ mod tests {
         }
     }
 
-    /// A panic in a tool call answers its batch with an error and drops the
-    /// context, so later batches fail fast; none is left unanswered, and
-    /// `in_flight` returns to zero so the worker can be evicted.
-    #[test]
-    fn test_a_panicking_tool_call_still_answers_its_batch() {
+    /// A tool that panics when its batch's config asks it to.
+    struct PanicsOnRequest;
+
+    impl GplTool for PanicsOnRequest {
+        fn name(&self) -> &str {
+            "panicky"
+        }
+
+        fn version(&self) -> String {
+            "0.0.1".to_string()
+        }
+
+        fn schema_version(&self) -> u32 {
+            1
+        }
+
+        fn describe(&self) -> ToolDescription {
+            ToolDescription {
+                name: "panicky",
+                version: self.version(),
+                schema_version: 1,
+                describe_version: 1,
+                description: "Panics on request",
+                config_params: vec![],
+                input_schema: vec![],
+                outputs: vec![],
+                response_metadata: vec![],
+            }
+        }
+
+        fn execute(
+            &self,
+            config: &serde_json::Value,
+            _input: Vec<RecordBatch>,
+        ) -> Result<ToolOutput, String> {
+            if config["panic"] == true {
+                panic!("asked to panic");
+            }
+            Ok(ToolOutput {
+                outputs: vec![],
+                result: serde_json::json!({}),
+            })
+        }
+    }
+
+    /// Run `runner` on a worker thread over one batch per config, in
+    /// order, and return the responses, checking each batch is answered
+    /// and `in_flight` returns to zero, so the worker can be evicted.
+    fn answers(runner: Runner, configs: &[serde_json::Value]) -> Vec<Response> {
         let (response_tx, response_rx) = make_response_channel();
         let (tx, rx) = mpsc::channel::<BatchRequest>();
-        let in_flight = Arc::new(AtomicU32::new(2));
-        // The panicking batch must not need an input: write a real one
+        let in_flight = Arc::new(AtomicU32::new(configs.len() as u32));
+        // The batches must reach the tool: give them a readable input
         let name = crate::test_util::shm::unique_shm_name("wk-panic");
         let input = crate::test_util::shm::write_arrow_to_shm(
             &name,
@@ -870,7 +914,7 @@ mod tests {
             thread::spawn(move || {
                 worker_thread_main(
                     rx,
-                    Some(Runner::Streaming(Box::new(PanickingContext))),
+                    Some(runner),
                     1,
                     "panicky".to_string(),
                     response_tx,
@@ -878,10 +922,10 @@ mod tests {
                 )
             })
         };
-        for batch_id in [1, 2] {
+        for (batch_id, config) in (1..).zip(configs) {
             tx.send(BatchRequest {
                 tool: "panicky".to_string(),
-                config: serde_json::json!({}),
+                config: config.clone(),
                 shm_input: name.clone(),
                 shm_input_size: input.len(),
                 batch_id: Some(batch_id),
@@ -890,19 +934,56 @@ mod tests {
             })
             .unwrap();
         }
-
-        for batch_id in [1, 2] {
-            let response = response_rx
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .unwrap_or_else(|e| panic!("batch {batch_id} got no response: {e}"));
-            assert!(!response.success);
-            assert_eq!(response.batch_id, Some(batch_id));
-            let error = response.error.unwrap();
-            assert!(error.contains("panicked"), "{error}");
-        }
-        assert_eq!(in_flight.load(Ordering::Acquire), 0);
+        let responses: Vec<Response> = (1..=configs.len() as u64)
+            .map(|batch_id| {
+                let response = response_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap_or_else(|e| panic!("batch {batch_id} got no response: {e}"));
+                assert_eq!(response.batch_id, Some(batch_id));
+                response
+            })
+            .collect();
+        // The thread lowers in_flight after it sends a response: join first
         drop(tx);
         thread.join().expect("the worker thread exits cleanly");
+        assert_eq!(in_flight.load(Ordering::Acquire), 0);
+        responses
+    }
+
+    /// A batch whose handling panics is answered with an error, and the
+    /// streaming context is dropped, so the next batch fails fast.
+    #[test]
+    fn test_a_panicking_tool_call_still_answers_its_batch() {
+        let context = Runner::Streaming(Box::new(PanickingContext));
+        let responses = answers(context, &[serde_json::json!({}), serde_json::json!({})]);
+        let errors: Vec<String> = (responses.into_iter())
+            .map(|r| r.error.expect("an error response"))
+            .collect();
+        assert!(
+            errors[0].contains("panicked handling this batch: the test context panics"),
+            "{}",
+            errors[0]
+        );
+        assert!(
+            errors[1].contains("no streaming context: an earlier batch panicked"),
+            "{}",
+            errors[1]
+        );
+    }
+
+    /// A per-batch runner holds no state: after a batch panics, the next
+    /// runs the tool afresh.
+    #[test]
+    fn test_a_per_batch_runner_runs_on_after_a_panic() {
+        let tool = Runner::PerBatch(Box::new(PanicsOnRequest));
+        let configs = [serde_json::json!({"panic": true}), serde_json::json!({})];
+        let responses = answers(tool, &configs);
+        let error = responses[0].error.as_deref().expect("an error response");
+        assert!(
+            error.contains("panicked handling this batch: asked to panic"),
+            "{error}"
+        );
+        assert!(responses[1].success, "{:?}", responses[1].error);
     }
 
     #[test]

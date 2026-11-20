@@ -288,8 +288,8 @@ fn run_session() -> i32 {
         }
     }
 
-    // Drain phase. Step 4 introduced the pending queue: when a session
-    // ends with batches still in-flight or queued, we must let the
+    // Drain phase. When a session ends with batches still in-flight or
+    // queued (the registry's pending queue), we must let the
     // sweeper dispatch them and let workers emit their responses
     // *before* we close the registry. close_all() unconditionally fails
     // any pending batches, so without this drain a graceful shutdown
@@ -551,10 +551,9 @@ fn recv_event(rx: &mpsc::Receiver<Event>, idle_timeout_ms: u64) -> Result<Option
 
 /// Build an `EvictionConfig` from the init knobs the client sent. Missing
 /// fields fall back to `EvictionConfig::default()`. `workers_per_fingerprint`
-/// is accepted in the protocol but not yet used (step 3/4 keep it at 1
-/// for bowtie2 because the C library has process-wide state behind a
-/// mutex; >1 children for the same fingerprint just share an index for
-/// nothing).
+/// is accepted in the protocol but not used: a fingerprint has one worker,
+/// because bowtie2 keeps process-wide state behind a mutex, and more than
+/// one child for the same fingerprint would only load the index again.
 fn eviction_config_from(init: &InitParams) -> EvictionConfig {
     let mut cfg = EvictionConfig::default();
     if let Some(v) = init.max_workers {

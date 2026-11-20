@@ -5,10 +5,12 @@ integrate their program with GPL-boundary. It covers C API design decisions
 that minimize friction during integration, common pitfalls, and the data
 exchange contract.
 
-GPL-boundary wraps your tool as a short-lived child process. Data arrives as
-Apache Arrow IPC in POSIX shared memory. Your tool runs, and results go back
-the same way. Your C code never touches shared memory or Arrow directly --
-the Rust adapter handles that. But the shape of your C API determines how
+GPL-boundary runs your tool inside a long-lived daemon, or in a worker
+process the daemon spawns. Data arrives from miint as Apache Arrow IPC in
+POSIX shared memory, and results go back the same way. Your C code never
+touches shared memory or Arrow: the daemon's front end reads and writes the
+segments, and your tool's Rust adapter turns the Arrow record batches into
+your C API's inputs, and its outputs back into record batches. But the shape of your C API determines how
 much Rust glue code is needed and how error-prone the integration is.
 
 The reference integration is FastTree (`ext/fasttree/fasttree.h` and
@@ -325,11 +327,11 @@ call from any thread, never freed. `tool_last_error()` returns a detailed
 message owned by the context, like "Sequence 'SeqA' has length 20 but
 expected 30 (alignment length mismatch)".
 
-The Rust adapter combines both:
+The Rust adapter combines both into the error it returns:
 ```rust
 let code_msg = CStr::from_ptr(tool_strerror(rc)).to_string_lossy();
 let detail = CStr::from_ptr(tool_last_error(ctx)).to_string_lossy();
-Response::error(format!("{code_msg}: {detail}"))
+return Err(format!("{code_msg}: {detail}"));
 ```
 
 ### Never call exit() or abort()
@@ -656,7 +658,7 @@ Avoid:
 ## Input format
 
 Your `tool_run()` function receives input as arrays of C strings. The Rust
-adapter reads Arrow IPC from shared memory, extracts the relevant columns,
+adapter takes the input as Arrow record batches, extracts the relevant columns,
 converts them to `Vec<CString>`, and passes raw pointer arrays to your
 function:
 
@@ -792,8 +794,8 @@ cargo test --bin gpl-boundary tools::   # just tool module tests
 make check                    # fmt + clippy + test + test-scripts
 ```
 
-The front end's, the shared memory modules' and the daemon's integration
-tests require POSIX shared memory support (`/dev/shm` on Linux, `shm_open`
+Tests of code that reads or writes segments, the daemon's integration
+tests among them, need POSIX shared memory (`/dev/shm` on Linux, `shm_open`
 on macOS). CI runs on both platforms.
 
 ## Checklist

@@ -25,8 +25,7 @@ spawns it as a long-lived daemon (one per DuckDB instance).
 batches and returns its outputs as labelled record batches (`ToolOutput`)
 and the result JSON. It never sees shared memory: the native front end
 (`src/frontend.rs`) maps and decodes the input segment, runs the tool, and
-writes its outputs to new segments, all or none. A front end for the
-WebAssembly build will pass the same batches without shared memory.
+writes its outputs to new segments, all or none.
 
 **Batched streaming**: Tools with expensive context creation (bowtie2: index
 loading, prodigal: metagenomic bins or a single-genome model) support batched
@@ -61,8 +60,8 @@ in-flight batch, marks the fingerprint dead so subsequent same-fingerprint
 batches fail fast, and best-effort sweeps any orphan
 `/dev/shm/gb-{child_pid}-*` segments. Distinct fingerprints are unaffected;
 no auto-respawn — restart gpl-boundary to recover the dead fingerprint.
-In an in-process worker, a tool call that panics answers its batch with an
-error; a streaming context is dropped, so later same-fingerprint batches
+In an in-process worker, a batch whose handling panics (decode, tool call
+or output write) is answered with an error; a streaming context is dropped, so later same-fingerprint batches
 fail fast until the worker sits idle past `worker_idle_ms` and is evicted,
 or the daemon restarts. A tool without one runs on.
 
@@ -97,7 +96,9 @@ by checking if the PID is still alive.
 - `shm::register_for_cleanup(name)` -- called when output shm is created
   (inside `arrow_ipc::ShmWriter::new_with_capacity`, before `shm_open`)
 - `shm::deregister_cleanup(name)` -- called in `main.rs` **after** the JSON
-  response has been written to stdout (never by a tool or the front end)
+  response naming the segment has been written to stdout (never by a tool
+  or the front end). A segment a failed batch wrote leaves the registry when
+  `ShmOutputs` unlinks it.
 - Signal handler and `cleanup_all()` iterate the registry and unlink everything
 
 **Important**: deregister must happen after stdout write, not before. If a
@@ -284,10 +285,10 @@ thread.
 
 - **Rust edition 2021**, standard cargo project
 - **Tests use real data, no mocking**: tool tests call `execute`/`run_batch`
-  with record batches and read the `ToolOutput`. The front end, `arrow_ipc`
-  and `shm` are tested on real POSIX shm segments (`test_util::shm`), and
-  fasttree once through the front end on real shm; the integration tests in
-  `tests/` drive the daemon over real shm.
+  with record batches and read the `ToolOutput`. Code that reads or writes
+  segments is tested on real POSIX shm segments (`test_util::shm`), and
+  fasttree once through the front end; the integration tests in `tests/`
+  drive the daemon over real shm.
 - **FFI**: manual `#[repr(C)]` bindings in each tool module (not bindgen).
   Structs must match C headers exactly. Each config struct must have an ABI
   size-check test. Size checks catch added/removed fields but not reordering;
@@ -298,6 +299,10 @@ thread.
   types against the header.
 - **Error handling**: tools return `Err(msg)`; the front end turns it into
   the error response. Never panic across FFI.
+- **Input errors name the row**: an input row is 1-based, counted across
+  the request's record batches (`input row 3: null name`). The input
+  helpers in `src/tools/mod.rs` (`utf8_column`, `non_null`, `c_strings`)
+  give the messages.
 - **Tool registration**: tools self-register via `inventory::submit!`. No
   manual dispatch match arms. Duplicate names are caught at startup.
 - **CI**: GitHub Actions on Linux + macOS. Runs `cargo test`, `cargo clippy`,
@@ -404,9 +409,11 @@ advertisement:
  "batch_id": 42}
 ```
 - `shm_input_size` is REQUIRED. Exact byte count of the Arrow IPC stream
-  in `shm_input`. The reader uses this to size its mapping — `fstat` is
-  not consulted because Darwin POSIX shm has unreliable `fstat` semantics.
-  miint, which created the input segment, already knows this value.
+  in `shm_input`. The reader maps exactly this many bytes; `fstat` does not
+  size the mapping (Darwin POSIX shm has unreliable `fstat` semantics) and
+  only refuses a size past the segment's end. miint, which created the
+  input segment, already knows this value. The stream must end with its
+  end-of-stream marker; one without it is refused.
 - `batch_id` is optional but recommended. Echoed verbatim on the matching
   response so out-of-order completions across distinct fingerprints can be
   correlated.
@@ -489,6 +496,9 @@ clean exit code 0; in-flight batches complete before exit.
 - `name: Utf8` -- sequence identifier
 - `sequence: Utf8` -- aligned sequence (all must be equal length)
 
+A null name or sequence, or a NUL byte in either, is refused, naming the
+input row.
+
 **FastTree output** (written by gpl-boundary to shm_outputs, label "tree"; schema_version=2):
 - `node_index: Int64` -- node index [0, n_nodes)
 - `parent_index: Int64` (nullable) -- parent node's `node_index`; NULL for the root
@@ -499,7 +509,7 @@ clean exit code 0; in-flight batches complete before exit.
 - `is_tip: Boolean` -- whether node is a tip (renamed from `is_leaf`)
 - `name: Utf8` (nullable) -- tip name, NULL for internal nodes
 
-**FastTree config knobs** (`describe_version=3`; full surface in
+**FastTree config knobs** (`describe_version=4`; full surface in
 `gpl-boundary --describe fasttree`):
 
 | Knob | Type | Default | Notes |
@@ -638,6 +648,10 @@ to `prodigal`), `model` (as Prodigal's result), `closed_ends` and
 - `qual1: Utf8` (nullable) -- Phred+33 quality string; null = FASTA (default quality)
 - `qual2: Utf8` (nullable) -- mate 2 quality string; null = FASTA
 
+A null `read_id` or `sequence1`, or a NUL byte in any of the strings, is
+refused, naming the input row. A batch without `qual2` counts as null
+`qual2`; each quality column must be all null or all set across the input.
+
 **Bowtie2-align output** (written by gpl-boundary to shm_outputs, label "alignments"; schema_version=2):
 - `read_id: Utf8` -- read name (QNAME)
 - `flags: UInt16` -- SAM flags
@@ -700,6 +714,10 @@ library sees it.
 - `name: Utf8` -- sequence identifier
 - `sequence: Utf8` -- DNA sequence (different lengths allowed)
 
+Refused, naming the input row: a null name or sequence; an empty name; a
+name holding whitespace or `>` (bowtie2 would cut the reference name at
+it); a sequence holding a newline or `>`; a NUL byte in either.
+
 **Bowtie2-build output**: no Arrow output. The `result` JSON carries:
 - `elapsed_ms: integer` -- wall-clock build time
 - `n_sequences: integer` -- sequences in input
@@ -736,7 +754,7 @@ side-channel through `fstat`.
 
 **Reading (`map_shm(name, size)`, then `decode_stream(buffer)`)** — the
 front end's read of an input segment; tests read output segments the same
-way (`read_batches_from_shm`, test-only). Caller supplies the data length
+way (`test_util::shm::read_batches_from_shm`). Caller supplies the data length
 out-of-band: `BatchRequest::shm_input_size` for input segments,
 `ShmOutput::size` for output segments. `fstat` does not size the mapping —
 Darwin POSIX shm has unreliable `fstat` semantics, and gpl-boundary's own

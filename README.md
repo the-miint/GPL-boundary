@@ -295,7 +295,11 @@ string on an existing knob) bump only `describe_version`.
   correctness: Darwin POSIX shm has unreliable `fstat` semantics, and
   gpl-boundary's own outputs are over-allocated to a sparse-mmap reservation
   (default 1 GiB), so `fstat` returns the reservation rather than the data
-  length on either platform.
+  length on either platform. An input whose `shm_input_size` is past the end
+  of the segment is refused.
+- **End**: the stream ends with its end-of-stream marker. An input stream
+  without it is refused, rather than read as however many batches precede
+  the cut.
 - **Batches**: a single RecordBatch per stream (current convention; consumers
   should handle multiple batches for forward compatibility).
 

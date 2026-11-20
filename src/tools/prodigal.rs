@@ -3,9 +3,9 @@
 //! batches.
 
 use crate::tools::{
-    arrow_schema, config_bool, config_cint, config_f64, config_knobs_known, config_str,
-    ConfigParam, FieldDescription, GplTool, OutputDescription, StreamingContext, ToolDescription,
-    ToolOutput,
+    arrow_schema, config_bool, config_cint, config_f64, config_knobs_known, config_str, non_null,
+    utf8_column, ConfigParam, FieldDescription, GplTool, OutputDescription, StreamingContext,
+    ToolDescription, ToolOutput,
 };
 use arrow::array::{
     Array, ArrayRef, BooleanBuilder, Float64Builder, Int32Builder, StringArray, StringBuilder,
@@ -822,22 +822,10 @@ impl Contigs {
         let mut columns = Vec::with_capacity(batches.len());
         let mut row = 0;
         for batch in batches {
-            let column = |name: &str| {
-                let col = batch
-                    .column_by_name(name)
-                    .ok_or_else(|| format!("Input missing '{name}' column"))?;
-                let col = col.as_any().downcast_ref::<StringArray>();
-                col.cloned()
-                    .ok_or_else(|| format!("'{name}' column is not Utf8"))
-            };
-            let (names, seqs) = (column("name")?, column("sequence")?);
+            let (names, seqs) = (utf8_column(batch, "name")?, utf8_column(batch, "sequence")?);
             for i in 0..batch.num_rows() {
-                // 1-based, as positions in a sequence
                 let row = row + i + 1;
-                if names.is_null(i) {
-                    return Err(format!("input row {row}: null name"));
-                }
-                let name = names.value(i);
+                let name = non_null(names, i, row, "name")?;
                 if seqs.is_null(i) {
                     return Err(format!("contig '{name}' (input row {row}): null sequence"));
                 }
@@ -850,7 +838,7 @@ impl Contigs {
                 }
             }
             row += batch.num_rows();
-            columns.push((names, seqs));
+            columns.push((names.clone(), seqs.clone()));
         }
         if row == 0 {
             return Err("At least 1 sequence required".into());
@@ -994,8 +982,8 @@ impl Context {
         self.check_kept(c_len(seq).into())
     }
 
-    /// Check the loaded sequence is `length` characters long. Contigs::read
-    /// refused what the library drops: this catches a change in that rule.
+    /// Check the loaded sequence is `length` characters long.
+    /// Contigs::from_batches refused what the library drops: this catches a change in that rule.
     fn check_kept(&self, length: i64) -> Result<(), String> {
         let mut info: ProdigalSeqInfo = unsafe { std::mem::zeroed() };
         if unsafe { prodigal_get_seq_info(self.0, &mut info) } != PRODIGAL_OK {
@@ -1066,10 +1054,13 @@ enum Session {
     TrainOnBatch(ProdigalConfig),
 }
 
-// Safety: The C context is not thread-safe, but no references to it are
-// handed out: only Session's &mut self methods reach it, so exclusive
-// access is enforced at the type level. The config's pointers are null or
-// a static function.
+// Safety (Send, which StreamingContext requires): the in-process worker
+// makes a Session on one thread and uses and drops it on its own. The C
+// library keeps a context's state in heap memory reached through it, and
+// its sources hold no thread-local storage, so that state is not tied to
+// the thread that made it. One thread at a time reaches it: only Session's
+// `&mut self` methods and Drop use it. The config's pointers are null or a
+// static function.
 unsafe impl Send for Session {}
 
 impl Session {
@@ -2014,7 +2005,7 @@ mod tests {
         }
     }
 
-    /// Contigs::read refuses what the library drops. Should the library's
+    /// Contigs::from_batches refuses what the library drops. Should the library's
     /// rule change, a contig it doesn't keep whole is an error, when
     /// predicting and when training, not shifted coordinates or a model of
     /// other bases.
@@ -2026,7 +2017,7 @@ mod tests {
         let err = ctx.load(&dropped).unwrap_err();
         assert!(err.contains("kept"), "{err}");
 
-        // As Contigs::read would never return them
+        // As Contigs::from_batches would never return them
         let mut contigs = anthus();
         contigs[5].1.push('-');
         let names = StringArray::from_iter_values(contigs.iter().map(|c| &c.0));

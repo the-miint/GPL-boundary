@@ -5,8 +5,9 @@
 //! views of the mapping. It writes each output batch to a new segment
 //! through `arrow_ipc::ShmOutputs`, all or none. A segment is registered
 //! for signal-handler cleanup when it is created (`ShmWriter`); the front
-//! end never deregisters one, since `main.rs` does that once the response
-//! is on stdout.
+//! end never deregisters a segment the response names, since `main.rs`
+//! does that once the response is on stdout. A failed batch's segments
+//! leave the registry as `ShmOutputs` unlinks them.
 
 use arrow::buffer::Buffer;
 use arrow::record_batch::RecordBatch;
@@ -76,6 +77,7 @@ mod tests {
     use crate::test_util::column;
     use crate::test_util::shm::{
         take_outputs, unique_shm_name, write_arrow_to_shm, write_batches_to_shm,
+        write_stream_to_shm,
     };
     use crate::tools::{GplTool, Runner, StreamingContext, ToolDescription, ToolOutput};
     use arrow::array::{Array, ArrayData, Int64Array, ListArray, StringArray};
@@ -241,14 +243,8 @@ mod tests {
         assert_eq!(seen, Some(0));
 
         // A stream with a schema and no batches
-        let schema = names_batch(&[]).schema();
-        let mut stream = Vec::new();
-        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut stream, &schema).unwrap();
-        writer.finish().unwrap();
-        drop(writer);
         let name = unique_shm_name("fe-schema-only");
-        let mut holder = SharedMemory::create(&name, stream.len()).unwrap();
-        holder.as_mut_slice().copy_from_slice(&stream);
+        let holder = write_stream_to_shm(&name, &names_batch(&[]).schema(), &[]);
         let mut seen = None;
         let response = run_on_shm(&name, holder.len(), |input| {
             seen = Some(input.len());
@@ -442,7 +438,11 @@ mod tests {
     }
 
     impl StreamingContext for RunningTotal {
+        /// Refuses an input with no batches, leaving the total as it was.
         fn run_batch(&mut self, input: Vec<RecordBatch>) -> Result<ToolOutput, String> {
+            if input.is_empty() {
+                return Err("fe: no batches".to_string());
+            }
             self.0 += rows(&input);
             Ok(ToolOutput {
                 outputs: count_output(self.0),
@@ -548,10 +548,11 @@ mod tests {
         );
     }
 
-    /// A streaming runner keeps its context across batches, a failed batch
-    /// included; a per-batch runner runs the tool afresh.
+    /// A streaming runner keeps its context across batches, through a batch
+    /// the front end fails and one the context refuses; a per-batch runner
+    /// runs the tool afresh.
     #[test]
-    fn test_a_streaming_runner_keeps_its_context_across_batches() {
+    fn test_a_streaming_runner_keeps_its_context_and_a_per_batch_runner_does_not() {
         let config = json!({});
 
         // Three rows in two batches, then one row.
@@ -577,11 +578,18 @@ mod tests {
         assert_eq!(first[0].0, "fe-rows");
         assert_eq!(count_of(&first[0].1), 3);
 
-        // A batch that fails leaves the context as it was
+        // A batch that fails leaves the context as it was: one whose
+        // segment cannot be read, which never reaches it, and one it refuses
         let failed = respond(&request("/gb-fe-no-such-input", 0, 2), 7, |input| {
             runner.run(&config, input)
         });
         assert!(!failed.success);
+        let empty = unique_shm_name("fe-empty");
+        let empty_holder = write_stream_to_shm(&empty, &names_batch(&[]).schema(), &[]);
+        let refused = respond(&request(&empty, empty_holder.len(), 2), 7, |input| {
+            runner.run(&config, input)
+        });
+        assert_eq!(refused.error.as_deref(), Some("fe: no batches"));
 
         let second = respond(&request(&one, one_holder.len(), 3), 7, |input| {
             runner.run(&config, input)
