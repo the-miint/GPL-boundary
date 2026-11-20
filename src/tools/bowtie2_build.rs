@@ -546,16 +546,18 @@ mod tests {
         assert!(err.contains("truncate"), "Error should explain why: {err}");
     }
 
-    /// A null name or sequence is refused, not read as an empty string.
+    /// A null name or sequence is refused, naming its input row (1-based,
+    /// counted across batches), not read as an empty string.
     #[test]
     fn test_rejects_null_name_or_sequence() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("name", DataType::Utf8, true),
             Field::new("sequence", DataType::Utf8, true),
         ]));
+        let first = make_batch(&["chr1", "chr2"], &["ACGT", "ACGT"]);
         for (name, seq, wanted) in [
-            (None, Some("ACGT"), "Sequence name 0 is null"),
-            (Some("chr1"), None, "Sequence body 0 is null"),
+            (None, Some("ACGT"), "input row 3: null name"),
+            (Some("chr3"), None, "input row 3: null sequence"),
         ] {
             let batch = RecordBatch::try_new(
                 schema.clone(),
@@ -565,7 +567,7 @@ mod tests {
                 ],
             )
             .unwrap();
-            match read_input(&[batch]) {
+            match read_input(&[first.clone(), batch]) {
                 Ok(_) => panic!("expected {wanted:?}, got Ok"),
                 Err(e) => assert!(e.contains(wanted), "expected {wanted:?}, got: {e}"),
             }

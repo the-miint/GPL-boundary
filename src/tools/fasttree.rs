@@ -1384,20 +1384,23 @@ mod tests {
     }
 
     /// A NUL byte cannot pass to the C library in a name or a sequence:
-    /// it is refused, not a panic.
+    /// it is refused, naming its input row, not a panic.
     #[test]
     fn test_a_nul_byte_is_refused() {
         let seqs = ["ACGTACGT", "ACGTACGA", "TGCATGCA", "TGCATGCG"];
         let config = serde_json::json!({"seq_type": "nucleotide"});
         let names = make_input_batch(&["A", "B\0", "C", "D"], &seqs);
         let err = FastTreeTool.execute(&config, vec![names]).unwrap_err();
-        assert!(err.contains("NUL"), "{err}");
+        assert!(err.contains("input row 2: name holds a NUL byte"), "{err}");
         let sequences = make_input_batch(
             &["A", "B", "C", "D"],
             &["ACGTACG\0", seqs[1], seqs[2], seqs[3]],
         );
         let err = FastTreeTool.execute(&config, vec![sequences]).unwrap_err();
-        assert!(err.contains("NUL"), "{err}");
+        assert!(
+            err.contains("input row 1: sequence holds a NUL byte"),
+            "{err}"
+        );
     }
 
     /// A null name or sequence is refused, naming its input row (counted

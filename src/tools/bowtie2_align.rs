@@ -2582,6 +2582,51 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
         }
     }
 
+    /// qual2 covers every paired read when one paired batch has a qual2
+    /// column and another has none, in either order: the batches without
+    /// it count as null qualities, so FASTQ in one and none in the other is
+    /// a mix, refused before the C library reads past the qual2 array.
+    #[test]
+    fn test_read_input_qual2_covers_every_paired_read_across_batches() {
+        let qual = "IIIIIIIIIIII";
+        let with_qual2 = make_paired_end_input(
+            &["pair1"],
+            &["ACGTACGTACGT"],
+            &["AAAATTTTCCCC"],
+            &[Some(qual)],
+            &[Some(qual)],
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("read_id", DataType::Utf8, false),
+            Field::new("sequence1", DataType::Utf8, false),
+            Field::new("sequence2", DataType::Utf8, true),
+            Field::new("qual1", DataType::Utf8, true),
+        ]));
+        let without_qual2 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["pair2"])),
+                Arc::new(StringArray::from(vec!["TGCATGCATGCA"])),
+                Arc::new(StringArray::from(vec!["GGGGTTTTAAAA"])),
+                Arc::new(StringArray::from(vec![qual])),
+            ],
+        )
+        .unwrap();
+        for batches in [
+            [with_qual2.clone(), without_qual2.clone()],
+            [without_qual2, with_qual2],
+        ] {
+            match Bowtie2AlignTool::read_input(&batches) {
+                Ok(data) => panic!(
+                    "expected a qual2 mix, got {} qual2 values for {} paired reads",
+                    data.quals2.map_or(0, |q| q.len()),
+                    data.seqs2.map_or(0, |s| s.len())
+                ),
+                Err(e) => assert!(e.contains("qual2 has mix"), "got: {e}"),
+            }
+        }
+    }
+
     #[test]
     fn test_bowtie2_align_no_unal_zero_records() {
         let (_dir, index_prefix) = build_test_index();
