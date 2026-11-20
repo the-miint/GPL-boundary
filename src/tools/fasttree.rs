@@ -2,15 +2,15 @@
 //! and returns the SOA tree as a record batch.
 
 use crate::tools::{
-    checked_cint, ConfigParam, FieldDescription, GplTool, OutputDescription, ToolDescription,
-    ToolOutput,
+    c_strings, checked_cint, ConfigParam, FieldDescription, GplTool, OutputDescription,
+    ToolDescription, ToolOutput,
 };
 use arrow::array::{
     Array, BooleanArray, Float64Builder, Int32Array, Int64Array, Int64Builder, StringArray,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::Arc;
@@ -1008,13 +1008,6 @@ impl GplTool for FastTreeTool {
             return Err("All sequences must have the same length (aligned)".to_string());
         }
 
-        // Convert to C strings for fasttree
-        let c_strings = |strings: &[String], what: &str| {
-            (strings.iter())
-                .map(|s| CString::new(s.as_str()))
-                .collect::<Result<Vec<CString>, _>>()
-                .map_err(|e| format!("A {what} holds a NUL byte at {}", e.nul_position()))
-        };
         let c_names = c_strings(&names, "name")?;
         let c_seqs = c_strings(&sequences, "sequence")?;
         let c_name_ptrs: Vec<*const c_char> = c_names.iter().map(|n| n.as_ptr()).collect();
@@ -1186,6 +1179,7 @@ mod tests {
         assert_outputs_described, extracted_16s_phylip, parse_interleaved_phylip, subset_alignment,
     };
     use arrow::array::{Array, Float64Array};
+    use std::ffi::CString;
 
     // Test-only FFI binding for `fasttree_tree_soa_to_newick`.
     // Used by parity tests to serialize a library-built SOA tree into the

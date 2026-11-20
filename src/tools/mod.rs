@@ -8,6 +8,7 @@ pub mod prodigal_train;
 use crate::protocol::Response;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use std::ffi::CString;
 use std::os::raw::c_int;
 
 /// Description of an Arrow schema field for introspection.
@@ -85,6 +86,33 @@ pub(crate) fn checked_cint(name: &str, v: impl Into<i128>) -> Result<c_int, Stri
         return Err(format!("{name}={v} below C int range (min {})", c_int::MIN));
     }
     Ok(v as c_int)
+}
+
+// --- Input to C ---
+
+/// C strings of a column's values, one per input row in order. A value
+/// holding a NUL byte would reach the C library cut short, so it is
+/// refused, naming its 1-based input row.
+pub(crate) fn c_strings(values: &[String], column: &str) -> Result<Vec<CString>, String> {
+    (values.iter().enumerate())
+        .map(|(i, s)| CString::new(s.as_str()).map_err(|_| holds_nul(i, column)))
+        .collect()
+}
+
+/// As `c_strings`, for a nullable column; a null stays None.
+pub(crate) fn c_optional_strings(
+    values: &[Option<String>],
+    column: &str,
+) -> Result<Vec<Option<CString>>, String> {
+    (values.iter().enumerate())
+        .map(|(i, v)| {
+            (v.as_deref().map(CString::new).transpose()).map_err(|_| holds_nul(i, column))
+        })
+        .collect()
+}
+
+fn holds_nul(index: usize, column: &str) -> String {
+    format!("input row {}: {column} holds a NUL byte", index + 1)
 }
 
 /// Check that `config` is an object (null: no knobs) whose knobs are all
@@ -402,6 +430,19 @@ mod tests {
                 "prodigal-train"
             ]
         );
+    }
+
+    #[test]
+    fn test_c_strings_name_the_row_of_a_nul_byte() {
+        let values = ["a".to_string(), "b\0".to_string()];
+        let err = c_strings(&values, "name").unwrap_err();
+        assert_eq!(err, "input row 2: name holds a NUL byte");
+        let optional = [None, Some("q".to_string()), Some("\0".to_string())];
+        let err = c_optional_strings(&optional, "qual1").unwrap_err();
+        assert_eq!(err, "input row 3: qual1 holds a NUL byte");
+        let ok = c_optional_strings(&optional[..2], "qual1").unwrap();
+        assert!(ok[0].is_none());
+        assert_eq!(ok[1].as_deref(), Some(c"q"));
     }
 
     #[test]

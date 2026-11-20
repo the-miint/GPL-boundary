@@ -121,11 +121,13 @@ fn read_input(batches: &[RecordBatch]) -> Result<BuildInput, String> {
             .downcast_ref::<StringArray>()
             .ok_or("'sequence' column is not Utf8")?;
         for i in 0..batch.num_rows() {
+            // 1-based, across the batches
+            let row = names.len() + 1;
             if name_col.is_null(i) {
-                return Err(format!("Sequence name {i} is null"));
+                return Err(format!("input row {row}: null name"));
             }
             if seq_col.is_null(i) {
-                return Err(format!("Sequence body {i} is null"));
+                return Err(format!("input row {row}: null sequence"));
             }
             let n = name_col.value(i);
             let s = seq_col.value(i);
@@ -138,18 +140,18 @@ fn read_input(batches: &[RecordBatch]) -> Result<BuildInput, String> {
             // the FASTA record boundary) up front so the failure mode is
             // a clear error rather than silent name truncation.
             if n.is_empty() {
-                return Err(format!("Sequence name {i} is empty"));
+                return Err(format!("input row {row}: empty name"));
             }
             if n.chars().any(|c| c.is_whitespace()) || n.contains('>') {
                 return Err(format!(
-                    "Sequence name {i} contains whitespace or '>'; bowtie2 \
+                    "input row {row}: name contains whitespace or '>'; bowtie2 \
                      would silently truncate it (FASTA name = first token). \
                      Strip these before submitting.",
                 ));
             }
             if s.contains('\n') || s.contains('\r') || s.contains('>') {
                 return Err(format!(
-                    "Sequence body {i} contains a newline or '>' character"
+                    "input row {row}: sequence contains a newline or '>' character"
                 ));
             }
             n_bases += s.len() as i64;
@@ -318,7 +320,7 @@ impl GplTool for Bowtie2BuildTool {
     fn execute(
         &self,
         config: &serde_json::Value,
-        input: Vec<RecordBatch>,
+        batches: Vec<RecordBatch>,
     ) -> Result<ToolOutput, String> {
         let index_path = (config.get("index_path").and_then(|v| v.as_str()))
             .ok_or("index_path is required (output basename for .bt2 files)")?
@@ -329,7 +331,9 @@ impl GplTool for Bowtie2BuildTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let input = read_input(&input)?;
+        let input = read_input(&batches)?;
+        // Copied out: release the batches before the build
+        drop(batches);
 
         if input.names.is_empty() {
             return Err("At least 1 sequence required".to_string());

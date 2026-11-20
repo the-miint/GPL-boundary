@@ -63,7 +63,8 @@ batches fail fast, and best-effort sweeps any orphan
 no auto-respawn — restart gpl-boundary to recover the dead fingerprint.
 In an in-process worker, a tool call that panics answers its batch with an
 error; a streaming context is dropped, so later same-fingerprint batches
-fail fast until the worker is evicted, and a tool without one runs on.
+fail fast until the worker sits idle past `worker_idle_ms` and is evicted,
+or the daemon restarts. A tool without one runs on.
 
 ## Shared memory lifecycle (critical)
 

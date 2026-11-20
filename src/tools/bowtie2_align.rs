@@ -11,8 +11,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::tools::{
-    ConfigParam, FieldDescription, GplTool, OutputDescription, StreamingContext, ToolDescription,
-    ToolOutput, ToolRegistration,
+    c_optional_strings, c_strings, ConfigParam, FieldDescription, GplTool, OutputDescription,
+    StreamingContext, ToolDescription, ToolOutput, ToolRegistration,
 };
 
 // ---------------------------------------------------------------------------
@@ -477,7 +477,10 @@ impl Bowtie2AlignTool {
         let mut seqs1 = Vec::new();
         let mut quals1: Vec<Option<String>> = Vec::new();
         let mut seqs2: Option<Vec<String>> = None;
-        let mut quals2: Option<Vec<Option<String>>> = None;
+        // One per paired read: a paired batch without a qual2 column adds
+        // nulls, so qual2 covers every read the C library is given
+        let mut paired_quals2: Vec<Option<String>> = Vec::new();
+        let mut any_qual2_column = false;
 
         for batch in batches {
             let id_col = batch
@@ -557,15 +560,11 @@ impl Bowtie2AlignTool {
                         buf.push(s2.value(i).to_string());
                     }
 
-                    if let Some(q2) = q2_col {
-                        let qbuf = quals2.get_or_insert_with(Vec::new);
-                        for i in 0..batch.num_rows() {
-                            if q2.is_null(i) {
-                                qbuf.push(None);
-                            } else {
-                                qbuf.push(Some(q2.value(i).to_string()));
-                            }
-                        }
+                    any_qual2_column |= q2_col.is_some();
+                    for i in 0..batch.num_rows() {
+                        paired_quals2.push(
+                            (q2_col.filter(|q2| !q2.is_null(i))).map(|q2| q2.value(i).to_string()),
+                        );
                     }
                 }
             }
@@ -589,6 +588,8 @@ impl Bowtie2AlignTool {
             }
         }
 
+        // No qual2 column in any batch: no qual2 array at all
+        let quals2 = any_qual2_column.then_some(paired_quals2);
         validate_qual_uniformity(&quals1, &seqs2, &quals2)?;
 
         Ok(Bt2InputData {
@@ -1033,25 +1034,6 @@ impl StreamingContext for Bowtie2StreamingContext {
         drop(input);
         self.align(&reads)
     }
-}
-
-/// C strings of a column's values, for the C input arrays.
-fn c_strings(values: &[String], column: &str) -> Result<Vec<CString>, String> {
-    (values.iter())
-        .map(|s| CString::new(s.as_str()))
-        .collect::<Result<_, _>>()
-        .map_err(|_| format!("{column} contains interior null byte"))
-}
-
-/// C strings of a nullable column's values; a null stays None.
-fn c_optional_strings(
-    values: &[Option<String>],
-    column: &str,
-) -> Result<Vec<Option<CString>>, String> {
-    (values.iter())
-        .map(|v| v.as_deref().map(CString::new).transpose())
-        .collect::<Result<_, _>>()
-        .map_err(|_| format!("{column} contains interior null byte"))
 }
 
 /// Pointers to C strings, null for a None.

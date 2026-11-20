@@ -403,8 +403,8 @@ pub struct SubprocessWorker {
     /// Set when the reader thread observes EOF on the child's stdout
     /// (child crashed or exited unexpectedly). Once true, future
     /// `submit` calls emit error responses without trying to write to
-    /// the dead pipe. The plan deliberately does not auto-respawn —
-    /// the user must restart gpl-boundary to recover the fingerprint.
+    /// the dead pipe. There is no auto-respawn: restarting gpl-boundary
+    /// recovers the fingerprint.
     fingerprint_dead: Arc<AtomicBool>,
     /// In-submission-order records of batches written to the child's stdin
     /// but not yet responded to. Pushed by `submit`, popped by the reader
@@ -685,10 +685,9 @@ impl Worker for SubprocessWorker {
         }
 
         if self.fingerprint_dead.load(Ordering::Acquire) {
-            // The reader thread observed the child crash. Per the plan,
-            // we don't auto-respawn — the user must restart the daemon
-            // to recover this fingerprint. Fail every subsequent submit
-            // fast.
+            // The reader thread observed the child crash. There is no
+            // auto-respawn, so every later submit fails fast until the
+            // daemon restarts.
             let mut r = Response::error(format!(
                 "Worker for tool '{}' is dead (subprocess crashed); \
                  restart gpl-boundary to recover this fingerprint",
