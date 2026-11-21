@@ -37,8 +37,11 @@ state, no stdout/stderr writes.
 
 ## Step 2: Add `build_<tool>()` to `build.rs`
 
-Each tool gets its own `cc::Build` with a unique `.compile()` name to prevent
-symbol collisions between C libraries.
+Each tool gets its own static archive, a unique `.compile()` name, to prevent
+symbol collisions between C libraries. A source that needs other flags is
+compiled on its own (`compile_intermediates()`) and its object added to the
+tool's archive (`.objects(...)`), as `build_prodigal()` does for Prodigal's
+`training.c`: a second archive would make the link order matter.
 
 ```rust
 fn main() {
@@ -58,7 +61,8 @@ fn build_newtool() {
         .define("NEWTOOL_NO_MAIN", None)
         .flag("-fvisibility=hidden")
         // The submodule's own release-build flags (its Makefile's, or
-        // CMake Release's), nothing else: extra optimisation flags can cost
+        // CMake Release's), nothing else, unless a compiler cannot build a
+        // file with them: extra optimisation flags can cost
         // (-funroll-loops made Prodigal 46% slower) and FP flags can change
         // results
         .opt_level(3)
@@ -656,8 +660,9 @@ Manual review against the C header is required when fields change.
 
 ### Reusing another tool's cc::Build
 
-Each tool must have its own `cc::Build::new()` chain. Adding files to
-another tool's build causes symbol collisions.
+Each tool must have its own archive, built from its own
+`cc::Build::new()` chains. Adding files to another tool's archive causes
+symbol collisions.
 
 ### Storing raw pointers to per-batch data in the streaming context
 
