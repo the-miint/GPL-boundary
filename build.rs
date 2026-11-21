@@ -151,8 +151,8 @@ fn locate_macos_libomp() -> PathBuf {
     );
 }
 
-/// Compile Prodigal C sources into static libraries: the library at -O3, and
-/// training.c on its own at -O0.
+/// Compile Prodigal C sources into a static library: training.c at -O0, the
+/// rest at -O3.
 fn build_prodigal() {
     let dir = PathBuf::from("ext/prodigal");
     let prodigal = || {
@@ -169,7 +169,21 @@ fn build_prodigal() {
         build
     };
 
+    // training.c holds the 50 metagenomic models, each built from constant
+    // tables and copied out, and reads and writes a model file: nothing an
+    // optimizer speeds up. gcc 15.2 (Ubuntu 26.04) at -O1 to -O3 did not
+    // finish compiling it in 10 minutes; at -O0 it takes 15 s. At -O0 the 50
+    // models are byte-identical to the -O3 build's (gcc 14.2), the object is
+    // 0.16 MB larger, and the largest stack frame is the same (558 KB).
+    // CFLAGS from the environment come after this flag (cc's order), so an
+    // -O there applies to training.c too.
+    let training = prodigal()
+        .file(dir.join("training.c"))
+        .opt_level(0)
+        .compile_intermediates();
+
     prodigal()
+        .objects(training)
         .file(dir.join("dprog.c"))
         .file(dir.join("gene.c"))
         .file(dir.join("metagenomic.c"))
@@ -182,18 +196,6 @@ fn build_prodigal() {
         // output; -finline-functions alone changes nothing at -O3).
         .opt_level(3)
         .compile("prodigal_c");
-
-    // training.c holds the 50 metagenomic models, each built from constant
-    // tables and copied out, and reads and writes a model file: nothing an
-    // optimizer speeds up. gcc 15.2 (Ubuntu 26.04) at -O1 to -O3 did not
-    // finish compiling it in 10 minutes; at -O0 it takes 15 s. At -O0 the 50
-    // models are byte-identical to the -O3 build's (gcc 14.2), the object is
-    // 0.16 MB larger, and the largest stack frame is the same (558 KB).
-    // Linked after prodigal_c, which calls it; it calls only libc.
-    prodigal()
-        .file(dir.join("training.c"))
-        .opt_level(0)
-        .compile("prodigal_training");
 
     // The whole submodule, so a source added or removed upstream is seen
     println!("cargo:rerun-if-changed=ext/prodigal");
