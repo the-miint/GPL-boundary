@@ -174,7 +174,8 @@ fn build_prodigal() {
     // optimizer speeds up. gcc 15.2 (Ubuntu 26.04) at -O1 to -O3 did not
     // finish compiling it in 10 minutes; at -O0 it takes 15 s. At -O0 the 50
     // models are byte-identical to the -O3 build's (gcc 14.2), the object is
-    // 0.16 MB larger, and the largest stack frame is the same (558 KB).
+    // 0.16 MB larger, and its largest stack frame (558 KB, on a worker
+    // thread's 2 MiB default stack) grows by 16 B.
     // CFLAGS from the environment come after this flag (cc's order), so an
     // -O there applies to training.c too.
     let training = prodigal()
