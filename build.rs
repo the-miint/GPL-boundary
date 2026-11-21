@@ -151,30 +151,51 @@ fn locate_macos_libomp() -> PathBuf {
     );
 }
 
-/// Compile Prodigal C sources into a static library.
+/// Compile Prodigal C sources into a static library: training.c at -O0, the
+/// rest at -O3.
 fn build_prodigal() {
     let dir = PathBuf::from("ext/prodigal");
+    let prodigal = || {
+        let mut build = cc::Build::new();
+        build
+            .include(&dir)
+            .define("PRODIGAL_NO_MAIN", None)
+            .flag("-fvisibility=hidden")
+            // As the fork's Makefile: without it aarch64 fuses multiply-adds
+            // and prints some scores differently from x86-64 in the last
+            // digit.
+            .flag("-ffp-contract=off")
+            .warnings(false);
+        build
+    };
 
-    cc::Build::new()
+    // training.c holds the 50 metagenomic models, each built from constant
+    // tables and copied out, and reads and writes a model file: nothing an
+    // optimizer speeds up. gcc 15.2 (Ubuntu 26.04) at -O1 to -O3 did not
+    // finish compiling it in 10 minutes; at -O0 it takes 15 s. At -O0 the 50
+    // models are byte-identical to the -O3 build's (gcc 14.2), the object is
+    // 0.16 MB larger, and its largest stack frame (558 KB, on a worker
+    // thread's 2 MiB default stack) grows by 16 B.
+    // CFLAGS from the environment come after this flag (cc's order), so an
+    // -O there applies to training.c too.
+    let training = prodigal()
+        .file(dir.join("training.c"))
+        .opt_level(0)
+        .compile_intermediates();
+
+    prodigal()
+        .objects(training)
         .file(dir.join("dprog.c"))
         .file(dir.join("gene.c"))
         .file(dir.join("metagenomic.c"))
         .file(dir.join("node.c"))
         .file(dir.join("sequence.c"))
-        .file(dir.join("training.c"))
         .file(dir.join("prodigal_api.c"))
-        .include(&dir)
-        .define("PRODIGAL_NO_MAIN", None)
-        .flag("-fvisibility=hidden")
-        // As the fork's Makefile: without it aarch64 fuses multiply-adds and
-        // prints some scores differently from x86-64 in the last digit.
-        .flag("-ffp-contract=off")
         // -O3 alone, as the fork's Makefile: -funroll-loops (with
         // -finline-functions, FastTree's flags, copied here once) made
         // metagenomic mode 46% slower (E. coli 12.4 s → 18.1 s, the same
         // output; -finline-functions alone changes nothing at -O3).
         .opt_level(3)
-        .warnings(false)
         .compile("prodigal_c");
 
     // The whole submodule, so a source added or removed upstream is seen
