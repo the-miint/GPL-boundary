@@ -10,9 +10,9 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::protocol::Response;
 use crate::tools::{
-    ConfigParam, FieldDescription, GplTool, OutputDescription, StreamingContext, ToolDescription,
+    c_optional_strings, c_strings, non_null, optional_utf8_column, utf8_column, ConfigParam,
+    FieldDescription, GplTool, OutputDescription, StreamingContext, ToolDescription, ToolOutput,
     ToolRegistration,
 };
 
@@ -72,9 +72,9 @@ pub struct Bt2AlignConfig {
     pub mismatch_penalty_min: c_int,
     // v0.4 fields (bt2_api.h BT2_API_VERSION_MINOR=4, commit d35e377). Order
     // must match the C struct tail exactly (ABI size check catches size, not
-    // reordering). `lowseeds` + three seed-behavior knobs are NOT exposed as
-    // JSON config yet (left at config_init defaults: NULL/0); `memory_mapped`
-    // is set implicitly by build_config — see the note there.
+    // reordering). `lowseeds`, the three seed-behaviour knobs and
+    // `memory_mapped` are config knobs, applied by build_config (see the
+    // `memory_mapped` note there for its default).
     pub lowseeds: *const c_char,
     pub no_exact_upfront: c_int,
     pub no_1mm_upfront: c_int,
@@ -238,6 +238,147 @@ inventory::submit! {
     }
 }
 
+/// The alignments output: one row per SAM record. Its columns, as
+/// --describe lists them, are `output_schema`'s.
+const ALIGNMENTS: OutputDescription = OutputDescription {
+    label: "alignments",
+    schema: &[
+        FieldDescription {
+            name: "read_id",
+            arrow_type: "Utf8",
+            nullable: false,
+            description: "Read name (QNAME)",
+        },
+        FieldDescription {
+            name: "flags",
+            arrow_type: "UInt16",
+            nullable: false,
+            description: "SAM flags",
+        },
+        FieldDescription {
+            name: "reference",
+            arrow_type: "Utf8",
+            nullable: false,
+            description: "Reference sequence name (RNAME); * if unmapped",
+        },
+        FieldDescription {
+            name: "position",
+            arrow_type: "Int64",
+            nullable: false,
+            description: "1-based leftmost position (POS); 0 if unmapped",
+        },
+        FieldDescription {
+            name: "stop_position",
+            arrow_type: "Int64",
+            nullable: false,
+            description: "1-based inclusive end on reference; \
+                          derived from POS + reference-length(CIGAR) - 1; \
+                          0 if unmapped",
+        },
+        FieldDescription {
+            name: "mapq",
+            arrow_type: "UInt8",
+            nullable: false,
+            description: "Mapping quality (MAPQ)",
+        },
+        FieldDescription {
+            name: "cigar",
+            arrow_type: "Utf8",
+            nullable: false,
+            description: "CIGAR string; * if unmapped",
+        },
+        FieldDescription {
+            name: "mate_reference",
+            arrow_type: "Utf8",
+            nullable: false,
+            description: "Mate reference name (RNEXT); * if unavailable",
+        },
+        FieldDescription {
+            name: "mate_position",
+            arrow_type: "Int64",
+            nullable: false,
+            description: "Mate position (PNEXT); 0 if unavailable",
+        },
+        FieldDescription {
+            name: "template_length",
+            arrow_type: "Int64",
+            nullable: false,
+            description: "Template length (TLEN); 0 if unavailable",
+        },
+        FieldDescription {
+            name: "tag_as",
+            arrow_type: "Int32",
+            nullable: true,
+            description: "AS:i alignment score; null if absent",
+        },
+        FieldDescription {
+            name: "tag_xs",
+            arrow_type: "Int32",
+            nullable: true,
+            description: "XS:i second-best alignment score; null if absent",
+        },
+        FieldDescription {
+            name: "tag_ys",
+            arrow_type: "Int32",
+            nullable: true,
+            description: "YS:i mate alignment score (paired-end); \
+                          null on single-end or when mate is unaligned",
+        },
+        FieldDescription {
+            name: "tag_xn",
+            arrow_type: "Int32",
+            nullable: true,
+            description: "XN:i ambiguous bases in covered reference; \
+                          null if read is unmapped",
+        },
+        FieldDescription {
+            name: "tag_xm",
+            arrow_type: "Int32",
+            nullable: true,
+            description: "XM:i mismatches; null if read is unmapped",
+        },
+        FieldDescription {
+            name: "tag_xo",
+            arrow_type: "Int32",
+            nullable: true,
+            description: "XO:i gap opens; null if read is unmapped",
+        },
+        FieldDescription {
+            name: "tag_xg",
+            arrow_type: "Int32",
+            nullable: true,
+            description: "XG:i gap extensions (incl. opens); \
+                          null if read is unmapped",
+        },
+        FieldDescription {
+            name: "tag_nm",
+            arrow_type: "Int32",
+            nullable: true,
+            description: "NM:i edit distance; null if absent",
+        },
+        FieldDescription {
+            name: "tag_yt",
+            arrow_type: "Utf8",
+            nullable: true,
+            description: "YT:Z pairing type (UU/CP/DP/UP); null if absent",
+        },
+        FieldDescription {
+            name: "tag_md",
+            arrow_type: "Utf8",
+            nullable: true,
+            description: "MD:Z mismatch string; null if absent",
+        },
+        FieldDescription {
+            name: "tag_sa",
+            arrow_type: "Utf8",
+            nullable: true,
+            description: "SA:Z chimeric alignment string; always null \
+                          (bowtie2 does not emit SA). Carried for parity \
+                          with HTSlib-derived schemas.",
+        },
+    ],
+};
+
 // ---------------------------------------------------------------------------
 // Input data
 // ---------------------------------------------------------------------------
@@ -323,63 +464,38 @@ fn validate_qual_uniformity(
 }
 
 impl Bowtie2AlignTool {
-    fn read_input(shm_input: &str, shm_input_size: usize) -> Result<Bt2InputData, String> {
-        let batches = crate::arrow_ipc::read_batches_from_shm(shm_input, shm_input_size)?;
+    /// The reads of the input batches, copied out; at least one.
+    fn reads(batches: &[RecordBatch]) -> Result<Bt2InputData, String> {
+        let reads = Self::read_input(batches)?;
+        if reads.read_ids.is_empty() {
+            return Err("At least 1 read required".to_string());
+        }
+        Ok(reads)
+    }
 
+    fn read_input(batches: &[RecordBatch]) -> Result<Bt2InputData, String> {
         let mut read_ids = Vec::new();
         let mut seqs1 = Vec::new();
         let mut quals1: Vec<Option<String>> = Vec::new();
         let mut seqs2: Option<Vec<String>> = None;
-        let mut quals2: Option<Vec<Option<String>>> = None;
+        // One per paired read: a paired batch without a qual2 column adds
+        // nulls, so qual2 covers every read the C library is given
+        let mut paired_quals2: Vec<Option<String>> = Vec::new();
+        let mut any_qual2_column = false;
 
-        for batch in &batches {
-            let id_col = batch
-                .column_by_name("read_id")
-                .ok_or("Input missing 'read_id' column")?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or("'read_id' column is not Utf8")?;
-
-            let seq1_col = batch
-                .column_by_name("sequence1")
-                .ok_or("Input missing 'sequence1' column")?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or("'sequence1' column is not Utf8")?;
-
+        for batch in batches {
+            let id_col = utf8_column(batch, "read_id")?;
+            let seq1_col = utf8_column(batch, "sequence1")?;
             // qual1 is optional (nullable for FASTA)
-            let q1_col = batch
-                .column_by_name("qual1")
-                .map(|c| {
-                    c.as_any()
-                        .downcast_ref::<StringArray>()
-                        .ok_or("'qual1' column is not Utf8")
-                })
-                .transpose()?;
-
+            let q1_col = optional_utf8_column(batch, "qual1")?;
             // sequence2 is optional (nullable, paired indicator)
-            let seq2_col = batch
-                .column_by_name("sequence2")
-                .map(|c| {
-                    c.as_any()
-                        .downcast_ref::<StringArray>()
-                        .ok_or("'sequence2' column is not Utf8")
-                })
-                .transpose()?;
-
-            // qual2 is optional
-            let q2_col = batch
-                .column_by_name("qual2")
-                .map(|c| {
-                    c.as_any()
-                        .downcast_ref::<StringArray>()
-                        .ok_or("'qual2' column is not Utf8")
-                })
-                .transpose()?;
+            let seq2_col = optional_utf8_column(batch, "sequence2")?;
+            let q2_col = optional_utf8_column(batch, "qual2")?;
 
             for i in 0..batch.num_rows() {
-                read_ids.push(id_col.value(i).to_string());
-                seqs1.push(seq1_col.value(i).to_string());
+                let row = read_ids.len() + 1;
+                read_ids.push(non_null(id_col, i, row, "read_id")?.to_string());
+                seqs1.push(non_null(seq1_col, i, row, "sequence1")?.to_string());
 
                 quals1.push(match q1_col {
                     Some(col) if !col.is_null(i) => Some(col.value(i).to_string()),
@@ -402,22 +518,18 @@ impl Bowtie2AlignTool {
                         buf.push(s2.value(i).to_string());
                     }
 
-                    if let Some(q2) = q2_col {
-                        let qbuf = quals2.get_or_insert_with(Vec::new);
-                        for i in 0..batch.num_rows() {
-                            if q2.is_null(i) {
-                                qbuf.push(None);
-                            } else {
-                                qbuf.push(Some(q2.value(i).to_string()));
-                            }
-                        }
+                    any_qual2_column |= q2_col.is_some();
+                    for i in 0..batch.num_rows() {
+                        paired_quals2.push(
+                            (q2_col.filter(|q2| !q2.is_null(i))).map(|q2| q2.value(i).to_string()),
+                        );
                     }
                 }
             }
         }
 
-        // Paired-end mode must be uniform across all batches in this
-        // shm_input. The FFI call passes `n_reads2 = read_ids.len()`, so
+        // Paired-end mode must be uniform across all batches of the
+        // input. The FFI call passes `n_reads2 = read_ids.len()`, so
         // if seqs2 covers fewer rows than read_ids (because some batches
         // were paired and others were single-end) the C library would
         // read past the end of the pointer array. Reject explicitly.
@@ -434,6 +546,8 @@ impl Bowtie2AlignTool {
             }
         }
 
+        // No qual2 column in any batch: no qual2 array at all
+        let quals2 = any_qual2_column.then_some(paired_quals2);
         validate_qual_uniformity(&quals1, &seqs2, &quals2)?;
 
         Ok(Bt2InputData {
@@ -709,8 +823,7 @@ fn build_config(
     // with shared page-cache-backed mmap (cheap minor faults). It therefore
     // defaults to on. It is exposed as a caller knob so a diagnostic run can
     // turn it off and contrast the fault/RSS profile (the upstream C API caps
-    // the win — see the Bowtie2StreamingContext note and
-    // localdocs/REQUEST-bowtie2-index-reload-fix-and-mm.md).
+    // the win — see the Bowtie2StreamingContext note).
     bt2.memory_mapped = 1;
     if let Some(v) = config.get("memory_mapped").and_then(|v| v.as_bool()) {
         bt2.memory_mapped = if v { 1 } else { 0 };
@@ -732,6 +845,7 @@ fn build_config(
 /// Holds a bowtie2 alignment context for batched streaming. We call
 /// `bt2_align_create` once and reuse the `ctx` across every `run_batch`, so the
 /// daemon-side "one context = one resident worker" contract holds here.
+/// `execute` opens one for its single batch.
 ///
 /// CAVEAT (as of the v2.5.5-miint pin, bt2 C API v0.4): the C API does NOT keep
 /// the FM-index resident across calls. `bt2_align_create` loads no `Ebwt`; each
@@ -745,8 +859,7 @@ fn build_config(
 /// page-cache pages instead of a full whole-index read-copy, which removed the
 /// bulk of the ~30-40% reload tax. A fully resident index would need the
 /// upstream persistent-`Ebwt` refactor, declined as too complex (the
-/// `driver<T>()` surgery). Background:
-/// `localdocs/REQUEST-bowtie2-index-reload-fix-and-mm.md`.
+/// `driver<T>()` surgery).
 struct Bowtie2StreamingContext {
     ctx: *mut bt2_align_ctx_t,
     /// CStrings backing the config's raw pointers. Kept alive for the session
@@ -754,9 +867,13 @@ struct Bowtie2StreamingContext {
     _config_cstrings: Vec<CString>,
 }
 
-// Safety: The underlying C context is not thread-safe, but no shared
-// references to self.ctx are handed out. Only &mut self methods exist
-// (run_batch), so exclusive access is enforced at the type level.
+// Safety (Send, which StreamingContext requires): the context may be
+// made on one thread and used and destroyed on another, because between
+// calls its state is heap memory reached through `ctx` (the configuration;
+// each run rebuilds the index, see above), not thread-local storage. The
+// only thread-local storage in the library's sources is its read queues'
+// (concurrentqueue.h), within a run. One thread at a time reaches `ctx`:
+// only `&mut self` methods and Drop use it.
 unsafe impl Send for Bowtie2StreamingContext {}
 
 impl Drop for Bowtie2StreamingContext {
@@ -767,99 +884,53 @@ impl Drop for Bowtie2StreamingContext {
     }
 }
 
-impl StreamingContext for Bowtie2StreamingContext {
-    fn run_batch(&mut self, shm_input: &str, shm_input_size: usize) -> Response {
-        let input_data = match Bowtie2AlignTool::read_input(shm_input, shm_input_size) {
-            Ok(data) => data,
-            Err(e) => return Response::error(e),
-        };
+impl Bowtie2StreamingContext {
+    /// The aligner for `config`: its bowtie2 config, and the context made
+    /// from it.
+    fn open(config: &serde_json::Value) -> Result<Self, String> {
+        let verbose = config
+            .get("verbose")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let (bt2_config, config_cstrings) = build_config(config, verbose)?;
 
-        if input_data.read_ids.is_empty() {
-            return Response::error("At least 1 read required");
+        unsafe {
+            let mut error_code: c_int = 0;
+            let ctx = bt2_align_create(&bt2_config, &mut error_code);
+            if ctx.is_null() {
+                let cat = CStr::from_ptr(bt2_strerror(error_code))
+                    .to_string_lossy()
+                    .into_owned();
+                return Err(format!("Failed to create bowtie2 context: {cat}"));
+            }
+            Ok(Self {
+                ctx,
+                _config_cstrings: config_cstrings,
+            })
         }
+    }
 
-        // Build per-batch C input arrays (ephemeral — dropped after bt2_align_run)
-        let name_cstrings: Vec<CString> = match input_data
-            .read_ids
-            .iter()
-            .map(|s| CString::new(s.as_str()))
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(v) => v,
-            Err(_) => return Response::error("read_id contains interior null byte"),
-        };
-        let name_ptrs: Vec<*const c_char> = name_cstrings.iter().map(|s| s.as_ptr()).collect();
+    /// Align the reads on the context: the alignments and the run's stats.
+    fn align(&mut self, reads: &Bt2InputData) -> Result<ToolOutput, String> {
+        // The C input arrays, dropped after bt2_align_run
+        let names = c_strings(&reads.read_ids, "read_id")?;
+        let seqs1 = c_strings(&reads.seqs1, "sequence1")?;
+        let quals1 = c_optional_strings(&reads.quals1, "qual1")?;
+        let seqs2 = (reads.seqs2.as_deref())
+            .map(|seqs| c_strings(seqs, "sequence2"))
+            .transpose()?;
+        let quals2 = (reads.quals2.as_deref())
+            .map(|quals| c_optional_strings(quals, "qual2"))
+            .transpose()?;
 
-        let seq1_cstrings: Vec<CString> = match input_data
-            .seqs1
-            .iter()
-            .map(|s| CString::new(s.as_str()))
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(v) => v,
-            Err(_) => return Response::error("sequence1 contains interior null byte"),
-        };
-        let seq1_ptrs: Vec<*const c_char> = seq1_cstrings.iter().map(|s| s.as_ptr()).collect();
-
-        let qual1_cstrings: Vec<Option<CString>> = match input_data
-            .quals1
-            .iter()
-            .map(|opt| match opt {
-                Some(s) => CString::new(s.as_str()).map(Some),
-                None => Ok(None),
-            })
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(v) => v,
-            Err(_) => return Response::error("qual1 contains interior null byte"),
-        };
-        let qual1_ptrs: Vec<*const c_char> = qual1_cstrings
-            .iter()
-            .map(|opt| match opt {
-                Some(c) => c.as_ptr(),
-                None => ptr::null(),
-            })
-            .collect();
-        let all_quals_null = qual1_ptrs.iter().all(|p| p.is_null());
-
-        // Paired-end mate 2
-        let seq2_cstrings: Option<Vec<CString>> = match &input_data.seqs2 {
-            Some(seqs) => match seqs
-                .iter()
-                .map(|s| CString::new(s.as_str()))
-                .collect::<Result<Vec<_>, _>>()
-            {
-                Ok(v) => Some(v),
-                Err(_) => return Response::error("sequence2 contains interior null byte"),
-            },
-            None => None,
-        };
-        let seq2_ptrs: Option<Vec<*const c_char>> = seq2_cstrings
-            .as_ref()
-            .map(|v| v.iter().map(|s| s.as_ptr()).collect());
-
-        let qual2_cstrings: Option<Vec<Option<CString>>> = match &input_data.quals2 {
-            Some(quals) => match quals
-                .iter()
-                .map(|opt| match opt {
-                    Some(s) => CString::new(s.as_str()).map(Some),
-                    None => Ok(None),
-                })
-                .collect::<Result<Vec<_>, _>>()
-            {
-                Ok(v) => Some(v),
-                Err(_) => return Response::error("qual2 contains interior null byte"),
-            },
-            None => None,
-        };
-        let qual2_ptrs: Option<Vec<*const c_char>> = qual2_cstrings.as_ref().map(|v| {
-            v.iter()
-                .map(|opt| match opt {
-                    Some(c) => c.as_ptr(),
-                    None => ptr::null(),
-                })
-                .collect()
-        });
+        let name_ptrs: Vec<*const c_char> = names.iter().map(|s| s.as_ptr()).collect();
+        let seq1_ptrs: Vec<*const c_char> = seqs1.iter().map(|s| s.as_ptr()).collect();
+        let qual1_ptrs = c_ptrs(&quals1);
+        // FASTA (no qual1 at all): a null quals array
+        let all_quals_null = quals1.iter().all(Option::is_none);
+        let seq2_ptrs: Option<Vec<*const c_char>> =
+            (seqs2.as_ref()).map(|seqs| seqs.iter().map(|s| s.as_ptr()).collect());
+        let qual2_ptrs = quals2.as_deref().map(c_ptrs);
 
         unsafe {
             let mut bt2_input: Bt2Input = std::mem::zeroed();
@@ -871,19 +942,18 @@ impl StreamingContext for Bowtie2StreamingContext {
             } else {
                 qual1_ptrs.as_ptr()
             };
-            bt2_input.n_reads = input_data.read_ids.len();
+            bt2_input.n_reads = reads.read_ids.len();
 
             if let Some(ref s2_ptrs) = seq2_ptrs {
-                bt2_input.names2 = name_ptrs.as_ptr();
+                bt2_input.names2 = name_ptrs.as_ptr(); // same names for mate 2
                 bt2_input.seqs2 = s2_ptrs.as_ptr();
                 bt2_input.quals2 = match qual2_ptrs.as_ref() {
                     Some(q2) => q2.as_ptr(),
                     None => ptr::null(),
                 };
-                bt2_input.n_reads2 = input_data.read_ids.len();
+                bt2_input.n_reads2 = reads.read_ids.len();
             }
 
-            // Run alignment on the pre-loaded context
             let mut output: *mut Bt2AlignOutput = ptr::null_mut();
             let mut stats: Bt2AlignStats = std::mem::zeroed();
 
@@ -896,24 +966,13 @@ impl StreamingContext for Bowtie2StreamingContext {
                 let detail = CStr::from_ptr(bt2_align_last_error(self.ctx))
                     .to_string_lossy()
                     .into_owned();
-                return Response::error(format!("{cat}: {detail}"));
+                return Err(format!("{cat}: {detail}"));
             }
 
-            let batch = match soa_to_record_batch(&*output) {
-                Ok(b) => b,
-                Err(e) => {
-                    bt2_align_output_free(output);
-                    return Response::error(e);
-                }
-            };
-
-            let shm_out = match crate::arrow_ipc::write_batch_to_output_shm(&batch, "alignments") {
-                Ok(v) => v,
-                Err(e) => {
-                    bt2_align_output_free(output);
-                    return Response::error(e);
-                }
-            };
+            // The batch copies the output, which is freed here on either
+            // outcome of the conversion
+            let batch = soa_to_record_batch(&*output);
+            bt2_align_output_free(output);
 
             let result = serde_json::json!({
                 "n_reads": stats.n_reads,
@@ -922,12 +981,28 @@ impl StreamingContext for Bowtie2StreamingContext {
                 "n_aligned_concordant": stats.n_aligned_concordant,
                 "elapsed_ms": stats.elapsed_ms,
             });
-
-            bt2_align_output_free(output);
-
-            Response::ok(result, vec![shm_out])
+            Ok(ToolOutput {
+                outputs: vec![(ALIGNMENTS.label, batch?)],
+                result,
+            })
         }
     }
+}
+
+impl StreamingContext for Bowtie2StreamingContext {
+    fn run_batch(&mut self, input: Vec<RecordBatch>) -> Result<ToolOutput, String> {
+        let reads = Bowtie2AlignTool::reads(&input)?;
+        // Copied out: release the input before the alignment
+        drop(input);
+        self.align(&reads)
+    }
+}
+
+/// Pointers to C strings, null for a None.
+fn c_ptrs(strings: &[Option<CString>]) -> Vec<*const c_char> {
+    (strings.iter())
+        .map(|s| s.as_ref().map_or(ptr::null(), |c| c.as_ptr()))
+        .collect()
 }
 
 /// SAM flag bit for an unmapped read (BAM_FUNMAP).
@@ -1632,144 +1707,7 @@ impl GplTool for Bowtie2AlignTool {
                     description: "Mate 2 quality string; null = FASTA",
                 },
             ],
-            outputs: vec![OutputDescription {
-                label: "alignments",
-                schema: &[
-                FieldDescription {
-                    name: "read_id",
-                    arrow_type: "Utf8",
-                    nullable: false,
-                    description: "Read name (QNAME)",
-                },
-                FieldDescription {
-                    name: "flags",
-                    arrow_type: "UInt16",
-                    nullable: false,
-                    description: "SAM flags",
-                },
-                FieldDescription {
-                    name: "reference",
-                    arrow_type: "Utf8",
-                    nullable: false,
-                    description: "Reference sequence name (RNAME); * if unmapped",
-                },
-                FieldDescription {
-                    name: "position",
-                    arrow_type: "Int64",
-                    nullable: false,
-                    description: "1-based leftmost position (POS); 0 if unmapped",
-                },
-                FieldDescription {
-                    name: "stop_position",
-                    arrow_type: "Int64",
-                    nullable: false,
-                    description: "1-based inclusive end on reference; \
-                                  derived from POS + reference-length(CIGAR) - 1; \
-                                  0 if unmapped",
-                },
-                FieldDescription {
-                    name: "mapq",
-                    arrow_type: "UInt8",
-                    nullable: false,
-                    description: "Mapping quality (MAPQ)",
-                },
-                FieldDescription {
-                    name: "cigar",
-                    arrow_type: "Utf8",
-                    nullable: false,
-                    description: "CIGAR string; * if unmapped",
-                },
-                FieldDescription {
-                    name: "mate_reference",
-                    arrow_type: "Utf8",
-                    nullable: false,
-                    description: "Mate reference name (RNEXT); * if unavailable",
-                },
-                FieldDescription {
-                    name: "mate_position",
-                    arrow_type: "Int64",
-                    nullable: false,
-                    description: "Mate position (PNEXT); 0 if unavailable",
-                },
-                FieldDescription {
-                    name: "template_length",
-                    arrow_type: "Int64",
-                    nullable: false,
-                    description: "Template length (TLEN); 0 if unavailable",
-                },
-                FieldDescription {
-                    name: "tag_as",
-                    arrow_type: "Int32",
-                    nullable: true,
-                    description: "AS:i alignment score; null if absent",
-                },
-                FieldDescription {
-                    name: "tag_xs",
-                    arrow_type: "Int32",
-                    nullable: true,
-                    description: "XS:i second-best alignment score; null if absent",
-                },
-                FieldDescription {
-                    name: "tag_ys",
-                    arrow_type: "Int32",
-                    nullable: true,
-                    description: "YS:i mate alignment score (paired-end); \
-                                  null on single-end or when mate is unaligned",
-                },
-                FieldDescription {
-                    name: "tag_xn",
-                    arrow_type: "Int32",
-                    nullable: true,
-                    description: "XN:i ambiguous bases in covered reference; \
-                                  null if read is unmapped",
-                },
-                FieldDescription {
-                    name: "tag_xm",
-                    arrow_type: "Int32",
-                    nullable: true,
-                    description: "XM:i mismatches; null if read is unmapped",
-                },
-                FieldDescription {
-                    name: "tag_xo",
-                    arrow_type: "Int32",
-                    nullable: true,
-                    description: "XO:i gap opens; null if read is unmapped",
-                },
-                FieldDescription {
-                    name: "tag_xg",
-                    arrow_type: "Int32",
-                    nullable: true,
-                    description: "XG:i gap extensions (incl. opens); \
-                                  null if read is unmapped",
-                },
-                FieldDescription {
-                    name: "tag_nm",
-                    arrow_type: "Int32",
-                    nullable: true,
-                    description: "NM:i edit distance; null if absent",
-                },
-                FieldDescription {
-                    name: "tag_yt",
-                    arrow_type: "Utf8",
-                    nullable: true,
-                    description: "YT:Z pairing type (UU/CP/DP/UP); null if absent",
-                },
-                FieldDescription {
-                    name: "tag_md",
-                    arrow_type: "Utf8",
-                    nullable: true,
-                    description: "MD:Z mismatch string; null if absent",
-                },
-                FieldDescription {
-                    name: "tag_sa",
-                    arrow_type: "Utf8",
-                    nullable: true,
-                    description: "SA:Z chimeric alignment string; always null \
-                                  (bowtie2 does not emit SA). Carried for parity \
-                                  with HTSlib-derived schemas.",
-                },
-            ],
-            }],
+            outputs: vec![ALIGNMENTS],
             response_metadata: vec![
                 FieldDescription {
                     name: "n_reads",
@@ -1808,232 +1746,20 @@ impl GplTool for Bowtie2AlignTool {
     fn execute(
         &self,
         config: &serde_json::Value,
-        shm_input: &str,
-        shm_input_size: usize,
-    ) -> Response {
-        let verbose = config
-            .get("verbose")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        // Read input from shared memory
-        let input_data = match Self::read_input(shm_input, shm_input_size) {
-            Ok(data) => data,
-            Err(e) => return Response::error(e),
-        };
-
-        if input_data.read_ids.is_empty() {
-            return Response::error("At least 1 read required");
-        }
-
-        // Build config
-        let (bt2_config, _config_cstrings) = match build_config(config, verbose) {
-            Ok(v) => v,
-            Err(e) => return Response::error(e),
-        };
-
-        // Build C input arrays
-        let name_cstrings: Vec<CString> = match input_data
-            .read_ids
-            .iter()
-            .map(|s| CString::new(s.as_str()))
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(v) => v,
-            Err(_) => return Response::error("read_id contains interior null byte"),
-        };
-        let name_ptrs: Vec<*const c_char> = name_cstrings.iter().map(|s| s.as_ptr()).collect();
-
-        let seq1_cstrings: Vec<CString> = match input_data
-            .seqs1
-            .iter()
-            .map(|s| CString::new(s.as_str()))
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(v) => v,
-            Err(_) => return Response::error("sequence1 contains interior null byte"),
-        };
-        let seq1_ptrs: Vec<*const c_char> = seq1_cstrings.iter().map(|s| s.as_ptr()).collect();
-
-        // qual1: build CStrings for non-null values, null pointer for None
-        let qual1_cstrings: Vec<Option<CString>> = match input_data
-            .quals1
-            .iter()
-            .map(|opt| match opt {
-                Some(s) => CString::new(s.as_str()).map(Some),
-                None => Ok(None),
-            })
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(v) => v,
-            Err(_) => return Response::error("qual1 contains interior null byte"),
-        };
-        let qual1_ptrs: Vec<*const c_char> = qual1_cstrings
-            .iter()
-            .map(|opt| match opt {
-                Some(c) => c.as_ptr(),
-                None => ptr::null(),
-            })
-            .collect();
-        // If all quals are null (FASTA), pass null array pointer
-        let all_quals_null = qual1_cstrings.iter().all(|c| c.is_none());
-
-        // Paired-end mate 2 arrays
-        let seq2_cstrings: Option<Vec<CString>> = input_data
-            .seqs2
-            .as_ref()
-            .map(|seqs| {
-                seqs.iter()
-                    .map(|s| CString::new(s.as_str()))
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()
-            .unwrap_or(None);
-        if input_data.seqs2.is_some() && seq2_cstrings.is_none() {
-            return Response::error("sequence2 contains interior null byte");
-        }
-        let seq2_ptrs: Option<Vec<*const c_char>> = seq2_cstrings
-            .as_ref()
-            .map(|v| v.iter().map(|s| s.as_ptr()).collect());
-
-        let qual2_cstrings: Option<Vec<Option<CString>>> = input_data
-            .quals2
-            .as_ref()
-            .map(|quals| {
-                quals
-                    .iter()
-                    .map(|opt| match opt {
-                        Some(s) => CString::new(s.as_str()).map(Some),
-                        None => Ok(None),
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()
-            .unwrap_or(None);
-        if input_data.quals2.is_some() && qual2_cstrings.is_none() {
-            return Response::error("qual2 contains interior null byte");
-        }
-        let qual2_ptrs: Option<Vec<*const c_char>> = qual2_cstrings.as_ref().map(|v| {
-            v.iter()
-                .map(|opt| match opt {
-                    Some(c) => c.as_ptr(),
-                    None => ptr::null(),
-                })
-                .collect()
-        });
-
-        unsafe {
-            // Initialize bt2_input_t
-            let mut bt2_input: Bt2Input = std::mem::zeroed();
-            bt2_input_init(&mut bt2_input);
-            bt2_input.names = name_ptrs.as_ptr();
-            bt2_input.seqs = seq1_ptrs.as_ptr();
-            bt2_input.quals = if all_quals_null {
-                ptr::null()
-            } else {
-                qual1_ptrs.as_ptr()
-            };
-            bt2_input.n_reads = input_data.read_ids.len();
-
-            if let Some(ref s2_ptrs) = seq2_ptrs {
-                bt2_input.names2 = name_ptrs.as_ptr(); // same names for mate 2
-                bt2_input.seqs2 = s2_ptrs.as_ptr();
-                bt2_input.quals2 = match qual2_ptrs.as_ref() {
-                    Some(q2) => q2.as_ptr(),
-                    None => ptr::null(),
-                };
-                bt2_input.n_reads2 = input_data.read_ids.len();
-            }
-
-            // Create context
-            let mut error_code: c_int = 0;
-            let ctx = bt2_align_create(&bt2_config, &mut error_code);
-            if ctx.is_null() {
-                let cat = CStr::from_ptr(bt2_strerror(error_code))
-                    .to_string_lossy()
-                    .into_owned();
-                return Response::error(format!("Failed to create bowtie2 context: {cat}"));
-            }
-
-            // Run alignment
-            let mut output: *mut Bt2AlignOutput = ptr::null_mut();
-            let mut stats: Bt2AlignStats = std::mem::zeroed();
-
-            let rc = bt2_align_run(ctx, &bt2_input, &mut output, &mut stats);
-
-            if rc != BT2_OK {
-                let cat = CStr::from_ptr(bt2_strerror(rc))
-                    .to_string_lossy()
-                    .into_owned();
-                let detail = CStr::from_ptr(bt2_align_last_error(ctx))
-                    .to_string_lossy()
-                    .into_owned();
-                bt2_align_destroy(ctx);
-                return Response::error(format!("{cat}: {detail}"));
-            }
-
-            // Convert output to Arrow
-            let batch = match soa_to_record_batch(&*output) {
-                Ok(b) => b,
-                Err(e) => {
-                    bt2_align_output_free(output);
-                    bt2_align_destroy(ctx);
-                    return Response::error(e);
-                }
-            };
-
-            let shm_out = match crate::arrow_ipc::write_batch_to_output_shm(&batch, "alignments") {
-                Ok(v) => v,
-                Err(e) => {
-                    bt2_align_output_free(output);
-                    bt2_align_destroy(ctx);
-                    return Response::error(e);
-                }
-            };
-
-            // Build response metadata
-            let result = serde_json::json!({
-                "n_reads": stats.n_reads,
-                "n_aligned": stats.n_aligned,
-                "n_unaligned": stats.n_unaligned,
-                "n_aligned_concordant": stats.n_aligned_concordant,
-                "elapsed_ms": stats.elapsed_ms,
-            });
-
-            // Cleanup
-            bt2_align_output_free(output);
-            bt2_align_destroy(ctx);
-
-            Response::ok(result, vec![shm_out])
-        }
+        input: Vec<RecordBatch>,
+    ) -> Result<ToolOutput, String> {
+        // The input's columns and nulls are checked before the context is
+        // made; a NUL byte is found when `align` converts the reads
+        let reads = Self::reads(&input)?;
+        drop(input);
+        Bowtie2StreamingContext::open(config)?.align(&reads)
     }
 
     fn create_streaming_context(
         &self,
         config: &serde_json::Value,
     ) -> Result<Option<Box<dyn StreamingContext>>, String> {
-        let verbose = config
-            .get("verbose")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let (bt2_config, config_cstrings) = build_config(config, verbose)?;
-
-        unsafe {
-            let mut error_code: c_int = 0;
-            let ctx = bt2_align_create(&bt2_config, &mut error_code);
-            if ctx.is_null() {
-                let cat = CStr::from_ptr(bt2_strerror(error_code))
-                    .to_string_lossy()
-                    .into_owned();
-                return Err(format!("Failed to create bowtie2 context: {cat}"));
-            }
-
-            Ok(Some(Box::new(Bowtie2StreamingContext {
-                ctx,
-                _config_cstrings: config_cstrings,
-            })))
-        }
+        Ok(Some(Box::new(Bowtie2StreamingContext::open(config)?)))
     }
 }
 
@@ -2044,8 +1770,7 @@ impl GplTool for Bowtie2AlignTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shm::SharedMemory;
-    use crate::test_util::{read_arrow_from_shm, unique_shm_name, write_arrow_to_shm};
+    use crate::test_util::{assert_outputs_described, outputs_of};
     use crate::tools::bowtie2_build::{
         bt2_build_config_init, bt2_build_create, bt2_build_destroy, bt2_build_run, Bt2BuildConfig,
         Bt2BuildStats,
@@ -2099,6 +1824,12 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    /// The result and the alignments of a successful run.
+    fn alignments_of(output: ToolOutput) -> (serde_json::Value, RecordBatch) {
+        let (result, [alignments]) = outputs_of(output, [ALIGNMENTS.label]);
+        (result, alignments)
     }
 
     // -- Test fixture: build a tiny bowtie2 index --
@@ -2189,15 +1920,12 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
         let read_seq = &TEST_REF[10..37];
         let read_qual = &"I".repeat(27);
 
-        let input_name = unique_shm_name("bt2-abi-out");
         let batch = make_single_end_input(&["r1"], &[read_seq], &[Some(read_qual)]);
-        let shm_holder = write_arrow_to_shm(&input_name, &batch);
-        let shm_holder_size = shm_holder.len();
 
         let tool = Bowtie2AlignTool;
         let config = serde_json::json!({"index_path": index_prefix, "seed": 42});
-        let response = tool.execute(&config, &input_name, shm_holder_size);
-        assert!(response.success, "Alignment failed: {:?}", response.error);
+        tool.execute(&config, vec![batch])
+            .expect("Alignment failed");
 
         // The struct_size check happens inside execute() implicitly via
         // soa_to_record_batch reading the output. But we also verify it
@@ -2244,8 +1972,6 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             bt2_align_output_free(output);
             bt2_align_destroy(ctx);
         }
-
-        let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
     }
 
     // ---------------------------------------------------------------
@@ -2588,80 +2314,48 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
     // ---------------------------------------------------------------
 
     #[test]
-    fn test_bowtie2_align_bad_input_shm() {
-        let tool = Bowtie2AlignTool;
-        let config = serde_json::json!({"index_path": "/nonexistent/index"});
-        let response = tool.execute(&config, "/nonexistent-shm-name", 0);
-        assert!(!response.success);
-        assert!(response
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("Failed to open shm"));
-    }
-
-    #[test]
     fn test_bowtie2_align_missing_index_path() {
-        let input_name = unique_shm_name("bt2-err-idx");
         let batch = make_single_end_input(&["r1"], &["ACGT"], &[Some("IIII")]);
-        let shm_holder = write_arrow_to_shm(&input_name, &batch);
-        let shm_holder_size = shm_holder.len();
 
         let tool = Bowtie2AlignTool;
-        let response = tool.execute(&serde_json::json!({}), &input_name, shm_holder_size);
-        assert!(!response.success);
+        let err = tool
+            .execute(&serde_json::json!({}), vec![batch])
+            .unwrap_err();
         assert!(
-            response.error.as_ref().unwrap().contains("index_path"),
-            "Expected error about index_path, got: {:?}",
-            response.error
+            err.contains("index_path"),
+            "Expected error about index_path, got: {err}"
         );
     }
 
     #[test]
     fn test_bowtie2_align_invalid_index_path() {
-        let input_name = unique_shm_name("bt2-err-bad");
         let batch = make_single_end_input(&["r1"], &["ACGT"], &[Some("IIII")]);
-        let shm_holder = write_arrow_to_shm(&input_name, &batch);
-        let shm_holder_size = shm_holder.len();
 
         let tool = Bowtie2AlignTool;
         let config = serde_json::json!({"index_path": "/nonexistent/path/idx"});
-        let response = tool.execute(&config, &input_name, shm_holder_size);
-        assert!(!response.success);
+        assert!(tool.execute(&config, vec![batch]).is_err());
     }
 
     #[test]
     fn test_bowtie2_align_empty_input() {
         let (_dir, index_prefix) = build_test_index();
-        let input_name = unique_shm_name("bt2-empty");
         let batch = make_single_end_input(&[], &[], &[]);
-        let shm_holder = write_arrow_to_shm(&input_name, &batch);
-        let shm_holder_size = shm_holder.len();
 
         let tool = Bowtie2AlignTool;
         let config = serde_json::json!({"index_path": index_prefix});
-        let response = tool.execute(&config, &input_name, shm_holder_size);
-        assert!(!response.success);
-        assert!(response.error.as_ref().unwrap().contains("At least 1"));
+        let err = tool.execute(&config, vec![batch]).unwrap_err();
+        assert!(err.contains("At least 1"), "{err}");
     }
 
     // ---------------------------------------------------------------
     // qual1/qual2 uniformity + paired-mate agreement (Ask 2)
     // ---------------------------------------------------------------
 
-    fn read_input_via_shm(label: &str, batch: &RecordBatch) -> Result<Bt2InputData, String> {
-        let shm_name = unique_shm_name(label);
-        let holder = write_arrow_to_shm(&shm_name, batch);
-        let res = Bowtie2AlignTool::read_input(&shm_name, holder.len());
-        let _ = SharedMemory::unlink(&shm_name);
-        res
-    }
-
     /// Expect a read_input call to return Err containing `needle` and return
     /// the full error string for fixture diagnostics. Bt2InputData has no
     /// Debug impl so we can't use `Result::expect_err` directly.
-    fn expect_read_input_err(label: &str, batch: &RecordBatch, needle: &str) -> String {
-        match read_input_via_shm(label, batch) {
+    fn expect_read_input_err(batch: &RecordBatch, needle: &str) -> String {
+        match Bowtie2AlignTool::read_input(std::slice::from_ref(batch)) {
             Ok(_) => panic!("expected error containing {needle:?}, got Ok"),
             Err(e) => {
                 assert!(e.contains(needle), "expected {needle:?}, got: {e}");
@@ -2678,7 +2372,7 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             &["ACGTACGTACGT", "TGCATGCATGCA"],
             &[Some("IIIIIIIIIIII"), None],
         );
-        expect_read_input_err("bt2-q1-mix", &batch, "qual1 has mix");
+        expect_read_input_err(&batch, "qual1 has mix");
     }
 
     #[test]
@@ -2692,7 +2386,7 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             &[Some(qual), Some(qual)],
             &[Some(qual), None],
         );
-        expect_read_input_err("bt2-q2-mix", &batch, "qual2 has mix");
+        expect_read_input_err(&batch, "qual2 has mix");
     }
 
     #[test]
@@ -2706,11 +2400,7 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             &[Some(qual), Some(qual)],
             &[None, None],
         );
-        expect_read_input_err(
-            "bt2-q1set-q2null",
-            &batch,
-            "qual1 and qual2 must be uniformly",
-        );
+        expect_read_input_err(&batch, "qual1 and qual2 must be uniformly");
     }
 
     #[test]
@@ -2724,11 +2414,40 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             &[None, None],
             &[Some(qual), Some(qual)],
         );
-        expect_read_input_err(
-            "bt2-q1null-q2set",
-            &batch,
-            "qual1 and qual2 must be uniformly",
-        );
+        expect_read_input_err(&batch, "qual1 and qual2 must be uniformly");
+    }
+
+    /// A null read_id or sequence1 is refused, naming its input row
+    /// (counted across batches), rather than read as an empty string.
+    #[test]
+    fn test_read_input_refuses_a_null_read_id_or_sequence1() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("read_id", DataType::Utf8, true),
+            Field::new("sequence1", DataType::Utf8, true),
+        ]));
+        let batch = |ids: Vec<Option<&str>>, seqs: Vec<Option<&str>>| {
+            let columns: Vec<arrow::array::ArrayRef> = vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(seqs)),
+            ];
+            RecordBatch::try_new(schema.clone(), columns).unwrap()
+        };
+        let first = batch(vec![Some("r1")], vec![Some("ACGT")]);
+        for (second, wanted) in [
+            (
+                batch(vec![Some("r2"), None], vec![Some("ACGT"), Some("ACGT")]),
+                "input row 3: null read_id",
+            ),
+            (
+                batch(vec![Some("r2")], vec![None]),
+                "input row 2: null sequence1",
+            ),
+        ] {
+            match Bowtie2AlignTool::read_input(&[first.clone(), second]) {
+                Ok(_) => panic!("expected {wanted:?}, got Ok"),
+                Err(e) => assert!(e.contains(wanted), "expected {wanted:?}, got: {e}"),
+            }
+        }
     }
 
     #[test]
@@ -2741,7 +2460,8 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             &[None, None],
             &[None, None],
         );
-        let data = read_input_via_shm("bt2-pe-fa", &batch).expect("paired FASTA must parse");
+        let data = Bowtie2AlignTool::read_input(&[batch]);
+        let data = data.unwrap_or_else(|e| panic!("paired FASTA must parse: {e}"));
         assert_eq!(data.read_ids.len(), 2);
         assert!(data.seqs2.is_some());
         // quals1 / quals2 are still populated (per-row Option), but all None.
@@ -2750,15 +2470,11 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
 
     #[test]
     fn test_read_input_rejects_mixed_paired_single_across_batches() {
-        // Surface the prior UB: a single Arrow IPC stream carrying two
-        // RecordBatches with the same paired schema, but the second batch
-        // has all-null sequence2 (single-end mode within the paired
-        // schema). Before this fix, the paired branch ran for batch 1 and
-        // skipped batch 2, leaving seqs2.len() < read_ids.len(); the FFI
-        // call then passed `n_reads2 = read_ids.len()`, so the C library
-        // would read past the end of the pointer array.
-        use arrow::ipc::writer::StreamWriter;
-
+        // Two record batches with the paired schema, the second with an
+        // all-null sequence2 (single-end within the paired schema). Read
+        // as they come, seqs2 would cover fewer reads than read_ids, and
+        // the C library, given `n_reads2 = read_ids.len()`, would read past
+        // the end of the pointer array.
         let qual = "IIIIIIIIIIII";
         let paired = make_paired_end_input(
             &["pair1"],
@@ -2795,28 +2511,56 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             RecordBatch::try_new(pseudo_single.schema(), columns).unwrap()
         };
 
-        let mut buf = Vec::<u8>::new();
-        {
-            let mut writer = StreamWriter::try_new(&mut buf, paired.schema().as_ref()).unwrap();
-            writer.write(&paired).unwrap();
-            writer.write(&pseudo_single).unwrap();
-            writer.finish().unwrap();
-        }
-
-        let shm_name = unique_shm_name("bt2-mixed-batches");
-        let mut shm =
-            crate::shm::SharedMemory::create(&shm_name, buf.len()).expect("create shm for test");
-        shm.as_mut_slice()[..buf.len()].copy_from_slice(&buf);
-
-        let res = Bowtie2AlignTool::read_input(&shm_name, buf.len());
-        // shm holder drops here — but read_input has already consumed the
-        // mapping. Explicitly unlink so subsequent test runs don't collide.
-        drop(shm);
-        let _ = SharedMemory::unlink(&shm_name);
+        let res = Bowtie2AlignTool::read_input(&[paired, pseudo_single]);
 
         match res {
             Ok(_) => panic!("expected inconsistent-paired-end rejection"),
             Err(err) => assert!(err.contains("inconsistent paired-end mode"), "got: {err}"),
+        }
+    }
+
+    /// qual2 covers every paired read when one paired batch has a qual2
+    /// column and another has none, in either order: the batches without
+    /// it count as null qualities, so FASTQ in one and none in the other is
+    /// a mix, refused before the C library reads past the qual2 array.
+    #[test]
+    fn test_read_input_qual2_covers_every_paired_read_across_batches() {
+        let qual = "IIIIIIIIIIII";
+        let with_qual2 = make_paired_end_input(
+            &["pair1"],
+            &["ACGTACGTACGT"],
+            &["AAAATTTTCCCC"],
+            &[Some(qual)],
+            &[Some(qual)],
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("read_id", DataType::Utf8, false),
+            Field::new("sequence1", DataType::Utf8, false),
+            Field::new("sequence2", DataType::Utf8, true),
+            Field::new("qual1", DataType::Utf8, true),
+        ]));
+        let without_qual2 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["pair2"])),
+                Arc::new(StringArray::from(vec!["TGCATGCATGCA"])),
+                Arc::new(StringArray::from(vec!["GGGGTTTTAAAA"])),
+                Arc::new(StringArray::from(vec![qual])),
+            ],
+        )
+        .unwrap();
+        for batches in [
+            [with_qual2.clone(), without_qual2.clone()],
+            [without_qual2, with_qual2],
+        ] {
+            match Bowtie2AlignTool::read_input(&batches) {
+                Ok(data) => panic!(
+                    "expected a qual2 mix, got {} qual2 values for {} paired reads",
+                    data.quals2.map_or(0, |q| q.len()),
+                    data.seqs2.map_or(0, |s| s.len())
+                ),
+                Err(e) => assert!(e.contains("qual2 has mix"), "got: {e}"),
+            }
         }
     }
 
@@ -2828,10 +2572,7 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
         let garbage_read = "NNNNNNNNNNNNNNNNNNNNNNNNNNN";
         let garbage_qual = &"!".repeat(27);
 
-        let input_name = unique_shm_name("bt2-noul");
         let batch = make_single_end_input(&["garbage"], &[garbage_read], &[Some(garbage_qual)]);
-        let shm_holder = write_arrow_to_shm(&input_name, &batch);
-        let shm_holder_size = shm_holder.len();
 
         let tool = Bowtie2AlignTool;
         let config = serde_json::json!({
@@ -2839,18 +2580,14 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             "no_unal": true,
             "seed": 42,
         });
-        let response = tool.execute(&config, &input_name, shm_holder_size);
-        assert!(response.success, "Failed: {:?}", response.error);
-        assert_eq!(response.shm_outputs.len(), 1);
+        let output = tool
+            .execute(&config, vec![batch])
+            .expect("alignment failed");
+        let (_, out) = alignments_of(output);
 
         // Verify the zero-records path works (soa_to_record_batch handles
         // n_records==0 without UB from null pointer dereference).
-        let batches =
-            read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].num_columns(), 21);
-
-        let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
+        assert_eq!(out.num_columns(), 21);
     }
 
     // ---------------------------------------------------------------
@@ -2864,10 +2601,7 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
         let read_seq = &TEST_REF[10..37]; // 27bp substring
         let read_qual = &"I".repeat(27);
 
-        let input_name = unique_shm_name("bt2-se");
         let batch = make_single_end_input(&["read1"], &[read_seq], &[Some(read_qual)]);
-        let shm_holder = write_arrow_to_shm(&input_name, &batch);
-        let shm_holder_size = shm_holder.len();
 
         let tool = Bowtie2AlignTool;
         let config = serde_json::json!({
@@ -2875,23 +2609,16 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             "nthreads": 1,
             "seed": 42,
         });
-        let response = tool.execute(&config, &input_name, shm_holder_size);
+        let output = tool
+            .execute(&config, vec![batch])
+            .expect("alignment failed");
+        assert_outputs_described(&tool.describe(), &output);
+        let (result, out) = alignments_of(output);
 
-        assert!(response.success, "Failed: {:?}", response.error);
-        assert_eq!(response.shm_outputs.len(), 1);
-        assert_eq!(response.shm_outputs[0].label, "alignments");
-        assert!(response.shm_outputs[0].name.starts_with("/gb-"));
-        assert!(response.shm_outputs[0].size > 0);
-
-        let result = response.result.unwrap();
         assert_eq!(result["n_reads"], 1);
         assert_eq!(result["n_aligned"], 1);
         assert_eq!(result["n_unaligned"], 0);
 
-        let batches =
-            read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
-        assert_eq!(batches.len(), 1);
-        let out = &batches[0];
         assert_eq!(out.num_columns(), 21);
         assert!(out.num_rows() >= 1);
 
@@ -2990,8 +2717,6 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
         // seq and qual are NOT in the output
         assert!(out.column_by_name("seq").is_none());
         assert!(out.column_by_name("qual").is_none());
-
-        let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
     }
 
     // ---------------------------------------------------------------
@@ -3004,10 +2729,7 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
 
         let read_seq = &TEST_REF[10..37];
 
-        let input_name = unique_shm_name("bt2-fa");
         let batch = make_single_end_input(&["read1"], &[read_seq], &[None]);
-        let shm_holder = write_arrow_to_shm(&input_name, &batch);
-        let shm_holder_size = shm_holder.len();
 
         let tool = Bowtie2AlignTool;
         let config = serde_json::json!({
@@ -3015,14 +2737,12 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             "nthreads": 1,
             "ignore_quals": true,
         });
-        let response = tool.execute(&config, &input_name, shm_holder_size);
-        assert!(response.success, "Failed: {:?}", response.error);
+        let output = tool
+            .execute(&config, vec![batch])
+            .expect("alignment failed");
+        let (_, out) = alignments_of(output);
 
-        let batches =
-            read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
-        assert!(batches[0].num_rows() >= 1);
-
-        let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
+        assert!(out.num_rows() >= 1);
     }
 
     // ---------------------------------------------------------------
@@ -3038,7 +2758,6 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
         let read2 = &TEST_REF[100..130];
         let qual = &"I".repeat(30);
 
-        let input_name = unique_shm_name("bt2-pe");
         let batch = make_paired_end_input(
             &["pair1"],
             &[read1],
@@ -3046,8 +2765,6 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             &[Some(qual.as_str())],
             &[Some(qual.as_str())],
         );
-        let shm_holder = write_arrow_to_shm(&input_name, &batch);
-        let shm_holder_size = shm_holder.len();
 
         let tool = Bowtie2AlignTool;
         let config = serde_json::json!({
@@ -3055,17 +2772,15 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
             "nthreads": 1,
             "seed": 42,
         });
-        let response = tool.execute(&config, &input_name, shm_holder_size);
-        assert!(response.success, "Failed: {:?}", response.error);
+        let output = tool
+            .execute(&config, vec![batch])
+            .expect("alignment failed");
+        let (result, out) = alignments_of(output);
 
-        let result = response.result.unwrap();
         // bowtie2 counts n_reads as the number of read pairs for paired-end
         assert!(result["n_reads"].as_i64().unwrap() >= 1);
         let n_concordant = result["n_aligned_concordant"].as_i64().unwrap();
 
-        let batches =
-            read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
-        let out = &batches[0];
         // Paired-end produces 2 records (one per mate)
         assert!(out.num_rows() >= 1);
 
@@ -3105,8 +2820,6 @@ GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAG";
                 "n_aligned_concordant >= 1 but no record carries a tag_ys value"
             );
         }
-
-        let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
     }
 
     // ---------------------------------------------------------------
@@ -3150,7 +2863,6 @@ CGATCATGCATGCAGGTACGATCAGACAGGCTAGCATCGATCAGC";
         let read2 = reverse_complement(&UNIQUE_REF[100..130]);
         let qual = "I".repeat(30);
 
-        let input_name = unique_shm_name("bt2-pe-ys");
         let batch = make_paired_end_input(
             &["pair1"],
             &[read1.as_str()],
@@ -3158,8 +2870,6 @@ CGATCATGCATGCAGGTACGATCAGACAGGCTAGCATCGATCAGC";
             &[Some(qual.as_str())],
             &[Some(qual.as_str())],
         );
-        let shm_holder = write_arrow_to_shm(&input_name, &batch);
-        let shm_holder_size = shm_holder.len();
 
         let tool = Bowtie2AlignTool;
         let config = serde_json::json!({
@@ -3167,18 +2877,15 @@ CGATCATGCATGCAGGTACGATCAGACAGGCTAGCATCGATCAGC";
             "nthreads": 1,
             "seed": 42,
         });
-        let response = tool.execute(&config, &input_name, shm_holder_size);
-        assert!(response.success, "Failed: {:?}", response.error);
+        let output = tool
+            .execute(&config, vec![batch])
+            .expect("alignment failed");
+        let (result, out) = alignments_of(output);
 
-        let result = response.result.unwrap();
         assert!(
             result["n_aligned_concordant"].as_i64().unwrap() >= 1,
             "non-repetitive PE fixture must produce a concordant pair, got result={result}"
         );
-
-        let batches =
-            read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
-        let out = &batches[0];
 
         let flags_col = out
             .column_by_name("flags")
@@ -3233,8 +2940,6 @@ CGATCATGCATGCAGGTACGATCAGACAGGCTAGCATCGATCAGC";
             checked_pairs >= 1,
             "Expected to check at least one mate pair for YS==AS_sibling"
         );
-
-        let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
     }
 
     // ---------------------------------------------------------------
@@ -3250,22 +2955,18 @@ CGATCATGCATGCAGGTACGATCAGACAGGCTAGCATCGATCAGC";
         let garbage_read = "TTTTTTTTTTTTTTTTTTTTTTTTTTT";
         let garbage_qual = &"!".repeat(27);
 
-        let input_name = unique_shm_name("bt2-una");
         let batch = make_single_end_input(&["garbage"], &[garbage_read], &[Some(garbage_qual)]);
-        let shm_holder = write_arrow_to_shm(&input_name, &batch);
-        let shm_holder_size = shm_holder.len();
 
         let tool = Bowtie2AlignTool;
         let config = serde_json::json!({
             "index_path": index_prefix,
             "seed": 42,
         });
-        let response = tool.execute(&config, &input_name, shm_holder_size);
-        assert!(response.success, "Failed: {:?}", response.error);
+        let output = tool
+            .execute(&config, vec![batch])
+            .expect("alignment failed");
+        let (_, out) = alignments_of(output);
 
-        let batches =
-            read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
-        let out = &batches[0];
         assert_eq!(out.num_rows(), 1, "Expected 1 unmapped record");
 
         let flags_col = out
@@ -3302,8 +3003,6 @@ CGATCATGCATGCAGGTACGATCAGACAGGCTAGCATCGATCAGC";
                 c.value(0)
             );
         }
-
-        let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
     }
 
     // ---------------------------------------------------------------
@@ -3407,30 +3106,17 @@ CGATCATGCATGCAGGTACGATCAGACAGGCTAGCATCGATCAGC";
 
         // Single-end read from TEST_REF[10..37]
         let read_seq = &TEST_REF[10..37];
-        let input_name = unique_shm_name("bt2-str-in");
         let batch = make_single_end_input(
             &["read1"],
             &[read_seq],
             &[Some(&"I".repeat(read_seq.len()))],
         );
-        let shm_holder = write_arrow_to_shm(&input_name, &batch);
-        let shm_holder_size = shm_holder.len();
 
-        let response = ctx.run_batch(&input_name, shm_holder_size);
-        assert!(response.success, "run_batch failed: {:?}", response.error);
-        assert_eq!(response.shm_outputs.len(), 1);
-        assert_eq!(response.shm_outputs[0].label, "alignments");
-
-        let result = response.result.unwrap();
+        let output = ctx.run_batch(vec![batch]).expect("run_batch failed");
+        let (result, out) = alignments_of(output);
         assert_eq!(result["n_reads"], 1);
         assert_eq!(result["n_aligned"], 1);
-
-        let out_batches =
-            read_arrow_from_shm(&response.shm_outputs[0].name, response.shm_outputs[0].size);
-        assert_eq!(out_batches.len(), 1);
-        assert!(out_batches[0].num_rows() > 0);
-
-        let _ = SharedMemory::unlink(&response.shm_outputs[0].name);
+        assert!(out.num_rows() > 0);
     }
 
     #[test]
@@ -3445,26 +3131,16 @@ CGATCATGCATGCAGGTACGATCAGACAGGCTAGCATCGATCAGC";
 
         // Batch 1: read from positions 10-37
         let read1 = &TEST_REF[10..37];
-        let input1 = unique_shm_name("bt2-str-b1");
         let batch1 =
             make_single_end_input(&["read_a"], &[read1], &[Some(&"I".repeat(read1.len()))]);
-        let shm_holder1 = write_arrow_to_shm(&input1, &batch1);
-        let shm_holder1_size = shm_holder1.len();
-        let resp1 = ctx.run_batch(&input1, shm_holder1_size);
-        assert!(resp1.success, "Batch 1 failed: {:?}", resp1.error);
-        assert_eq!(resp1.result.as_ref().unwrap()["n_aligned"], 1);
-        let _ = SharedMemory::unlink(&resp1.shm_outputs[0].name);
+        let output = ctx.run_batch(vec![batch1]).expect("Batch 1 failed");
+        assert_eq!(output.result["n_aligned"], 1);
 
         // Batch 2: read from positions 50-77
         let read2 = &TEST_REF[50..77];
-        let input2 = unique_shm_name("bt2-str-b2");
         let batch2 =
             make_single_end_input(&["read_b"], &[read2], &[Some(&"I".repeat(read2.len()))]);
-        let shm_holder2 = write_arrow_to_shm(&input2, &batch2);
-        let shm_holder2_size = shm_holder2.len();
-        let resp2 = ctx.run_batch(&input2, shm_holder2_size);
-        assert!(resp2.success, "Batch 2 failed: {:?}", resp2.error);
-        assert_eq!(resp2.result.as_ref().unwrap()["n_aligned"], 1);
-        let _ = SharedMemory::unlink(&resp2.shm_outputs[0].name);
+        let output = ctx.run_batch(vec![batch2]).expect("Batch 2 failed");
+        assert_eq!(output.result["n_aligned"], 1);
     }
 }

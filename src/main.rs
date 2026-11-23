@@ -1,4 +1,5 @@
 mod arrow_ipc;
+mod frontend;
 mod protocol;
 mod registry;
 mod rusage;
@@ -287,8 +288,8 @@ fn run_session() -> i32 {
         }
     }
 
-    // Drain phase. Step 4 introduced the pending queue: when a session
-    // ends with batches still in-flight or queued, we must let the
+    // Drain phase. When a session ends with batches still in-flight or
+    // queued (the registry's pending queue), we must let the
     // sweeper dispatch them and let workers emit their responses
     // *before* we close the registry. close_all() unconditionally fails
     // any pending batches, so without this drain a graceful shutdown
@@ -387,9 +388,9 @@ fn run_worker(tool_name: &str) -> i32 {
         }
     };
 
-    let mut ctx = match tools::streaming_setup(tool_name, &config) {
-        Ok(Some((c, _sv))) => c,
-        Ok(None) => {
+    let (mut ctx, schema_version) = match tools::open(tool_name, &config) {
+        Ok((tools::Runner::Streaming(ctx), schema_version)) => (ctx, schema_version),
+        Ok((tools::Runner::PerBatch(_), _)) => {
             let resp = Response::error(format!(
                 "worker '{tool_name}': tool does not support streaming; \
                  cannot run as a subprocess worker"
@@ -397,16 +398,11 @@ fn run_worker(tool_name: &str) -> i32 {
             let _ = write_response(&mut stdout, &resp);
             return 1;
         }
-        Err(mut resp) => {
+        Err(resp) => {
             let _ = write_response(&mut stdout, &resp);
-            // Touch the response so clippy doesn't flag the mutable binding
-            // we keep so callers can inspect/extend before write.
-            resp.success = false;
             return 1;
         }
     };
-
-    let schema_version = tools::tool_schema_version(tool_name).unwrap_or_default();
 
     // Counts batches actually run against this resident context. Used to set
     // `worker_reused`: the first batch after spawn hits a cold index; later
@@ -445,20 +441,15 @@ fn run_worker(tool_name: &str) -> i32 {
         // + /proc deltas. Skipped entirely when the caller didn't ask, so a
         // production batch pays nothing.
         let reused = batches_processed > 0;
-        let mut response = if batch.metrics {
-            let (mut resp, metrics) = rusage::measure(reused, || {
-                ctx.run_batch(&batch.shm_input, batch.shm_input_size)
-            });
+        let mut run = || frontend::respond(&batch, schema_version, |input| ctx.run_batch(input));
+        let response = if batch.metrics {
+            let (mut resp, metrics) = rusage::measure(reused, run);
             resp.metrics = Some(metrics);
             resp
         } else {
-            ctx.run_batch(&batch.shm_input, batch.shm_input_size)
+            run()
         };
         batches_processed += 1;
-        if response.success {
-            response.schema_version = Some(schema_version);
-        }
-        response.batch_id = batch.batch_id;
 
         if write_response(&mut stdout, &response).is_err() {
             break;
@@ -560,10 +551,9 @@ fn recv_event(rx: &mpsc::Receiver<Event>, idle_timeout_ms: u64) -> Result<Option
 
 /// Build an `EvictionConfig` from the init knobs the client sent. Missing
 /// fields fall back to `EvictionConfig::default()`. `workers_per_fingerprint`
-/// is accepted in the protocol but not yet used (step 3/4 keep it at 1
-/// for bowtie2 because the C library has process-wide state behind a
-/// mutex; >1 children for the same fingerprint just share an index for
-/// nothing).
+/// is accepted in the protocol but not used: a fingerprint has one worker,
+/// which serializes its batches and keeps them in order (`CLAUDE.md`,
+/// "Per-fingerprint dispatch").
 fn eviction_config_from(init: &InitParams) -> EvictionConfig {
     let mut cfg = EvictionConfig::default();
     if let Some(v) = init.max_workers {
@@ -575,7 +565,7 @@ fn eviction_config_from(init: &InitParams) -> EvictionConfig {
     if let Some(v) = init.worker_idle_ms {
         cfg.worker_idle_ms = v;
     }
-    // workers_per_fingerprint is accepted for forward-compat; no-op today.
+    // Accepted, not used (see above)
     let _ = init.workers_per_fingerprint;
     cfg
 }
